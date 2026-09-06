@@ -137,12 +137,14 @@ export class MemoryStore implements EventStore, LiveStore {
       }
     }
     const first = this.records.length + 1;
+    // JSON round trip: the reference store must forget what JSONB forgets (Dates → strings,
+    // `undefined` → missing, NaN → null) so tests against memory behave like production.
     const recorded: RecordedEvent[] = prepared.map(({ event, id }, i) => ({
       type: event.type,
-      data: event.data,
+      data: jsonRoundTrip(event.data) as Record<string, unknown>,
       id,
       scopes: { ...(event.scopes ?? {}) },
-      metadata: { ...(event.metadata ?? {}) },
+      metadata: jsonRoundTrip(event.metadata ?? {}) as Record<string, unknown>,
       sequence: first + i,
       recordedAt: now,
       transactionId: String(first + i),
@@ -175,6 +177,10 @@ export class MemoryStore implements EventStore, LiveStore {
   async close(): Promise<void> {
     this.listeners.clear();
   }
+}
+
+function jsonRoundTrip(value: unknown): unknown {
+  return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
 function cursorOf(events: readonly RecordedEvent[]): Cursor | null {

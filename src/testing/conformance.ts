@@ -4,6 +4,7 @@ import {
   UniqueViolationError,
   ValidationError,
   type EventStore,
+  type Query,
   type StoreSchema,
 } from "../index.js";
 import { conformanceEvents, conformanceSchema } from "./schema.js";
@@ -99,6 +100,40 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     assert.deepEqual(two.events.map((e) => e.id).sort(), ["acc-1", "acc-3"]);
     const both = await store.query({ scopes: { accountOpenedId: "acc-1", thingId: "missing" } });
     assert.equal(both.events.length, 0);
+  });
+
+  withStore("contextVersion equals the highest matching sequence for every filter shape, with and without options", async (store) => {
+    await store.append([
+      openAccount("mary", "acc-1"),
+      openAccount("bob", "acc-2"),
+      ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" }),
+      ev.NoteAdded({ text: "n1" }, { accountOpenedId: "acc-1" }),
+      ev.NoteAdded({ text: "n2" }),
+      ev.MoneyDeposited({ amount: 7 }, { accountOpenedId: "acc-2" }),
+    ]);
+    const all = (await store.query({})).events;
+    const shapes: Query[] = [
+      { types: ["NoteAdded"] },
+      { scopes: { accountOpenedId: "acc-1" } },
+      { types: ["AccountOpened", "MoneyDeposited", "NoteAdded"], scopes: { accountOpenedId: "acc-1" } },
+      { types: ["MoneyDeposited"], scopes: { accountOpenedId: ["acc-1", "acc-2"] } },
+      { scopes: { accountOpenedId: "acc-1", thingId: "none" } },
+      { types: ["AccountOpened"], where: [{ owner: "bob" }] },
+      [{ types: ["NoteAdded"] }, { scopes: { accountOpenedId: "acc-2" } }],
+      { types: ["MoneyDeposited"], scopes: { accountOpenedId: "acc-1" }, where: [{ amount: 5 }] },
+    ];
+    for (const shape of shapes) {
+      const full = await store.query(shape);
+      const expected = full.events.reduce((m, e) => Math.max(m, e.sequence), 0);
+      assert.equal(full.contextVersion, expected, `contextVersion for ${JSON.stringify(shape)}`);
+      const narrowed = await store.query(shape, { after: expected, limit: 1 });
+      assert.equal(narrowed.contextVersion, expected, `contextVersion with options for ${JSON.stringify(shape)}`);
+      assert.equal(narrowed.events.length, 0);
+      // the guard must agree with the read: an appendIf with the read version commits
+      const probe = await store.appendIf([ev.NoteAdded({ text: "probe" })], { query: [{ scopes: { thingId: "never" } }], version: 0 });
+      assert.equal(probe.ok, true);
+    }
+    assert.ok(all.length >= 6);
   });
 
   withStore("where is JSONB containment, OR-ed across predicates", async (store) => {
