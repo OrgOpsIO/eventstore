@@ -219,19 +219,34 @@ export interface CompiledFilters {
   readonly sql: string;
 }
 
-export function compileFilters(query: Query): CompiledFilters {
+/** Parameter collector shared by every fragment of one statement: values → `($1::text[])[i]` / `($2::jsonb[])[i]`. */
+export interface ParamCollector {
+  readonly texts: string[];
+  readonly jsons: string[];
+  text(v: string): string;
+  json(v: unknown): string;
+}
+
+export function createParamCollector(): ParamCollector {
   const texts: string[] = [];
   const jsons: string[] = [];
-  const text = (v: string): string => {
-    texts.push(v);
-    return `($1::text[])[${texts.length}]`;
+  return {
+    texts,
+    jsons,
+    text(v) {
+      texts.push(v);
+      return `($1::text[])[${texts.length}]`;
+    },
+    json(v) {
+      jsons.push(JSON.stringify(v));
+      return `($2::jsonb[])[${jsons.length}]`;
+    },
   };
-  const json = (v: unknown): string => {
-    jsons.push(JSON.stringify(v));
-    return `($2::jsonb[])[${jsons.length}]`;
-  };
-  const perFilter = filtersOf(query).map((f) => compileFilter(f, text, json));
-  return { texts, jsons, perFilter, sql: perFilter.map((c) => `(${c})`).join(" OR ") };
+}
+
+export function compileFilters(query: Query, collector: ParamCollector = createParamCollector()): CompiledFilters {
+  const perFilter = filtersOf(query).map((f) => compileFilter(f, collector.text, collector.json));
+  return { texts: collector.texts, jsons: collector.jsons, perFilter, sql: perFilter.map((c) => `(${c})`).join(" OR ") };
 }
 
 function compileFilter(filter: Filter, text: (v: string) => string, json: (v: unknown) => string): string {
@@ -267,18 +282,15 @@ function compileFilter(filter: Filter, text: (v: string) => string, json: (v: un
  * of the `(es_scope(payload,'K'), sequence_number)` index (4 buffers) instead of walking the
  * primary key backwards with a filter (thousands of buffers, as measured on 800k rows).
  */
-export function compileVersionSql(table: string, query: Query): { sql: string; texts: string[]; jsons: string[] } {
+export function compileVersionSql(
+  table: string,
+  query: Query,
+  collector: ParamCollector = createParamCollector(),
+): { sql: string; texts: string[]; jsons: string[] } {
   const t = quoteIdent(assertIdentifier(table, "table name"));
-  const texts: string[] = [];
-  const jsons: string[] = [];
-  const text = (v: string): string => {
-    texts.push(v);
-    return `($1::text[])[${texts.length}]`;
-  };
-  const json = (v: unknown): string => {
-    jsons.push(JSON.stringify(v));
-    return `($2::jsonb[])[${jsons.length}]`;
-  };
+  const { texts, jsons } = collector;
+  const text = collector.text;
+  const json = collector.json;
   const branches: string[] = [];
   for (const filter of filtersOf(query)) {
     const scopeKeys = Object.keys(filter.scopes ?? {});
@@ -316,8 +328,10 @@ export interface CompiledQuery {
  */
 export function compileQuery(table: string, query: Query, options: QueryOptions): CompiledQuery {
   const t = quoteIdent(assertIdentifier(table, "table name"));
-  const compiled = compileFilters(query);
-  const params: unknown[] = [compiled.texts, compiled.jsons];
+  const collector = createParamCollector();
+  const compiled = compileFilters(query, collector);
+  const version = compileVersionSql(table, query, collector); // same collector: one parameter space
+  const params: unknown[] = [collector.texts, collector.jsons];
   const param = (v: unknown): string => {
     params.push(v);
     return `$${params.length}`;
@@ -335,9 +349,6 @@ export function compileQuery(table: string, query: Query, options: QueryOptions)
   const hits = `ARRAY[${compiled.perFilter.map((c) => `(${c})`).join(", ")}]::boolean[]`;
   // Both parameter arrays are always referenced so the statement's parameter count is stable
   // even when a query has no text or no jsonb values.
-  // The version CTE reuses the same parameter arrays: compileVersionSql pushes its values in the
-  // same order compileFilters does, so we compile it against a fresh collector and assert equality.
-  const version = compileVersionSql(table, query);
   const sql = `WITH ctx AS (SELECT (${version.sql})::text AS v)
 SELECT ctx.v AS context_version,
        e.seq, e.event_type, e.payload, e.metadata, e.recorded_at, e.xid, e.settled, e.hits

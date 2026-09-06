@@ -98,7 +98,8 @@ export async function runCommand<S, R>(runtime: CommandRuntime, spec: CommandSpe
 
 async function loadContext<S, R>(runtime: CommandRuntime, spec: CommandSpec<S, R>): Promise<LoadedContext<S>> {
   const fold = spec.fold ?? ((events: readonly RecordedEvent[], state: S) => [...((state as unknown as RecordedEvent[]) ?? []), ...events] as unknown as S);
-  const initial = spec.initial ?? ([] as unknown as S);
+  // `null` is a legitimate initial state ("nothing exists yet"); only `undefined` means "not given".
+  const initial = spec.initial !== undefined ? spec.initial : ([] as unknown as S);
   if (runtime.cache && !spec.noCache && spec.fold) {
     return runtime.cache.load<S>({ query: spec.context, fold, initial });
   }
