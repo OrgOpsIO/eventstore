@@ -1,0 +1,223 @@
+import { runCommand, type CommandOutcome, type CommandSpec } from "./command.js";
+import { ContextCache, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
+import { ConflictError, NotConfiguredError } from "./errors.js";
+import { MemoryStore } from "./memory.js";
+import { buildSchema, type RegistryLike } from "./registry.js";
+import { PLATFORM_TENANT_ID, scopedToTenant, type TenantConfig } from "./tenant.js";
+import type {
+  AppendIfOutcome,
+  AppendResult,
+  ContextHandle,
+  EventStore,
+  NewEvent,
+  Query,
+  QueryOptions,
+  QueryResult,
+  StoreSchema,
+} from "./types.js";
+
+/** Options of the Postgres store (mirrored here so the core stays driver-free). */
+export interface PostgresOptions {
+  /** `"auto"` (default): create table, function and indexes on first use, under an advisory lock. `"none"`: never touch the schema. */
+  readonly schema?: "auto" | "none";
+  /** Table name. Default `events`. */
+  readonly table?: string;
+  /** Add a `jsonb_path_ops` GIN index on the payload for ad-hoc `where` queries. Default `false`. */
+  readonly adhocQueries?: boolean;
+  /** Install a row-level-security policy on the tenant scope (needs a non-owner application role). Default `false`. */
+  readonly rls?: boolean;
+  /** Pool size. Default 10. */
+  readonly poolSize?: number;
+}
+
+export interface EventStoreConfig {
+  /** Postgres connection string. Loads `@orgops/eventstore/postgres` lazily (peer dependency `pg`). */
+  readonly connection?: string;
+  /** Or bring your own store (e.g. `new MemoryStore()`), or a factory receiving the schema. */
+  readonly store?: EventStore | ((schema: StoreSchema) => EventStore | Promise<EventStore>);
+  /** Your `defineEvents(...)` registries. They drive typing, validation, indexes, locks and unique constraints. */
+  readonly events?: readonly RegistryLike[];
+  /** Extra scope keys to index and lock (for flat-id payloads that are not declared in a registry). */
+  readonly scopeKeys?: readonly string[];
+  readonly tenant?: TenantConfig;
+  /** Strict mode: guard queries must be lockable through declared scope keys. Default `true`. */
+  readonly strict?: boolean;
+  readonly postgres?: PostgresOptions;
+  /** In-process incremental context cache. `false` disables it. */
+  readonly contextCache?: ContextCacheOptions | false;
+  readonly clock?: () => Date;
+}
+
+/** The thing you use. `es` is one of these; `createEventStore()` gives you your own. */
+export interface EventStoreApi extends EventStore {
+  readonly schema: StoreSchema;
+  /** Run a CCC command: read → decide → `appendIf`, retrying on conflict. */
+  command<S, R = void>(spec: CommandSpec<S, R>): Promise<CommandOutcome<R>>;
+  /** Load a context incrementally (cached per query in this process). */
+  context<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>>;
+  /** Like `appendIf`, but throws `ConflictError` instead of returning the conflict. */
+  appendIfOrThrow(events: readonly NewEvent[], ctx: ContextHandle): Promise<AppendResult>;
+  /** A view bound to one tenant. Requires `tenant` in the config. */
+  forTenant(tenantId: string): EventStoreApi;
+  /** The platform tenant (accounts, registrations, …). */
+  forPlatform(): EventStoreApi;
+  /** The underlying store, initialised. */
+  store(): Promise<EventStore>;
+  /** Forget cached contexts (all, or one query). */
+  invalidate(query?: Query): void;
+}
+
+export function createEventStore(config: EventStoreConfig): EventStoreApi {
+  const schema = buildSchema(config.events ?? [], {
+    scopeKeys: [...(config.scopeKeys ?? []), ...(config.tenant ? [config.tenant.scopeKey] : [])],
+    strict: config.strict ?? true,
+  });
+  let storePromise: Promise<EventStore> | undefined;
+  const store = (): Promise<EventStore> => {
+    if (!storePromise) {
+      storePromise = resolveStore(config, schema).catch((err) => {
+        storePromise = undefined;
+        throw err;
+      });
+    }
+    return storePromise;
+  };
+  return buildApi({ schema, store, config, tenantId: undefined, cache: undefined });
+}
+
+interface ApiParts {
+  readonly schema: StoreSchema;
+  readonly store: () => Promise<EventStore>;
+  readonly config: EventStoreConfig;
+  readonly tenantId: string | undefined;
+  readonly cache: ContextCache | undefined;
+}
+
+function buildApi(parts: ApiParts): EventStoreApi {
+  const { schema, config } = parts;
+  let viewPromise: Promise<EventStore> | undefined;
+  const view = (): Promise<EventStore> => {
+    if (!viewPromise) {
+      viewPromise = parts.store().then((inner) =>
+        parts.tenantId !== undefined && config.tenant ? scopedToTenant(inner, config.tenant, parts.tenantId) : inner,
+      );
+    }
+    return viewPromise;
+  };
+  let cache: ContextCache | undefined = parts.cache;
+  const cacheFor = async (): Promise<ContextCache | undefined> => {
+    if (config.contextCache === false) return undefined;
+    if (!cache) cache = new ContextCache(await view(), config.contextCache ?? {});
+    return cache;
+  };
+
+  const api: EventStoreApi = {
+    schema,
+    async query(query: Query, options?: QueryOptions): Promise<QueryResult> {
+      return (await view()).query(query, options);
+    },
+    async append(events: readonly NewEvent[]): Promise<AppendResult> {
+      return (await view()).append(events);
+    },
+    async appendIf(events: readonly NewEvent[], ctx: ContextHandle): Promise<AppendIfOutcome> {
+      return (await view()).appendIf(events, ctx);
+    },
+    async appendIfOrThrow(events, ctx) {
+      const outcome = await api.appendIf(events, ctx);
+      if (!outcome.ok) throw new ConflictError(outcome.conflict);
+      return outcome.appended;
+    },
+    async command(spec) {
+      return runCommand({ store: await view(), cache: await cacheFor(), clock: config.clock }, spec);
+    },
+    async context(spec) {
+      const c = await cacheFor();
+      if (c) return c.load(spec);
+      return new ContextCache(await view(), { max: 0 }).load(spec);
+    },
+    forTenant(tenantId: string): EventStoreApi {
+      if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");
+      if (tenantId === parts.tenantId) return api;
+      return buildApi({ ...parts, tenantId, cache: undefined });
+    },
+    forPlatform(): EventStoreApi {
+      return api.forTenant(config.tenant?.platformId ?? PLATFORM_TENANT_ID);
+    },
+    store: () => parts.store(),
+    invalidate(query?: Query): void {
+      cache?.invalidate(query);
+    },
+    async close(): Promise<void> {
+      if (parts.tenantId === undefined) await (await parts.store()).close();
+    },
+  };
+  return api;
+}
+
+async function resolveStore(config: EventStoreConfig, schema: StoreSchema): Promise<EventStore> {
+  if (config.store) {
+    return typeof config.store === "function" ? config.store(schema) : config.store;
+  }
+  if (config.connection) {
+    const { createPostgresStore } = await import("./postgres/index.js");
+    const { schema: schemaMode, ...pg } = config.postgres ?? {};
+    return createPostgresStore({
+      connection: config.connection,
+      schema,
+      schemaMode,
+      ...pg,
+      tenantScopeKey: config.tenant?.scopeKey,
+      clock: config.clock,
+    });
+  }
+  return new MemoryStore({ schema, clock: config.clock });
+}
+
+// ── ambient instance ──────────────────────────────────────────────────────────
+
+let ambient: EventStoreApi | undefined;
+
+/**
+ * Configure the ambient store ONCE at startup (a Nuxt/Nitro server plugin, your `main.ts`).
+ * Then `import { es } from "@orgops/eventstore"` anywhere.
+ *
+ * ```ts
+ * configure({ connection: process.env.DATABASE_URL!, events: [articles, accounts] });
+ * ```
+ */
+export function configure(config: EventStoreConfig): EventStoreApi {
+  ambient = createEventStore(config);
+  return ambient;
+}
+
+export function isConfigured(): boolean {
+  return ambient !== undefined;
+}
+
+/** Reset the ambient instance (tests). Does not close the store. */
+export function reset(): void {
+  ambient = undefined;
+}
+
+function current(): EventStoreApi {
+  if (!ambient) throw new NotConfiguredError();
+  return ambient;
+}
+
+/** The ambient store — delegates to whatever `configure()` set. */
+export const es: EventStoreApi = {
+  get schema() {
+    return current().schema;
+  },
+  query: (q, o) => current().query(q, o),
+  append: (e) => current().append(e),
+  appendIf: (e, c) => current().appendIf(e, c),
+  appendIfOrThrow: (e, c) => current().appendIfOrThrow(e, c),
+  command: (s) => current().command(s),
+  context: (s) => current().context(s),
+  forTenant: (id) => current().forTenant(id),
+  forPlatform: () => current().forPlatform(),
+  store: () => current().store(),
+  invalidate: (q) => current().invalidate(q),
+  close: () => current().close(),
+};

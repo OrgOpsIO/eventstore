@@ -1,0 +1,43 @@
+{
+  "name": "@orgops/eventstore",
+  "version": "0.1.0",
+  "description": "Command Context Consistency event store for PostgreSQL with Westphal scopes. Configure once, import `es` anywhere. Typed events via Zod, atomic conditional append, indexes derived from your event declarations.",
+  "type": "module",
+  "license": "MIT",
+  "author": "orgops",
+  "keywords": ["event-sourcing", "event-store", "postgres", "ccc", "dcb", "zod", "typescript"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" },
+    "./postgres": { "types": "./dist/postgres/index.d.ts", "import": "./dist/postgres/index.js", "require": "./dist/postgres/index.cjs" },
+    "./subscribe": { "types": "./dist/subscribe/index.d.ts", "import": "./dist/subscribe/index.js", "require": "./dist/subscribe/index.cjs" },
+    "./testing": { "types": "./dist/testing/index.d.ts", "import": "./dist/testing/index.js", "require": "./dist/testing/index.cjs" }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:pg": "ES_TEST_DATABASE_URL=postgres://es:es@localhost:5432/es_sdk_test vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "pg": ">=8.11.0",
+    "zod": "^4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "pg": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/pg": "^8.11.0",
+    "pg": "^8.13.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0",
+    "zod": "^4.0.0"
+  },
+  "engines": { "node": ">=20" }
+}
