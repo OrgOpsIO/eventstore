@@ -125,6 +125,7 @@ $fn$`,
     );
   }
 
+  statements.push(`DROP FUNCTION IF EXISTS ${quoteIdent(appendFunctionName(table))}(bigint[], bigint, boolean, text, text[], jsonb[], bigint, text[], jsonb[], jsonb[])`);
   statements.push(appendFunctionDdl(table));
 
   if (options.rls) {
@@ -153,7 +154,7 @@ export function appendFunctionDdl(table: string): string {
   p_lock_keys bigint[],
   p_global_key bigint,
   p_exclusive_global boolean,
-  p_where text,
+  p_version_sql text,
   p_texts text[],
   p_jsons jsonb[],
   p_expected bigint,
@@ -176,10 +177,11 @@ BEGIN
   END IF;
   PERFORM pg_advisory_xact_lock(k) FROM unnest(p_lock_keys) AS k ORDER BY k;
 
-  -- 2. the context version, read after the locks (fresh snapshot)
-  IF p_where IS NOT NULL THEN
-    EXECUTE 'SELECT COALESCE(MAX(sequence_number), 0) FROM ${t} WHERE ' || p_where
-      INTO v_actual USING p_texts, p_jsons;
+  -- 2. the context version, read after the locks (fresh snapshot). p_version_sql is the
+  --    statement compiled by compileVersionSql(): one MAX per scope value, so every branch is
+  --    an index-backward scan on the scope index instead of a filtered walk of the primary key.
+  IF p_version_sql IS NOT NULL THEN
+    EXECUTE p_version_sql INTO v_actual USING p_texts, p_jsons;
     IF v_actual <> p_expected THEN
       RETURN QUERY SELECT false, v_actual, NULL::bigint, NULL::bigint, 0;
       RETURN;
@@ -241,13 +243,64 @@ function compileFilter(filter: Filter, text: (v: string) => string, json: (v: un
     for (const [key, values] of Object.entries(filter.scopes)) {
       assertIdentifier(key, "scope key");
       const list = (typeof values === "string" ? [values] : values).map((v) => text(v));
-      parts.push(`es_scope(payload, ${quoteLiteral(key)}) = ANY(ARRAY[${list.join(", ")}]::text[])`);
+      // Scalar equality lets the planner use the scope index's statistics and, for MAX(), the
+      // index itself; `= ANY(ARRAY[...])` does neither.
+      parts.push(
+        list.length === 1
+          ? `es_scope(payload, ${quoteLiteral(key)}) = ${list[0]}`
+          : `es_scope(payload, ${quoteLiteral(key)}) IN (${list.join(", ")})`,
+      );
     }
   }
   if (filter.where && filter.where.length > 0) {
     parts.push(`(${filter.where.map((w) => `payload @> ${json(w)}::jsonb`).join(" OR ")})`);
   }
   return parts.length > 0 ? parts.join(" AND ") : "TRUE";
+}
+
+/**
+ * The CCC context version as one statement returning a single bigint, using the same
+ * `$1::text[]` / `$2::jsonb[]` parameter arrays as `compileFilters`.
+ *
+ * For a filter with scope keys the MAX is split into one subquery per value of the leading
+ * scope key, each a scalar equality — Postgres then answers each branch with a backward scan
+ * of the `(es_scope(payload,'K'), sequence_number)` index (4 buffers) instead of walking the
+ * primary key backwards with a filter (thousands of buffers, as measured on 800k rows).
+ */
+export function compileVersionSql(table: string, query: Query): { sql: string; texts: string[]; jsons: string[] } {
+  const t = quoteIdent(assertIdentifier(table, "table name"));
+  const texts: string[] = [];
+  const jsons: string[] = [];
+  const text = (v: string): string => {
+    texts.push(v);
+    return `($1::text[])[${texts.length}]`;
+  };
+  const json = (v: unknown): string => {
+    jsons.push(JSON.stringify(v));
+    return `($2::jsonb[])[${jsons.length}]`;
+  };
+  const branches: string[] = [];
+  for (const filter of filtersOf(query)) {
+    const scopeKeys = Object.keys(filter.scopes ?? {});
+    if (scopeKeys.length === 0) {
+      branches.push(`SELECT MAX(sequence_number) FROM ${t} WHERE ${compileFilter(filter, text, json)}`);
+      continue;
+    }
+    const leading = scopeKeys[0]!;
+    const rest: Filter = { ...filter, scopes: Object.fromEntries(Object.entries(filter.scopes!).filter(([k]) => k !== leading)) };
+    if (Object.keys(rest.scopes!).length === 0) delete (rest as { scopes?: unknown }).scopes;
+    const values = filter.scopes![leading]!;
+    for (const value of typeof values === "string" ? [values] : values) {
+      assertIdentifier(leading, "scope key");
+      const restSql = compileFilter(rest, text, json);
+      branches.push(
+        `SELECT MAX(sequence_number) FROM ${t} WHERE es_scope(payload, ${quoteLiteral(leading)}) = ${text(value)}${restSql === "TRUE" ? "" : ` AND ${restSql}`}`,
+      );
+    }
+  }
+  const anchor = "coalesce(array_length($1::text[], 1), 0) >= 0 AND coalesce(array_length($2::jsonb[], 1), 0) >= 0";
+  const sql = `SELECT COALESCE(MAX(m), 0) FROM (${branches.map((b) => `(${b})`).join(" UNION ALL ")}) AS branches(m) WHERE ${anchor}`;
+  return { sql, texts, jsons };
 }
 
 export const SETTLED_SQL = "transaction_id < pg_snapshot_xmin(pg_current_snapshot())";
@@ -282,8 +335,10 @@ export function compileQuery(table: string, query: Query, options: QueryOptions)
   const hits = `ARRAY[${compiled.perFilter.map((c) => `(${c})`).join(", ")}]::boolean[]`;
   // Both parameter arrays are always referenced so the statement's parameter count is stable
   // even when a query has no text or no jsonb values.
-  const anchor = "coalesce(array_length($1::text[], 1), 0) >= 0 AND coalesce(array_length($2::jsonb[], 1), 0) >= 0";
-  const sql = `WITH ctx AS (SELECT COALESCE(MAX(sequence_number), 0)::text AS v FROM ${t} WHERE (${compiled.sql}) AND ${anchor})
+  // The version CTE reuses the same parameter arrays: compileVersionSql pushes its values in the
+  // same order compileFilters does, so we compile it against a fresh collector and assert equality.
+  const version = compileVersionSql(table, query);
+  const sql = `WITH ctx AS (SELECT (${version.sql})::text AS v)
 SELECT ctx.v AS context_version,
        e.seq, e.event_type, e.payload, e.metadata, e.recorded_at, e.xid, e.settled, e.hits
 FROM ctx

@@ -20,6 +20,7 @@ import {
   appendFunctionName,
   compileFilters,
   compileQuery,
+  compileVersionSql,
   ddlStatements,
   idempotencyIndexName,
   quoteIdent,
@@ -186,7 +187,7 @@ export class PostgresStore implements EventStore {
     const lockKeys = [...new Set([...condition.keys, ...eventLockKeys(prepared, this.schema)].map((k) => k.toString()))].sort(
       (a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0),
     );
-    const compiled = ctx ? compileFilters(ctx.query) : null;
+    const compiled = ctx ? compileVersionSql(this.table, ctx.query) : null;
     const params = [
       lockKeys,
       GLOBAL_LOCK_KEY.toString(),
