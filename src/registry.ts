@@ -78,6 +78,11 @@ export type FoldHandlers<D extends Definitions, S> = {
 };
 
 /** A filter restricted to this registry's types and scope keys. */
+/** Handlers of `$foldBy`: `(data, entry | undefined, event) => entry | null`. */
+export type FoldByHandlers<D extends Definitions, E> = {
+  readonly [N in keyof D & string]?: (data: DataOf<D[N]>, entry: E | undefined, event: RecordedEventOf<D, N>) => E | null;
+};
+
 export interface RegistryFilter<D extends Definitions> {
   readonly types?: readonly (keyof D & string)[];
   readonly scopes?: Partial<Record<AllScopeKeys<D> | (string & {}), string | readonly string[]>>;
@@ -111,6 +116,12 @@ export type EventRegistry<D extends Definitions> = {
    * Unknown or unhandled types are skipped. A handler must return the next state.
    */
   $fold<S>(handlers: FoldHandlers<D, S>): Fold<S>;
+  /**
+   * An incremental fold over a `Map` of entries keyed by `keyOf(event)`: each handler gets the
+   * entry for its key (or `undefined`) and returns the next entry, or `null` to delete it.
+   * Events whose key is `undefined` are skipped. One Map copy per batch, not per event.
+   */
+  $foldBy<K, E>(keyOf: (event: RecordedEventOf<D>) => K | undefined, handlers: FoldByHandlers<D, E>): Fold<Map<K, E>>;
   /**
    * One-shot: fold a complete list from `initial`. Deliberately NOT assignable to `Fold<S>`
    * (its second parameter is typed `undefined`), so it cannot slot into `es.context()`/`es.command()`
@@ -206,6 +217,24 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
       return { types: [...types], scopes: { [key]: value } };
     },
     $fold: <S>(handlers: FoldHandlers<D, S>) => foldWith(handlers),
+    $foldBy<K, E>(keyOf: (event: RecordedEventOf<D>) => K | undefined, handlers: FoldByHandlers<D, E>) {
+      const table = handlers as Record<string, ((d: unknown, e: E | undefined, ev: RecordedEvent) => E | null) | undefined>;
+      return (events: readonly RecordedEvent[], state: Map<K, E>): Map<K, E> => {
+        let next: Map<K, E> | undefined;
+        for (const event of events) {
+          const handler = table[event.type];
+          if (!handler) continue;
+          const key = keyOf(event as RecordedEventOf<D>);
+          if (key === undefined) continue;
+          if (!next) next = new Map(state);
+          const entry = handler(event.data, next.get(key), event);
+          if (entry === null) next.delete(key);
+          else if (entry === undefined) throw new Error(`eventstore: $foldBy handler for "${event.type}" returned undefined; return the entry or null`);
+          else next.set(key, entry);
+        }
+        return next ?? state;
+      };
+    },
     $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>) {
       const fold = foldWith(handlers);
       return (events: readonly RecordedEvent[]): S =>

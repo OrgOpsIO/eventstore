@@ -211,6 +211,24 @@ describe("memory store + api", () => {
     expect((await es.query(articles.$filter())).events).toHaveLength(1);
   });
 
+  it("$foldBy keeps a Map of entries keyed by the event's subject", async () => {
+    const byArticle = articles.$foldBy<string, Article>(
+      (e) => (e.type === "ArticleDrafted" ? e.id : e.scopes.articleDraftedId),
+      {
+        ArticleDrafted: (data, _entry, e) => ({ id: e.id, title: data.title, body: "", archived: false }),
+        ArticleContentEdited: (data, entry) => (entry ? { ...entry, body: data.body } : null),
+        ArticleArchived: (_data, entry) => (entry ? { ...entry, archived: true } : null),
+      },
+    );
+    const es = newApi().forTenant(WS);
+    const d = articles.ArticleDrafted({ title: "T", slug: "t" }, { workspaceProvisionedId: WS });
+    await es.append([d, articles.ArticleContentEdited({ body: "b" }, { articleDraftedId: d.id })]);
+    const loaded = await es.context({ query: articles.$filter(), fold: byArticle, initial: () => new Map<string, Article>() });
+    expect(loaded.state.get(d.id)).toEqual({ id: d.id, title: "T", body: "b", archived: false });
+    const empty = new Map<string, Article>();
+    expect(byArticle([], empty)).toBe(empty); // no events → same Map instance
+  });
+
   it("$parse narrows types", async () => {
     const store = new MemoryStore({ schema: buildSchema([articles], { strict: false }) });
     await store.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);

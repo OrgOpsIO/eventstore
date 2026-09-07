@@ -41,6 +41,7 @@ export type {
   EventDefinition,
   EventRegistry,
   FoldHandlers,
+  FoldByHandlers,
   NewEventOf,
   RecordedEventOf,
   RegistryFilter,
