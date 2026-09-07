@@ -189,6 +189,16 @@ describe("memory store + api", () => {
     expect(read.ctx.version).toBe(1);
   });
 
+  it("close() never connects a store that was never used", async () => {
+    let created = 0;
+    const api = createEventStore({ store: () => (created++, new MemoryStore()) });
+    await api.close();
+    expect(created).toBe(0);
+    await api.append([{ type: "Ping", data: {} }]);
+    await api.close();
+    expect(created).toBe(1);
+  });
+
   it("$parse narrows types", async () => {
     const store = new MemoryStore({ schema: buildSchema([articles], { strict: false }) });
     await store.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
