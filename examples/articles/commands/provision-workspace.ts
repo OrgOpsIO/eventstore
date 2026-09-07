@@ -7,8 +7,8 @@ import { workspace } from "../events.js";
  */
 export async function provisionWorkspace(input: { slug: string; name: string }) {
   const provisioned = workspace.WorkspaceProvisioned({ slug: input.slug, name: input.name });
-  return es.forTenant(provisioned.id).command<readonly unknown[], string>({
-    context: workspace.$scope("workspaceProvisionedId", provisioned.id), // create-if-absent: version 0
+  // a pure create reads nothing: no context, no guard — the slug index is the only rule
+  return es.forTenant(provisioned.id).command({
     decide: () => ({ events: [provisioned], result: provisioned.id }),
   });
 }

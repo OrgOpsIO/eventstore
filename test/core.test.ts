@@ -206,6 +206,23 @@ describe("memory store + api", () => {
     await expect(api.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })])).rejects.toThrow(/different schema/);
   });
 
+  it("accepts a pre-built store that enforces a superset, refuses one that enforces less", async () => {
+    const superset = buildSchema([articles], { scopeKeys: ["extraKey"], tenantScopeKey: "workspaceProvisionedId" });
+    const ok = createEventStore({ events: [articles], tenant: { scopeKey: "workspaceProvisionedId" }, store: new MemoryStore({ schema: superset }) });
+    await ok.forTenant(WS).append([articles.ArticleDrafted({ title: "S", slug: "s" }, { workspaceProvisionedId: WS })]);
+    const salted = createEventStore({ events: [articles], lockSalt: "x", store: new MemoryStore({ schema: buildSchema([articles]) }) });
+    await expect(salted.append([articles.ArticleDrafted({ title: "S", slug: "s2" }, { workspaceProvisionedId: WS })])).rejects.toThrow(/lockSalt/);
+  });
+
+  it("a tenant root event with a foreign id is refused instead of being shadowed by the stamp", async () => {
+    const ws = defineEvents({ WorkspaceProvisioned: { data: z.object({ name: z.string() }) } });
+    const api = createEventStore({ events: [ws], tenant: { scopeKey: "workspaceProvisionedId" }, strict: false });
+    const root = ws.WorkspaceProvisioned({ name: "A" });
+    await api.forTenant(root.id).append([root]); // its own tenant: no self back-link
+    expect((await api.forTenant(root.id).query(ws.$filter())).events[0]!.scopes).toEqual({});
+    await expect(api.forTenant("other").append([ws.WorkspaceProvisioned({ name: "B" })])).rejects.toThrow(/tenant root/);
+  });
+
   it("a command without context appends unconditionally", async () => {
     const es = newApi().forTenant(WS);
     const out = await es.command({ decide: () => ({ events: [articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })], result: "made" }) });

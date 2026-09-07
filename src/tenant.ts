@@ -50,8 +50,12 @@ export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId
         throw new TenantMismatchError(`eventstore: "${e.type}" names tenant ${claimed} but is appended to ${tenantId}`);
       }
       if (claimed === tenantId) return e;
-      // the tenant's own root event (its id IS the tenant id) carries no back-link to itself
-      if (idKeyOf && idKeyOf(e.type) === key && e.id === tenantId) return e;
+      if (idKeyOf && idKeyOf(e.type) === key) {
+        // the tenant's own root event (its id IS the tenant id) carries no back-link to itself;
+        // a root-keyed event with ANOTHER id would be shadowed by the stamp — refuse instead
+        if (e.id === tenantId) return e;
+        throw new TenantMismatchError(`eventstore: "${e.type}" is a tenant root with id ${e.id ?? "<generated>"} but is appended to tenant ${tenantId}`);
+      }
       return { ...e, scopes: { ...(e.scopes ?? {}), [key]: tenantId } };
     });
   return {

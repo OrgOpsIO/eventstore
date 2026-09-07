@@ -1,5 +1,5 @@
 import type { ContextCache, Fold, LoadedContext } from "./context.js";
-import { TransientError } from "./errors.js";
+import { TransientError, UsageError } from "./errors.js";
 import { uuidv7 } from "./ids.js";
 import type { AppendResult, Conflict, EventStore, NewEvent, Query, RecordedEvent } from "./types.js";
 
@@ -155,6 +155,7 @@ async function loadContext<S, R>(runtime: CommandRuntime, spec: CommandSpec<S, R
     const base = typeof initial === "function" ? (initial as () => S)() : initial;
     return { state: spec.fold(result.events, base), ctx: result.ctx, delta: result.events, cacheHit: false };
   }
+  if (spec.initial !== undefined) throw new UsageError("eventstore: `initial` without `fold` has no meaning on a command with a context — pass a fold, or drop `initial`");
   const result = await runtime.store.query(context);
   return { state: rawFold(result.events, []) as unknown as S, ctx: result.ctx, delta: result.events, cacheHit: false };
 }

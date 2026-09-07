@@ -193,7 +193,7 @@ export class MemoryStore implements EventStore, LiveStore {
     if (this.isSettled) {
       // settledness may change between reads: never memoise it
       const base = this.toRecordedBase(row);
-      return { ...base, settled: this.isSettled(row.transactionId, row.sequence) };
+      return Object.freeze({ ...base, settled: this.isSettled(row.transactionId, row.sequence) });
     }
     return this.toRecordedBase(row);
   }

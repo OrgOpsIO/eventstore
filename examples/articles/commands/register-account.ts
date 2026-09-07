@@ -8,8 +8,7 @@ import { accounts } from "../events.js";
  */
 export async function registerAccount(input: { email: string; displayName: string }) {
   const registered = accounts.AccountRegistered({ email: input.email, displayName: input.displayName });
-  return es.forPlatform().command<readonly unknown[], string>({
-    context: accounts.$scope("accountRegisteredId", registered.id),
+  return es.forPlatform().command({
     decide: () => ({ events: [registered], result: registered.id }),
   });
 }

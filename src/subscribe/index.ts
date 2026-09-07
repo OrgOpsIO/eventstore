@@ -122,7 +122,10 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
     caughtUpWaiters = [];
     try {
       const result = await store.query(query, { settledOnly: true, cursor, limit: batchSize });
-      if (stopped) return;
+      if (stopped) {
+        for (const w of waitersBeforeRead) w(); // stopped = caught up by contract; never leave a waiter hanging
+        return;
+      }
       if (result.events.length === 0) {
         backoffMs = 0;
         for (const w of waitersBeforeRead) w();
@@ -149,7 +152,10 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
         cursor = next;
       }
       backoffMs = 0;
-      if (stopped) return;
+      if (stopped) {
+        for (const w of waitersBeforeRead) w();
+        return;
+      }
       // Poll again right away: more may be waiting (full page) or a push arrived meanwhile.
       schedule(0);
     } catch (error) {

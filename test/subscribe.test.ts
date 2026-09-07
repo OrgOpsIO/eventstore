@@ -251,4 +251,32 @@ describe("subscribe", () => {
     expect(seen).toEqual(["Late"]);
     await sub.stop();
   });
+
+  it("stop() during an in-flight poll releases pending whenCaughtUp() waiters", async () => {
+    const inner = new MemoryStore();
+    let release: (() => void) | undefined;
+    let stallNext = false;
+    const stalling: EventStore = {
+      ...inner,
+      query: async (q, o) => {
+        const result = await inner.query(q, o);
+        if (stallNext) {
+          stallNext = false;
+          await new Promise<void>((r) => (release = r));
+        }
+        return result;
+      },
+      append: (e) => inner.append(e),
+      appendIf: (e, c) => inner.appendIf(e, c),
+      close: () => inner.close(),
+    };
+    const sub = subscribe("shutdown", { types: ["X"] }, () => {}, { store: stalling, pollIntervalMs: 20 });
+    await sub.whenCaughtUp();
+    stallNext = true;
+    const pending = sub.whenCaughtUp();
+    await new Promise((r) => setTimeout(r, 10));
+    const stopping = sub.stop();
+    release?.();
+    await Promise.all([stopping, pending]); // must not hang
+  });
 });
