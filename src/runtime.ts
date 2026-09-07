@@ -1,5 +1,5 @@
 import { runCommand, type CommandOutcome, type CommandSpec, type RawCommandSpec } from "./command.js";
-import { ContextCache, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
+import { CacheBudget, ContextCache, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
 import { ConflictError, NotConfiguredError, UsageError } from "./errors.js";
 import { MemoryStore } from "./memory.js";
 import { buildSchema, type Definitions, type EventRegistry, type RecordedEventOf, type RegistryLike } from "./registry.js";
@@ -45,6 +45,12 @@ export interface EventStoreConfig {
   readonly postgres?: PostgresOptions;
   /** In-process incremental context cache, one per tenant view. `false` disables it. */
   readonly contextCache?: ContextCacheOptions | false;
+  /**
+   * How many tenant views (`forTenant(id)`) stay memoised with their caches. Least recently
+   * used views are dropped beyond this (default 10 000); a dropped tenant's next command
+   * simply reads its context cold once.
+   */
+  readonly maxTenantViews?: number;
   readonly clock?: () => Date;
 }
 
@@ -105,7 +111,9 @@ export function createEventStore(config: EventStoreConfig): EventStoreApi {
     }
     return storePromise;
   };
-  return buildApi({ schema, store, created: () => storePromise !== undefined, config, tenantId: undefined, views: new Map() });
+  const cacheOptions = config.contextCache === false ? { max: 0 } : (config.contextCache ?? {});
+  const budget = new CacheBudget(cacheOptions.totalMaxBytes ?? 256 * 1024 * 1024);
+  return buildApi({ schema, store, created: () => storePromise !== undefined, config, tenantId: undefined, views: new Map(), budget });
 }
 
 interface ApiParts {
@@ -115,8 +123,10 @@ interface ApiParts {
   readonly created: () => boolean;
   readonly config: EventStoreConfig;
   readonly tenantId: string | undefined;
-  /** Tenant views, shared by the root api and every view, so `forTenant(id)` is memoised. */
+  /** Tenant views, shared by the root api and every view, so `forTenant(id)` is memoised (bounded LRU). */
   readonly views: Map<string, EventStoreApi>;
+  /** Process-wide byte budget shared by every view's context cache. */
+  readonly budget: CacheBudget;
 }
 
 function buildApi(parts: ApiParts): EventStoreApi {
@@ -136,7 +146,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
   // One cache per view, allocated once: tenant views never share entries. `false` → `max: 0` (no caching, same code path).
   let cache: ContextCache | undefined;
   const cacheFor = async (): Promise<ContextCache> => {
-    if (!cache) cache = new ContextCache(await view(), config.contextCache === false ? { max: 0 } : (config.contextCache ?? {}));
+    if (!cache) cache = new ContextCache(await view(), { ...(config.contextCache === false ? { max: 0 } : (config.contextCache ?? {})), budget: parts.budget });
     return cache;
   };
 
@@ -175,9 +185,18 @@ function buildApi(parts: ApiParts): EventStoreApi {
       if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");
       if (id === tenantId) return api;
       let existing = parts.views.get(id);
-      if (!existing) {
+      if (existing) {
+        parts.views.delete(id); // move to the most-recently-used end
+      } else {
         existing = buildApi({ ...parts, tenantId: id });
-        parts.views.set(id, existing);
+      }
+      parts.views.set(id, existing);
+      const maxViews = config.maxTenantViews ?? 10_000;
+      while (parts.views.size > maxViews) {
+        const oldest = parts.views.entries().next().value;
+        if (!oldest) break;
+        oldest[1].invalidate(); // release its cache entries from the shared budget
+        parts.views.delete(oldest[0]);
       }
       return existing;
     },

@@ -181,6 +181,8 @@ await es.appendIf(newEvents, ctx);
 
 A context larger than `contextCache.maxEvents` (default 100 000) is refused rather than silently truncated — a decision over a truncated context would be wrong. Narrow the query, or raise the limit deliberately.
 
+**Sizing.** The cache holds fold states, not events, so its size follows your folds. Three bounds keep a process under a fixed ceiling: `contextCache.max` entries per tenant view (default 1 000), `contextCache.maxBytes` per view (64 MiB) and `contextCache.totalMaxBytes` for the whole process (256 MiB) — when the total is exceeded the least recently used entries of *any* view are dropped. Sizes come from `estimateSize` (a structural estimate that understands Map/Set; override with `sizeOf`). Tenant views themselves are a bounded LRU too (`maxTenantViews`, default 10 000). A dropped entry or view costs one cold context read on its next command, nothing else. Transient memory during a load is the delta: roughly 0.5–1 KB per event with small payloads, so a cold read of a 10 000-event context uses ~10 MB for a moment.
+
 ## Tenants
 
 ```ts

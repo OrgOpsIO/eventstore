@@ -4,6 +4,7 @@ import {
   ConflictError,
   ContextCache,
   MemoryStore,
+  estimateSize,
   UnindexableContextError,
   UniqueViolationError,
   ValidationError,
@@ -266,6 +267,41 @@ describe("memory store + api", () => {
     expect(scopeLockKey("k", "v", "s1")).not.toBe(scopeLockKey("k", "v", "s2"));
     expect(globalLockKey("s1")).not.toBe(GLOBAL_LOCK_KEY);
     expect(typeof lockKeyOf("x", "s")).toBe("bigint");
+  });
+
+  it("estimateSize understands Maps, arrays and strings", () => {
+    const small = estimateSize({ a: 1 });
+    const map = estimateSize(new Map(Array.from({ length: 100 }, (_, i) => [`k${i}`, { title: "x".repeat(100) }])));
+    expect(map).toBeGreaterThan(100 * 200);
+    expect(estimateSize("x".repeat(1000))).toBeGreaterThan(2000);
+    expect(small).toBeGreaterThan(0);
+  });
+
+  it("the process-wide budget evicts across tenant views, oldest first", async () => {
+    const api = createEventStore({
+      events: [articles],
+      tenant: { scopeKey: "workspaceProvisionedId" },
+      contextCache: { totalMaxBytes: 3000, sizeOf: () => 1000 },
+    });
+    const fold = (events: readonly import("../src/index.js").RecordedEvent[], state: number) => state + events.length;
+    for (const ws of ["a", "b", "c", "d"]) {
+      await api.forTenant(ws).append([articles.ArticleDrafted({ title: ws, slug: ws }, { workspaceProvisionedId: ws })]);
+      await api.forTenant(ws).context({ query: articles.$filter(), fold, initial: 0 });
+    }
+    // four entries of 1000 bytes against a 3000-byte budget: the oldest view's entry is gone
+    const a = await api.forTenant("a").context({ query: articles.$filter(), fold, initial: 0 });
+    const d = await api.forTenant("d").context({ query: articles.$filter(), fold, initial: 0 });
+    expect(a.cacheHit).toBe(false);
+    expect(d.cacheHit).toBe(true);
+  });
+
+  it("tenant views are a bounded LRU", async () => {
+    const api = createEventStore({ events: [articles], tenant: { scopeKey: "workspaceProvisionedId" }, maxTenantViews: 2 });
+    const first = api.forTenant("t1");
+    api.forTenant("t2");
+    api.forTenant("t3"); // evicts t1
+    expect(api.forTenant("t1")).not.toBe(first);
+    expect(api.forTenant("t3")).toBe(api.forTenant("t3"));
   });
 
   it("$parse narrows types", async () => {

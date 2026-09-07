@@ -50,7 +50,7 @@ export type {
 } from "./registry.js";
 export { MemoryStore, cursorOf, isLiveStore } from "./memory.js";
 export type { AppendedListener, LiveStore, MemoryStoreOptions } from "./memory.js";
-export { ContextCache } from "./context.js";
+export { CacheBudget, ContextCache, estimateSize } from "./context.js";
 export type { ContextCacheOptions, ContextSpec, Fold, LoadedContext } from "./context.js";
 export { CONFLICT_CODE, httpStatusOf, isRejection, reject, rejectMissing, runCommand } from "./command.js";
 export type { CommandOutcome, CommandRuntime, CommandSpec, Decided, DecideTools, Decision, RawCommandSpec, Rejection } from "./command.js";
