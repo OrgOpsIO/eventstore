@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
   ConflictError,
+  ContextCache,
   MemoryStore,
   UnindexableContextError,
   UniqueViolationError,
@@ -227,6 +228,18 @@ describe("memory store + api", () => {
     expect(loaded.state.get(d.id)).toEqual({ id: d.id, title: "T", body: "b", archived: false });
     const empty = new Map<string, Article>();
     expect(byArticle([], empty)).toBe(empty); // no events → same Map instance
+  });
+
+  it("context cache honours a byte budget", async () => {
+    const store = new MemoryStore({ schema: buildSchema([articles], { strict: false }) });
+    const cache = new ContextCache(store, { maxBytes: 100, sizeOf: (s) => JSON.stringify(s).length });
+    await store.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
+    const fold = (events: readonly import("../src/index.js").RecordedEvent[], state: string[]) => [...state, ...events.map((e) => e.id + "-".repeat(60))];
+    await cache.load({ query: { types: ["ArticleDrafted"] }, fold, initial: [] as string[] });
+    expect(cache.size).toBe(1);
+    await cache.load({ query: { types: ["ArticleDrafted", "ArticleArchived"] }, fold, initial: [] as string[] });
+    expect(cache.size).toBe(1); // the second entry (>100 bytes each) evicted the first
+    expect(cache.byteSize).toBeLessThanOrEqual(200);
   });
 
   it("$parse narrows types", async () => {
