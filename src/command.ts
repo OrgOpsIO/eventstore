@@ -49,8 +49,13 @@ export interface DecideTools {
 
 /** A command: its context query, an optional incremental fold, and the pure `decide`. */
 export interface CommandSpec<S, R> {
-  /** The context: all events the decision depends on. Also the consistency boundary. */
-  readonly context: Query;
+  /**
+   * The context: all events the decision depends on. Also the consistency boundary.
+   * Omit it for a pure create that reads nothing — the append is then unconditional and
+   * `decide` receives the initial state (or `[]`). Uniqueness of the created thing belongs
+   * to a `unique` path or to a command that does declare a context.
+   */
+  readonly context?: Query;
   /** Optional incremental fold. Without it, `decide` receives the raw context events (`S` = `readonly RecordedEvent[]`). */
   readonly fold?: Fold<S>;
   readonly initial?: S | (() => S);
@@ -62,6 +67,9 @@ export interface CommandSpec<S, R> {
 }
 
 /** Result of `es.command()`: `ok` with `result`/`appended`/`attempts`, or a `Rejection` (incl. the conflict code). */
+/** A command without a `fold`: `decide` receives the raw context events. */
+export type RawCommandSpec<R> = Omit<CommandSpec<readonly RecordedEvent[], R>, "fold" | "initial"> & { readonly fold?: undefined; readonly initial?: undefined };
+
 export type CommandOutcome<R = void> =
   | { readonly ok: true; readonly result: R; readonly appended: AppendResult | null; readonly attempts: number }
   | (Rejection & { readonly attempts: number });
@@ -96,7 +104,7 @@ export async function runCommand<S, R>(runtime: CommandRuntime, spec: CommandSpe
     if (attempt > 0) await backoff(attempt);
     let loaded: LoadedContext<S>;
     try {
-      loaded = await loadContext(runtime, spec);
+      loaded = spec.context === undefined ? initialContext(spec) : await loadContext(runtime, spec);
     } catch (err) {
       if (err instanceof TransientError && attempt < retries) continue;
       throw err;
@@ -108,6 +116,10 @@ export async function runCommand<S, R>(runtime: CommandRuntime, spec: CommandSpe
       return { ok: true, result: decided.result as R, appended: null, attempts: attempt + 1 };
     }
     try {
+      if (spec.context === undefined) {
+        const appended = await runtime.store.append(decided.events);
+        return { ok: true, result: decided.result as R, appended, attempts: attempt + 1 };
+      }
       const outcome = await runtime.store.appendIf(decided.events, loaded.ctx);
       if (outcome.ok) return { ok: true, result: decided.result as R, appended: outcome.appended, attempts: attempt + 1 };
       lastConflict = outcome.conflict;
@@ -127,16 +139,23 @@ export async function runCommand<S, R>(runtime: CommandRuntime, spec: CommandSpe
 
 const rawFold: Fold<readonly RecordedEvent[]> = (events, state) => [...state, ...events];
 
+function initialContext<S, R>(spec: CommandSpec<S, R>): LoadedContext<S> {
+  const initial = (spec.initial !== undefined ? spec.initial : ([] as unknown)) as S | (() => S);
+  const state = typeof initial === "function" ? (initial as () => S)() : initial;
+  return { state, ctx: { query: [], version: 0 }, delta: [], cacheHit: false };
+}
+
 async function loadContext<S, R>(runtime: CommandRuntime, spec: CommandSpec<S, R>): Promise<LoadedContext<S>> {
+  const context = spec.context as Query;
   if (spec.fold) {
     // `null` is a legitimate initial state ("nothing exists yet"); only `undefined` means "not given".
     const initial = (spec.initial !== undefined ? spec.initial : ([] as unknown)) as S | (() => S);
-    if (runtime.cache && !spec.noCache) return runtime.cache.load<S>({ query: spec.context, fold: spec.fold, initial });
-    const result = await runtime.store.query(spec.context);
+    if (runtime.cache && !spec.noCache) return runtime.cache.load<S>({ query: context, fold: spec.fold, initial });
+    const result = await runtime.store.query(context);
     const base = typeof initial === "function" ? (initial as () => S)() : initial;
     return { state: spec.fold(result.events, base), ctx: result.ctx, delta: result.events, cacheHit: false };
   }
-  const result = await runtime.store.query(spec.context);
+  const result = await runtime.store.query(context);
   return { state: rawFold(result.events, []) as unknown as S, ctx: result.ctx, delta: result.events, cacheHit: false };
 }
 

@@ -112,11 +112,13 @@ From this one declaration you get:
 - **typed reads**: `es.read(articles, query?)` returns the registry's union, re-validated through `$parse`, so `event.type === "ArticleDrafted"` narrows `event.data`.
 - **the store schema**: a B-tree per declared scope key (plus `CREATE STATISTICS` on the same expression), a unique index per `unique` path, an idempotency-key index (per tenant when a tenant scope key is configured), `(transaction_id, sequence_number)` for cursor reads. `postgres: { typeIndex: true }` adds `(event_type, sequence_number)` for type-only reads; `adhocQueries: true` adds a GIN index for `where`.
 
+A pre-built store passed as `store` must have been built from the same registries (`buildSchema(events, { tenantScopeKey, strict })`); `configure()` refuses a store whose scope keys, uniques, tenant key or strictness disagree, because those are what its indexes enforce.
+
 On the wire an event is `{ articleDraftedId, title, slug, scopes: { workspaceProvisionedId } }` in a JSONB `payload` column — Ralf Westphal's convention as used in an earlier in-house store. Flat ids (`employeeId` as a plain field) keep working: a scope key matches `scopes.K`, the event's own id, or a top-level string field `K`. The envelope rules hold for every event, declared or not: `data` may not contain the own id key or a `scopes` key, and a value at a declared scope key must be a string.
 
 ### Uniqueness
 
-A `unique` path becomes a partial unique index on the events table, scoped to that event type: `unique: ["slug"]` on `ArticleDrafted` means no two `ArticleDrafted` rows share a slug, across all tenants. It is enforced by Postgres, not by your decision — a concurrent duplicate raises `UniqueViolationError` (409) *after* the guard passed, and `es.command()` deliberately does not retry it. So: check it in `decide` for the good error message, and let the index be the truth. `unique: ["scopes.magicLinkRequestedId"]` makes a back-link single-use — the standard way to model "consume this token once". A value that can be released and re-claimed (a per-tenant slug that frees up on archive) is not a `unique` path; it is a CCC rule in `decide` over a tenant-wide context.
+A `unique` path becomes a partial unique index on the events table, scoped to that event type: `unique: ["slug"]` on `ArticleDrafted` means no two `ArticleDrafted` rows share a slug, across all tenants. It is enforced by Postgres, not by your decision — a concurrent duplicate raises `UniqueViolationError` (409) *after* the guard passed, and `es.command()` deliberately does not retry it. So: check it in `decide` for the good error message, and let the index be the truth. `unique: ["scopes.magicLinkRequestedId"]` makes a back-link single-use — the standard way to model "consume this token once". A value that can be released and re-claimed (a per-tenant slug that frees up on archive) is not a `unique` path; it is a CCC rule. Make the claimed value itself a scope key so the guard is narrow and lockable: `SlugClaimed { }` with `scopes: ["workspaceProvisionedId", "slug"]` and `SlugReleased` likewise; the drafting command's context is then `{ types: ["SlugClaimed", "SlugReleased"], scopes: { workspaceProvisionedId, slug } }` — two drafts with different slugs never contend, two with the same slug are serialised on exactly that pair. A tenant-wide context (`scopes: { workspaceProvisionedId }` only) also works but serialises every draft of the tenant.
 
 ## The store contract
 
@@ -147,6 +149,16 @@ The well-known single-statement CTE guard (`WITH context AS (SELECT MAX(...)) IN
 **Strict mode** (default) refuses a guard query that has no declared scope key: the query would be neither indexable nor lockable. Set `strict: false` to accept the global lock instead. The tenant key is treated specially: a guard that names only the tenant serialises that tenant (exclusive tenant lock), while every append holds the tenant lock shared — so scope-level guards never contend on it.
 
 **Lock salt.** Advisory-lock keys are hashes of public strings, so any database role could compute and hold them. Pass `lockSalt` (a per-deployment secret) in `configure()` to make them unguessable.
+
+### Commands that read nothing
+
+A pure create (register an account, provision a workspace) has no facts to protect. Omit `context`: `decide` receives the initial state and the append is unconditional — no guard, no lock beyond the events' own scope pairs. Whatever must be unique about the created thing belongs to a `unique` path, or to a command that does declare a context.
+
+```ts
+await es.forPlatform().command({
+  decide: () => ({ events: [accounts.AccountRegistered({ email })] }),   // UniqueViolationError if the email is taken
+});
+```
 
 ## Contexts, incrementally
 
@@ -186,7 +198,7 @@ await resetCursor("search-index", cursors);      // forget the cursor → replay
 on(articles.$filter(), (events) => sse.push(events), { store: memoryStore });   // in-process, fire-and-forget; the store must be a LiveStore (MemoryStore)
 ```
 
-Durable, gap-free, at-least-once: reads settled events beyond a `(transactionId, sequence)` cursor, advances only after your handler resolved, retries with back-off. `events` stays the only table — the cursor store is pluggable.
+Durable, gap-free, at-least-once: reads settled events beyond a `(transactionId, sequence)` cursor, advances only after your handler resolved, retries with back-off. `events` stays the only table — the cursor store is pluggable. Subscriptions are not owned by `es`: stop them (`await sub.stop()`) before `es.close()`, or their next poll fails against a closed pool and is retried until you stop it.
 
 ## Testing (`@orgops/eventstore/testing`)
 

@@ -3,7 +3,9 @@
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,
@@ -12,7 +14,31 @@
     "declaration": true,
     "noEmit": true,
     "verbatimModuleSyntax": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@orgops/eventstore": [
+        "src/index.ts"
+      ],
+      "@orgops/eventstore/postgres": [
+        "src/postgres/index.ts"
+      ],
+      "@orgops/eventstore/subscribe": [
+        "src/subscribe/index.ts"
+      ],
+      "@orgops/eventstore/testing": [
+        "src/testing/index.ts"
+      ],
+      "@orgops/eventstore/internal": [
+        "src/internal.ts"
+      ]
+    }
   },
-  "include": ["src", "test"]
+  "include": [
+    "src",
+    "test",
+    "examples"
+  ]
 }

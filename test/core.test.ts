@@ -191,12 +191,24 @@ describe("memory store + api", () => {
 
   it("close() never connects a store that was never used", async () => {
     let created = 0;
-    const api = createEventStore({ store: () => (created++, new MemoryStore()) });
+    const api = createEventStore({ store: (schema) => (created++, new MemoryStore({ schema })) });
     await api.close();
     expect(created).toBe(0);
     await api.append([{ type: "Ping", data: {} }]);
     await api.close();
     expect(created).toBe(1);
+  });
+
+  it("refuses a pre-built store whose schema disagrees with the registries", async () => {
+    const api = createEventStore({ events: [articles], store: new MemoryStore() }); // default schema: no scope keys, non-strict
+    await expect(api.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })])).rejects.toThrow(/different schema/);
+  });
+
+  it("a command without context appends unconditionally", async () => {
+    const es = newApi().forTenant(WS);
+    const out = await es.command({ decide: () => ({ events: [articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })], result: "made" }) });
+    expect(out.ok && out.result).toBe("made");
+    expect((await es.query(articles.$filter())).events).toHaveLength(1);
   });
 
   it("$parse narrows types", async () => {

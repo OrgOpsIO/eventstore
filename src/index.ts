@@ -52,7 +52,7 @@ export type { AppendedListener, LiveStore, MemoryStoreOptions } from "./memory.j
 export { ContextCache } from "./context.js";
 export type { ContextCacheOptions, ContextSpec, Fold, LoadedContext } from "./context.js";
 export { CONFLICT_CODE, httpStatusOf, isRejection, reject, rejectMissing, runCommand } from "./command.js";
-export type { CommandOutcome, CommandRuntime, CommandSpec, Decided, DecideTools, Decision, Rejection } from "./command.js";
+export type { CommandOutcome, CommandRuntime, CommandSpec, Decided, DecideTools, Decision, RawCommandSpec, Rejection } from "./command.js";
 export { PLATFORM_TENANT_ID, scopedToTenant } from "./tenant.js";
 export type { TenantConfig } from "./tenant.js";
 export { configure, createEventStore, es, isConfigured, reset } from "./runtime.js";

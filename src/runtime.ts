@@ -1,6 +1,6 @@
-import { runCommand, type CommandOutcome, type CommandSpec } from "./command.js";
+import { runCommand, type CommandOutcome, type CommandSpec, type RawCommandSpec } from "./command.js";
 import { ContextCache, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
-import { ConflictError, NotConfiguredError } from "./errors.js";
+import { ConflictError, NotConfiguredError, UsageError } from "./errors.js";
 import { MemoryStore } from "./memory.js";
 import { buildSchema, type Definitions, type EventRegistry, type RecordedEventOf, type RegistryLike } from "./registry.js";
 import type { CreatePostgresStoreOptions } from "./postgres/store.js";
@@ -57,6 +57,7 @@ export interface EventStoreApi extends EventStore {
    */
   read<D extends Definitions>(registry: EventRegistry<D>, query?: Query, options?: QueryOptions): Promise<QueryResult<RecordedEventOf<D>>>;
   /** Run a CCC command: read → decide → `appendIf`, retrying on conflict. */
+  command<R = void>(spec: RawCommandSpec<R>): Promise<CommandOutcome<R>>;
   command<S, R = void>(spec: CommandSpec<S, R>): Promise<CommandOutcome<R>>;
   /** Load a context incrementally (cached per query in this view). */
   context<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>>;
@@ -127,7 +128,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
         if (tenantId === undefined || !config.tenant) return inner;
         // A store with tenant sessions (RLS) binds the session; the wrapper narrows and stamps.
         const bound = hasTenantSessions(inner) ? inner.withTenant(tenantId) : inner;
-        return scopedToTenant(bound, config.tenant, tenantId);
+        return scopedToTenant(bound, config.tenant, tenantId, schema.idKeyOf);
       });
     }
     return viewPromise;
@@ -164,9 +165,9 @@ function buildApi(parts: ApiParts): EventStoreApi {
       if (!outcome.ok) throw new ConflictError(outcome.conflict);
       return outcome.appended;
     },
-    async command(spec) {
+    command: (async (spec: CommandSpec<unknown, unknown>) => {
       return runCommand({ store: await view(), cache: await cacheFor(), clock: config.clock }, spec);
-    },
+    }) as EventStoreApi["command"],
     async context(spec) {
       return (await cacheFor()).load(spec);
     },
@@ -196,7 +197,9 @@ function buildApi(parts: ApiParts): EventStoreApi {
 
 async function resolveStore(config: EventStoreConfig, schema: StoreSchema): Promise<EventStore> {
   if (config.store) {
-    return typeof config.store === "function" ? config.store(schema) : config.store;
+    const store = typeof config.store === "function" ? await config.store(schema) : config.store;
+    assertSchemaAgrees(store, schema);
+    return store;
   }
   if (config.connection) {
     const { createPostgresStore } = await import("./postgres/index.js");
@@ -208,6 +211,29 @@ async function resolveStore(config: EventStoreConfig, schema: StoreSchema): Prom
     });
   }
   return new MemoryStore({ schema, clock: config.clock });
+}
+
+/**
+ * A pre-built store carries its own schema (that is what installed its indexes and uniques);
+ * silently using it with different registries would enforce a different set of rules than
+ * the one the caller declared.
+ */
+function assertSchemaAgrees(store: EventStore, schema: StoreSchema): void {
+  const own = (store as { schema?: StoreSchema }).schema;
+  if (!own) return;
+  const problems: string[] = [];
+  const keys = (a: readonly string[]) => [...a].sort().join(",");
+  if (keys(own.scopeKeys) !== keys(schema.scopeKeys)) problems.push(`scope keys [${keys(own.scopeKeys)}] vs [${keys(schema.scopeKeys)}]`);
+  const uniques = (u: StoreSchema["uniques"]) => u.map((x) => `${x.type}.${x.path}`).sort().join(",");
+  if (uniques(own.uniques) !== uniques(schema.uniques)) problems.push(`uniques [${uniques(own.uniques)}] vs [${uniques(schema.uniques)}]`);
+  if ((own.tenantScopeKey ?? "") !== (schema.tenantScopeKey ?? "")) problems.push(`tenant key ${own.tenantScopeKey ?? "none"} vs ${schema.tenantScopeKey ?? "none"}`);
+  if (own.strict !== schema.strict) problems.push(`strict ${own.strict} vs ${schema.strict}`);
+  if (problems.length > 0) {
+    throw new UsageError(
+      `eventstore: the store you passed was built with a different schema than configure() derives from your registries — ${problems.join("; ")}. ` +
+        `Build the store with buildSchema(events, { scopeKeys, tenantScopeKey, strict }) from the same registries, or omit \`store\` and let configure() create it.`,
+    );
+  }
 }
 
 // ── ambient instance ──────────────────────────────────────────────────────────
@@ -252,7 +278,7 @@ export const es: EventStoreApi = {
   append: (e) => current().append(e),
   appendIf: (e, c) => current().appendIf(e, c),
   appendIfOrThrow: (e, c) => current().appendIfOrThrow(e, c),
-  command: (s) => current().command(s),
+  command: ((s: CommandSpec<unknown, unknown>) => current().command(s)) as EventStoreApi["command"],
   context: (s) => current().context(s),
   forTenant: (id) => current().forTenant(id),
   forPlatform: () => current().forPlatform(),
