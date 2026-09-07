@@ -20,7 +20,8 @@ describe.skipIf(!url)("PostgresStore conformance", () => {
         await admin.query(`TRUNCATE "${table}" RESTART IDENTITY`);
       }
       await admin.end();
-      return new PostgresStore({ connection: url!, schema, table, poolSize: 25 });
+      // rebuildScopeIndexes: repairs a foreign es_scope left behind by an aborted run (scratch DB)
+      return new PostgresStore({ connection: url!, schema, table, poolSize: 25, rebuildScopeIndexes: true });
     },
     { test: it },
   );

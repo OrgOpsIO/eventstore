@@ -26,8 +26,8 @@ await store.append([accounts.AccountOpened({ owner: "warmup" })]);
 const accountIds = [];
 console.log(`seeding ${SEED} events across ${ACCOUNTS} accounts …`);
 let t0 = Date.now();
-for (let i = 0; i < ACCOUNTS; i += 250) {
-  const batch = Array.from({ length: Math.min(250, ACCOUNTS - i) }, (_, j) => accounts.AccountOpened({ owner: `acc-${i + j}` }));
+for (let i = 0; i < ACCOUNTS; i += 50) {
+  const batch = Array.from({ length: Math.min(50, ACCOUNTS - i) }, (_, j) => accounts.AccountOpened({ owner: `acc-${i + j}` }));
   const r = await store.append(batch);
   const opened = await store.query({ types: ["AccountOpened"], where: batch.map((b) => ({ owner: b.data.owner })) });
   for (const e of opened.events) accountIds.push(e.id);

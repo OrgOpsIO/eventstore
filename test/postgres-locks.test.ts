@@ -125,27 +125,34 @@ describe.skipIf(!url)("PostgresStore lock plan", () => {
     await c.ensureInstalled();
     const qual = await admin.query("SELECT qual FROM pg_policies WHERE policyname = $1", [`es_${rlsTable}_tenant_isolation`]);
     expect(String(qual.rows[0]?.qual)).toContain("'tenantId'::text");
-    expect(a.installWarnings).toEqual([]);
+    expect(a.warnings()).toEqual([]);
     await Promise.all([a.close(), b.close(), c.close()]);
     await admin.end();
   });
 
-  it("refuses to apply a changed es_scope body over fingerprinted indexes unless asked", async () => {
+  it("gates on THIS table's index fingerprints: a stale index comment refuses, a foreign function comment with our semantics is adopted", async () => {
     const admin = new pg.Pool({ connectionString: url, max: 1 });
-    await admin.query("COMMENT ON FUNCTION es_scope(jsonb, text) IS 'es:0000'"); // pretend an older SDK installed it
+    const idx = `es_${TABLE}_scope_articleId`;
+    // a foreign fingerprint on the function alone is not a stale index: the probes pass → adopted and re-stamped
+    await admin.query("COMMENT ON FUNCTION public.es_scope(jsonb, text) IS 'es:0000'");
+    const adopt = new PostgresStore({ connection: url!, schema, table: TABLE });
+    await adopt.ensureInstalled();
+    const fp = await admin.query("SELECT obj_description(p.oid, 'pg_proc') AS fp FROM pg_proc p WHERE proname = 'es_scope'");
+    expect(String(fp.rows[0]?.fp)).toMatch(/^es:[0-9a-f]{64}$/);
+    // a stale INDEX comment is the real gate
+    await admin.query(`COMMENT ON INDEX "${idx}" IS 'es:0000'`);
     const s = new PostgresStore({ connection: url!, schema, table: TABLE });
     await expect(s.ensureInstalled()).rejects.toThrow(/CREATE INDEX CONCURRENTLY/);
     const rebuild = new PostgresStore({ connection: url!, schema, table: TABLE, rebuildScopeIndexes: true });
     await rebuild.ensureInstalled();
-    const fp = await admin.query("SELECT obj_description(p.oid, 'pg_proc') AS fp FROM pg_proc p WHERE proname = 'es_scope'");
-    expect(String(fp.rows[0]?.fp)).toMatch(/^es:[0-9a-f]{64}$/);
-    const idx = await admin.query("SELECT 1 FROM pg_indexes WHERE indexname = $1", [`es_${TABLE}_scope_articleId`]);
-    expect(idx.rowCount).toBe(1);
-    // a pre-fingerprint function (no comment) is replaced silently
-    await admin.query("COMMENT ON FUNCTION es_scope(jsonb, text) IS NULL");
+    const after = await admin.query("SELECT obj_description(to_regclass($1), 'pg_class') AS fp", [`"${idx}"`]);
+    expect(String(after.rows[0]?.fp)).toMatch(/^es:[0-9a-f]{64}$/);
+    // a pre-fingerprint function (no comment) with our semantics is adopted, indexes untouched
+    await admin.query("COMMENT ON FUNCTION public.es_scope(jsonb, text) IS NULL");
     const quiet = new PostgresStore({ connection: url!, schema, table: TABLE });
     await quiet.ensureInstalled();
-    await Promise.all([s.close(), rebuild.close(), quiet.close()]);
+    expect(quiet.warnings()).toEqual([]);
+    await Promise.all([adopt.close(), s.close(), rebuild.close(), quiet.close()]);
     await admin.end();
   });
 });
