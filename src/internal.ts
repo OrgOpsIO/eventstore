@@ -4,6 +4,7 @@
  */
 export {
   GLOBAL_LOCK_KEY,
+  globalLockKey,
   conditionLockKeys,
   contains,
   eventLockKeys,

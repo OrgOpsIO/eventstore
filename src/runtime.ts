@@ -42,8 +42,14 @@ export interface EventStoreConfig {
   readonly tenant?: TenantConfig;
   /** Strict mode: guard queries must be lockable through declared scope keys. Default `true`. */
   readonly strict?: boolean;
+  /**
+   * Per-deployment secret mixed into every advisory-lock key. Without it the keys are plain
+   * hashes of public strings and any database role can compute and hold them. Set it from a
+   * secret; changing it later is safe (locks are transaction-scoped).
+   */
+  readonly lockSalt?: string;
   readonly postgres?: PostgresOptions;
-  /** In-process incremental context cache. `false` disables it. */
+  /** In-process incremental context cache, one per tenant view. `false` disables it. */
   readonly contextCache?: ContextCacheOptions | false;
   readonly clock?: () => Date;
 }
@@ -53,23 +59,39 @@ export interface EventStoreApi extends EventStore {
   readonly schema: StoreSchema;
   /** Run a CCC command: read → decide → `appendIf`, retrying on conflict. */
   command<S, R = void>(spec: CommandSpec<S, R>): Promise<CommandOutcome<R>>;
-  /** Load a context incrementally (cached per query in this process). */
+  /** Load a context incrementally (cached per query in this view). */
   context<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>>;
   /** Like `appendIf`, but throws `ConflictError` instead of returning the conflict. */
   appendIfOrThrow(events: readonly NewEvent[], ctx: ContextHandle): Promise<AppendResult>;
-  /** A view bound to one tenant. Requires `tenant` in the config. */
+  /**
+   * A view bound to one tenant: queries narrowed, events stamped, its own context cache.
+   * Memoised per tenant id, so calling it per request is free. Requires `tenant` in the config.
+   */
   forTenant(tenantId: string): EventStoreApi;
   /** The platform tenant (accounts, registrations, …). */
   forPlatform(): EventStoreApi;
-  /** The underlying store, initialised. */
+  /** The underlying store (memory or Postgres), initialised. Not narrowed to a tenant. */
   store(): Promise<EventStore>;
-  /** Forget cached contexts (all, or one query). */
+  /** Forget this view's cached contexts (all, or one query). */
   invalidate(query?: Query): void;
+  /** Closes the underlying store. On a tenant view this is a no-op — close the root api. */
+  close(): Promise<void>;
+}
+
+/** A store that can bind a database session to a tenant (e.g. the Postgres store with `rls: true`). */
+interface TenantSessionStore extends EventStore {
+  withTenant(tenantId: string): EventStore;
+}
+
+function hasTenantSessions(store: EventStore): store is TenantSessionStore {
+  return typeof (store as Partial<TenantSessionStore>).withTenant === "function";
 }
 
 export function createEventStore(config: EventStoreConfig): EventStoreApi {
   const schema = buildSchema(config.events ?? [], {
-    scopeKeys: [...(config.scopeKeys ?? []), ...(config.tenant ? [config.tenant.scopeKey] : [])],
+    scopeKeys: config.scopeKeys ?? [],
+    tenantScopeKey: config.tenant?.scopeKey,
+    lockSalt: config.lockSalt,
     strict: config.strict ?? true,
   });
   let storePromise: Promise<EventStore> | undefined;
@@ -82,7 +104,7 @@ export function createEventStore(config: EventStoreConfig): EventStoreApi {
     }
     return storePromise;
   };
-  return buildApi({ schema, store, config, tenantId: undefined, cache: undefined });
+  return buildApi({ schema, store, config, tenantId: undefined, views: new Map() });
 }
 
 interface ApiParts {
@@ -90,24 +112,28 @@ interface ApiParts {
   readonly store: () => Promise<EventStore>;
   readonly config: EventStoreConfig;
   readonly tenantId: string | undefined;
-  readonly cache: ContextCache | undefined;
+  /** Tenant views, shared by the root api and every view, so `forTenant(id)` is memoised. */
+  readonly views: Map<string, EventStoreApi>;
 }
 
 function buildApi(parts: ApiParts): EventStoreApi {
-  const { schema, config } = parts;
+  const { schema, config, tenantId } = parts;
   let viewPromise: Promise<EventStore> | undefined;
   const view = (): Promise<EventStore> => {
     if (!viewPromise) {
-      viewPromise = parts.store().then((inner) =>
-        parts.tenantId !== undefined && config.tenant ? scopedToTenant(inner, config.tenant, parts.tenantId) : inner,
-      );
+      viewPromise = parts.store().then((inner) => {
+        if (tenantId === undefined || !config.tenant) return inner;
+        // A store with tenant sessions (RLS) binds the session; the wrapper narrows and stamps.
+        const bound = hasTenantSessions(inner) ? inner.withTenant(tenantId) : inner;
+        return scopedToTenant(bound, config.tenant, tenantId);
+      });
     }
     return viewPromise;
   };
-  let cache: ContextCache | undefined = parts.cache;
-  const cacheFor = async (): Promise<ContextCache | undefined> => {
-    if (config.contextCache === false) return undefined;
-    if (!cache) cache = new ContextCache(await view(), config.contextCache ?? {});
+  // One cache per view, allocated once: tenant views never share entries. `false` → `max: 0` (no caching, same code path).
+  let cache: ContextCache | undefined;
+  const cacheFor = async (): Promise<ContextCache> => {
+    if (!cache) cache = new ContextCache(await view(), config.contextCache === false ? { max: 0 } : (config.contextCache ?? {}));
     return cache;
   };
 
@@ -131,14 +157,17 @@ function buildApi(parts: ApiParts): EventStoreApi {
       return runCommand({ store: await view(), cache: await cacheFor(), clock: config.clock }, spec);
     },
     async context(spec) {
-      const c = await cacheFor();
-      if (c) return c.load(spec);
-      return new ContextCache(await view(), { max: 0 }).load(spec);
+      return (await cacheFor()).load(spec);
     },
-    forTenant(tenantId: string): EventStoreApi {
+    forTenant(id: string): EventStoreApi {
       if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");
-      if (tenantId === parts.tenantId) return api;
-      return buildApi({ ...parts, tenantId, cache: undefined });
+      if (id === tenantId) return api;
+      let existing = parts.views.get(id);
+      if (!existing) {
+        existing = buildApi({ ...parts, tenantId: id });
+        parts.views.set(id, existing);
+      }
+      return existing;
     },
     forPlatform(): EventStoreApi {
       return api.forTenant(config.tenant?.platformId ?? PLATFORM_TENANT_ID);
@@ -148,7 +177,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       cache?.invalidate(query);
     },
     async close(): Promise<void> {
-      if (parts.tenantId === undefined) await (await parts.store()).close();
+      if (tenantId === undefined) await (await parts.store()).close();
     },
   };
   return api;
@@ -165,7 +194,6 @@ async function resolveStore(config: EventStoreConfig, schema: StoreSchema): Prom
       schema,
       ...(config.postgres ?? {}),
       tenantScopeKey: config.tenant?.scopeKey,
-      clock: config.clock,
     });
   }
   return new MemoryStore({ schema, clock: config.clock });

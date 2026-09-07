@@ -19,6 +19,7 @@ export {
   ConflictError,
   EventStoreError,
   NotConfiguredError,
+  PolicyViolationError,
   TransientError,
   UnindexableContextError,
   UniqueViolationError,

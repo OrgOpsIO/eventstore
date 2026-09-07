@@ -1,6 +1,6 @@
 export { conformanceSuite } from "./conformance.js";
 export type { ConformanceHooks, MakeStore } from "./conformance.js";
-export { conformanceEvents, conformanceSchema } from "./schema.js";
+export { conformanceEvents, conformanceSchema, conformanceUpcastEvents, conformanceUpcastSchema } from "./schema.js";
 export type { ConformanceSchemaOptions } from "./schema.js";
 export { given } from "./spec.js";
 export type { ExpectedEvent, SpecOptions, Then, When } from "./spec.js";

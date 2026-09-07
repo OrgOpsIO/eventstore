@@ -34,7 +34,9 @@ export type ScopesInputOf<Def extends EventDefinition> = Record<RequiredScopeKey
 export type ScopesOf<Def extends EventDefinition> = ScopesInputOf<Def> & Scopes;
 
 type ScopesArg<Def extends EventDefinition> = [RequiredScopeKeys<Def>] extends [never]
-  ? [scopes?: Partial<Record<OptionalScopeKeys<Def>, string>>]
+  ? [OptionalScopeKeys<Def>] extends [never]
+    ? [scopes?: Record<string, never>] // no scope keys at all: only `{}` is accepted
+    : [scopes?: Partial<Record<OptionalScopeKeys<Def>, string>>]
   : [scopes: ScopesInputOf<Def>];
 
 export type DataOf<Def extends EventDefinition> = output<Def["data"]>;
@@ -95,8 +97,12 @@ export type EventRegistry<D extends Definitions> = {
    * Unknown or unhandled types are skipped. A handler must return the next state.
    */
   $fold<S>(handlers: FoldHandlers<D, S>): Fold<S>;
-  /** One-shot: fold a complete list from `initial`. Not an incremental fold. */
-  $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>): (events: readonly RecordedEvent[]) => S;
+  /**
+   * One-shot: fold a complete list from `initial`. Deliberately NOT assignable to `Fold<S>`
+   * (its second parameter is typed `undefined`), so it cannot slot into `es.context()`/`es.command()`
+   * by accident and silently ignore the cached state.
+   */
+  $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>): (events: readonly RecordedEvent[], state?: undefined) => S;
   /** Narrow a recorded event to this registry's union, re-validating its data against the schema. Throws for unknown types. */
   $parse(event: RecordedEvent<string, unknown>): RecordedEventOf<D>;
   $is(event: RecordedEvent<string, unknown>): event is RecordedEventOf<D>;
@@ -219,6 +225,8 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
 export interface SchemaOptions {
   readonly scopeKeys?: readonly string[];
   readonly tenantScopeKey?: string;
+  /** Per-deployment secret mixed into advisory-lock keys (see `StoreSchema.lockSalt`). */
+  readonly lockSalt?: string;
   readonly strict?: boolean;
 }
 
@@ -247,6 +255,7 @@ export function buildSchema(registries: readonly RegistryLike[], options: Schema
   return {
     scopeKeys,
     ...(options.tenantScopeKey ? { tenantScopeKey: options.tenantScopeKey } : {}),
+    ...(options.lockSalt ? { lockSalt: options.lockSalt } : {}),
     uniques,
     strict: options.strict ?? true,
     idKeyOf,

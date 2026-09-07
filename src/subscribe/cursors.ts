@@ -1,6 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import type { Cursor } from "../index.js";
+import type { Cursor } from "../types.js";
 
 /**
  * Where a subscription remembers how far it got. Pluggable so the `events` table stays the

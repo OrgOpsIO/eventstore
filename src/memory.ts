@@ -18,6 +18,7 @@ import type {
   ContextHandle,
   Cursor,
   EventStore,
+  Filter,
   NewEvent,
   Query,
   QueryOptions,
@@ -48,20 +49,32 @@ interface Row {
   readonly metadata: Record<string, unknown>;
   readonly recordedAt: Date;
   readonly transactionId: string;
+  /** Memoised projection of the row (rows are immutable, `upcast` is deterministic). */
+  recorded?: RecordedEvent;
 }
 
 /**
  * The semantic reference implementation. Every behaviour of the Postgres store is specified
  * by this one and checked by the shared conformance suite. Single-threaded, so `appendIf` is
  * atomic by construction; all events are settled; one transaction id per append batch.
+ *
+ * Reads are served from posting lists (per event type and per `(scopeKey, value)` pair —
+ * the same pairs the Postgres store indexes and locks), so a context read costs O(matches),
+ * not O(store). Every candidate is still verified with the full filter predicate, so the
+ * index can only speed things up, never change an answer.
  */
 export class MemoryStore implements EventStore, LiveStore {
   readonly schema: StoreSchema;
   private readonly clock: () => Date;
   private readonly rows: Row[] = [];
+  /** row indices per event type, ascending */
+  private readonly byType = new Map<string, number[]>();
+  /** row indices per scope key → value, ascending */
+  private readonly byScope = new Map<string, Map<string, number[]>>();
   private readonly listeners = new Set<AppendedListener>();
   private readonly uniqueSeen = new Map<string, Set<string>>();
   private readonly idempotencyKeys = new Set<string>();
+  private readonly idKeys = new Map<string, string>();
 
   constructor(options: MemoryStoreOptions = {}) {
     this.schema = options.schema ?? emptySchema();
@@ -83,8 +96,8 @@ export class MemoryStore implements EventStore, LiveStore {
     const hits = new Map<RecordedEvent, boolean[]>();
     const visible: RecordedEvent[] = [];
     let contextVersion = 0;
-    for (const row of this.rows) {
-      const record = this.toRecorded(row);
+    for (const index of this.candidates(filters)) {
+      const record = this.toRecorded(this.rows[index]!);
       const matched = filters.map((f) => matchesFilter(record, f, this.schema));
       if (!matched.some(Boolean)) continue;
       if (record.sequence > contextVersion) contextVersion = record.sequence;
@@ -107,6 +120,47 @@ export class MemoryStore implements EventStore, LiveStore {
     };
   }
 
+  /** Ascending row indices that could match any of the filters (superset; verified by the caller). */
+  private candidates(filters: readonly Filter[]): number[] {
+    const lists: number[][] = [];
+    for (const filter of filters) {
+      const list = this.candidatesFor(filter);
+      if (list === null) return this.rows.map((_, i) => i);
+      lists.push(list);
+    }
+    return lists.length === 1 ? lists[0]! : mergeSorted(lists);
+  }
+
+  /** The shortest posting list that covers one filter, or `null` when only a scan can. */
+  private candidatesFor(filter: Filter): number[] | null {
+    let best: number[] | null = null;
+    const consider = (list: number[]) => {
+      if (best === null || list.length < best.length) best = list;
+    };
+    if (filter.scopes) {
+      for (const [key, values] of Object.entries(filter.scopes)) {
+        const byValue = this.byScope.get(key);
+        if (!byValue) {
+          // an undeclared flat key is not indexed — but if no row carries the key at all, nothing matches
+          if (!this.schema.scopeKeys.includes(key) && this.flatKeyUsed(key)) continue;
+          return best ?? (this.flatKeyUsed(key) ? null : []);
+        }
+        const lists = (values as readonly string[]).map((v) => byValue.get(v) ?? []);
+        consider(lists.length === 1 ? lists[0]! : mergeSorted(lists));
+      }
+    }
+    if (filter.types) {
+      const lists = filter.types.map((t) => this.byType.get(t) ?? []);
+      consider(lists.length === 1 ? lists[0]! : mergeSorted(lists));
+    }
+    return best;
+  }
+
+  private flatKeyUsed(key: string): boolean {
+    // conservative: a key that is not a declared scope key may sit flat in any row's data
+    return !this.schema.scopeKeys.includes(key);
+  }
+
   private visible(record: RecordedEvent, options: QueryOptions): boolean {
     if (options.after !== undefined && record.sequence <= options.after) return false;
     if (options.settledOnly && !record.settled) return false;
@@ -114,10 +168,17 @@ export class MemoryStore implements EventStore, LiveStore {
     return true;
   }
 
+  private idKeyOf(type: string): string {
+    let key = this.idKeys.get(type);
+    if (key === undefined) this.idKeys.set(type, (key = this.schema.idKeyOf(type)));
+    return key;
+  }
+
   private toRecorded(row: Row): RecordedEvent {
-    const idKey = this.schema.idKeyOf(row.type);
+    if (row.recorded) return row.recorded;
+    const idKey = this.idKeyOf(row.type);
     const { id, data, scopes } = fromPayload(this.schema.upcast(row.type, row.payload), idKey);
-    return {
+    row.recorded = {
       type: row.type,
       data,
       id: id ?? `~${row.sequence}`,
@@ -128,6 +189,7 @@ export class MemoryStore implements EventStore, LiveStore {
       transactionId: row.transactionId,
       settled: true,
     };
+    return row.recorded;
   }
 
   async append(events: readonly NewEvent[]): Promise<AppendResult> {
@@ -148,12 +210,12 @@ export class MemoryStore implements EventStore, LiveStore {
     const prepared = events.map((raw) => {
       const event = this.schema.validate(raw);
       const id = event.id ?? uuidv7(now.getTime());
-      const idKey = this.schema.idKeyOf(event.type);
+      const idKey = this.idKeyOf(event.type);
       // JSON round trip: the reference store must forget what JSONB forgets (Dates → strings,
       // `undefined` → missing, NaN → null) so tests against memory behave like production.
       const payload = jsonRoundTrip(toPayload({ ...event, id }, idKey)) as Record<string, unknown>;
       const metadata = jsonRoundTrip(event.metadata ?? {}) as Record<string, unknown>;
-      return { event, payload, metadata };
+      return { event, id, payload, metadata };
     });
     // Check constraints for the whole batch before committing anything (all or nothing).
     const batchUniques = new Set<string>();
@@ -193,7 +255,11 @@ export class MemoryStore implements EventStore, LiveStore {
       set.add(serialized);
     }
     for (const k of batchIdem) this.idempotencyKeys.add(k);
-    this.rows.push(...rows);
+    for (const row of rows) {
+      const index = this.rows.length;
+      this.rows.push(row);
+      this.indexRow(index, row);
+    }
     const result = { first, last: first + rows.length - 1, count: rows.length };
     if (this.listeners.size > 0) {
       const recorded = rows.map((r) => this.toRecorded(r));
@@ -208,6 +274,31 @@ export class MemoryStore implements EventStore, LiveStore {
     return result;
   }
 
+  /** Posting lists mirror `scopeValueOf`: the `scopes` object, the own id, declared keys flat in data. */
+  private indexRow(index: number, row: Row): void {
+    push(this.byType, row.type, index);
+    const scopes = row.payload.scopes;
+    if (scopes && typeof scopes === "object" && !Array.isArray(scopes)) {
+      for (const [k, v] of Object.entries(scopes as Record<string, unknown>)) if (typeof v === "string") this.post(k, v, index);
+    }
+    const idKey = this.idKeyOf(row.type);
+    const own = row.payload[idKey];
+    if (typeof own === "string") this.post(idKey, own, index);
+    for (const key of this.schema.scopeKeys) {
+      if (key === idKey) continue;
+      const flat = row.payload[key];
+      if (typeof flat === "string") this.post(key, flat, index);
+    }
+  }
+
+  private post(key: string, value: string, index: number): void {
+    let byValue = this.byScope.get(key);
+    if (!byValue) this.byScope.set(key, (byValue = new Map()));
+    const list = byValue.get(value);
+    if (!list) byValue.set(value, [index]);
+    else if (list[list.length - 1] !== index) list.push(index);
+  }
+
   onAppended(listener: AppendedListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -215,6 +306,35 @@ export class MemoryStore implements EventStore, LiveStore {
 
   async close(): Promise<void> {
     this.listeners.clear();
+  }
+}
+
+function push(map: Map<string, number[]>, key: string, index: number): void {
+  const list = map.get(key);
+  if (!list) map.set(key, [index]);
+  else if (list[list.length - 1] !== index) list.push(index);
+}
+
+/** Merge ascending, duplicate-free lists into one ascending, duplicate-free list. */
+function mergeSorted(lists: readonly number[][]): number[] {
+  const nonEmpty = lists.filter((l) => l.length > 0);
+  if (nonEmpty.length === 0) return [];
+  if (nonEmpty.length === 1) return nonEmpty[0]!;
+  const out: number[] = [];
+  const cursors = nonEmpty.map(() => 0);
+  for (;;) {
+    let min = Infinity;
+    for (let i = 0; i < nonEmpty.length; i++) {
+      const c = cursors[i]!;
+      const list = nonEmpty[i]!;
+      if (c < list.length && list[c]! < min) min = list[c]!;
+    }
+    if (min === Infinity) return out;
+    out.push(min);
+    for (let i = 0; i < nonEmpty.length; i++) {
+      const list = nonEmpty[i]!;
+      if (cursors[i]! < list.length && list[cursors[i]!] === min) cursors[i]!++;
+    }
   }
 }
 

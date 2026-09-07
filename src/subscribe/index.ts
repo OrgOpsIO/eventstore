@@ -1,5 +1,7 @@
-import { filtersOf, isLiveStore, matchesFilter } from "../index.js";
-import type { Cursor, EventStore, Query, RecordedEvent, StoreSchema } from "../index.js";
+import { isLiveStore } from "../memory.js";
+import { filtersOf, matchesFilter } from "../query.js";
+import { emptySchema } from "../registry.js";
+import type { Cursor, EventStore, Query, RecordedEvent, StoreSchema } from "../types.js";
 import { memoryCursors, type CursorStore } from "./cursors.js";
 
 export { fileCursors, memoryCursors } from "./cursors.js";
@@ -19,13 +21,19 @@ export interface SubscribeOptions {
   readonly pollIntervalMs?: number;
   /** Max events per handler call. Default 500. */
   readonly batchSize?: number;
-  /** What to do when the handler throws. Default: `"retry"` with back-off (100 ms → 5 s). */
+  /**
+   * What to do when the handler throws, or when the store/cursor store fails (then `batch` is
+   * empty and `"skip"` means `"retry"`). Default: `"retry"` with back-off (100 ms → 5 s).
+   */
   readonly onError?: (error: unknown, batch: readonly RecordedEvent[]) => ErrorDecision;
 }
 
 export interface Subscription {
   readonly name: string;
-  /** Resolves the next time a poll finds no new settled events (i.e. the subscription is caught up). */
+  /**
+   * Resolves the next time a poll returns an empty page — i.e. every settled event matching the
+   * query up to that moment has been handled. Resolves immediately once the subscription is stopped.
+   */
   whenCaughtUp(): Promise<void>;
   /** Stops polling; awaits an in-flight batch. */
   stop(): Promise<void>;
@@ -103,13 +111,15 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
   };
 
   const poll = async (): Promise<void> => {
+    wakeRequested = false;
     try {
       const result = await store.query(query, { settledOnly: true, cursor, limit: batchSize });
       if (stopped) return;
       if (result.events.length === 0) {
         backoffMs = 0;
         resolveCaughtUp();
-        schedule(pollIntervalMs);
+        // a push that arrived while this poll was in flight must not wait a full interval
+        schedule(wakeRequested ? 0 : pollIntervalMs);
         return;
       }
       const decision = await deliver(result.events);
@@ -131,10 +141,19 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
       backoffMs = 0;
       if (stopped) return;
       // Poll again right away: more may be waiting (full page) or a push arrived meanwhile.
-      wakeRequested = false;
       schedule(0);
-    } catch {
-      // store/cursor errors: back off and try again
+    } catch (error) {
+      // store/cursor errors: ask onError (with an empty batch), default to back-off and retry
+      let decision: ErrorDecision = "retry";
+      try {
+        decision = onError(error, []);
+      } catch {
+        decision = "retry";
+      }
+      if (decision === "stop") {
+        shutdown();
+        return;
+      }
       backoffMs = backoffMs === 0 ? MIN_BACKOFF_MS : Math.min(backoffMs * 2, MAX_BACKOFF_MS);
       schedule(backoffMs);
     }
@@ -218,7 +237,12 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
  * that push (`LiveStore`, e.g. `MemoryStore`); no cursor, no replay, at-most-once. Use it for
  * SSE fan-out and similar conveniences — use `subscribe` for anything that must not be lost.
  */
-export function on(query: Query, handler: (events: readonly RecordedEvent[]) => void, store: EventStore): () => void {
+export interface OnOptions {
+  readonly store: EventStore;
+}
+
+export function on(query: Query, handler: (events: readonly RecordedEvent[]) => void, options: OnOptions): () => void {
+  const store = options.store;
   if (!isLiveStore(store)) {
     throw new Error("eventstore: on() needs a LiveStore (one that pushes appended events); use subscribe() for polling stores");
   }
@@ -236,7 +260,7 @@ export function on(query: Query, handler: (events: readonly RecordedEvent[]) => 
 }
 
 /** Forget a subscription's cursor so its next start replays from `from`. */
-export async function reset(name: string, cursors: CursorStore): Promise<void> {
+export async function resetCursor(name: string, cursors: CursorStore): Promise<void> {
   if (cursors.delete) {
     await cursors.delete(name);
     return;
@@ -247,12 +271,5 @@ export async function reset(name: string, cursors: CursorStore): Promise<void> {
 function schemaOf(store: EventStore): StoreSchema {
   const candidate = (store as Partial<{ schema: StoreSchema }>).schema;
   if (candidate && typeof candidate.idKeyOf === "function") return candidate;
-  return {
-    scopeKeys: [],
-    uniques: [],
-    strict: false,
-    idKeyOf: (type) => `${type.charAt(0).toLowerCase()}${type.slice(1)}Id`,
-    upcast: (_type, payload) => payload,
-    validate: (event) => event,
-  };
+  return emptySchema();
 }

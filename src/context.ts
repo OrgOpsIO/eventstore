@@ -4,9 +4,10 @@ import type { ContextHandle, Cursor, EventStore, Query, RecordedEvent } from "./
 
 /**
  * An incremental fold: called with a batch of events (the delta) and the state so far.
- * The phantom parameter keeps a one-shot `(events) => S` from slotting in by arity.
+ * `$foldAll` deliberately returns `(events, state?: undefined) => S`, which is not assignable
+ * here, so a one-shot fold cannot slot in by arity and silently drop the cached state.
  */
-export type Fold<S> = (events: readonly RecordedEvent[], state: S, _incremental?: never) => S;
+export type Fold<S> = (events: readonly RecordedEvent[], state: S) => S;
 
 export interface ContextSpec<S> {
   readonly query: Query;

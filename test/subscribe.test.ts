@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MemoryStore, type RecordedEvent } from "../src/index.js";
-import { fileCursors, memoryCursors, on, reset, subscribe, type CursorStore } from "../src/subscribe/index.js";
+import { fileCursors, memoryCursors, on, resetCursor, subscribe, type CursorStore } from "../src/subscribe/index.js";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -73,7 +73,7 @@ describe("subscribe", () => {
     expect(second).toEqual([3]);
   });
 
-  it("persists the cursor in a JSON file (fileCursors) and reset() replays", async () => {
+  it("persists the cursor in a JSON file (fileCursors) and resetCursor() replays", async () => {
     const dir = mkdtempSync(join(tmpdir(), "es-cursors-"));
     try {
       const path = join(dir, "nested", "cursors.json");
@@ -96,7 +96,7 @@ describe("subscribe", () => {
       await sub2.stop();
       expect(b).toEqual([]);
 
-      await reset("file", cursors);
+      await resetCursor("file", cursors);
       expect(await cursors.load("file")).toBeNull();
       const c: number[] = [];
       const sub3 = subscribe("file", { types: ["AccountOpened"] }, (events) => {
@@ -199,7 +199,7 @@ describe("subscribe", () => {
   it("on() reacts in-process to matching appends only", async () => {
     const store = new MemoryStore();
     const seen: RecordedEvent[] = [];
-    const off = on({ types: ["AccountOpened"], scopes: { accountOpenedId: "x" } }, (events) => seen.push(...events), store);
+    const off = on({ types: ["AccountOpened"], scopes: { accountOpenedId: "x" } }, (events) => seen.push(...events), { store });
     await store.append([ev("AccountOpened", {}, {}), ev("Other", {}, { accountOpenedId: "x" })]);
     await store.append([{ type: "AccountOpened", data: {}, id: "x" }]);
     expect(seen.map((e) => [e.type, e.id])).toEqual([["AccountOpened", "x"]]);
@@ -215,6 +215,6 @@ describe("subscribe", () => {
       appendIf: async () => ({ ok: true as const, appended: { first: 0, last: 0, count: 0 } }),
       close: async () => {},
     };
-    expect(() => on({ types: ["X"] }, () => {}, polling)).toThrow(/LiveStore/);
+    expect(() => on({ types: ["X"] }, () => {}, { store: polling })).toThrow(/LiveStore/);
   });
 });

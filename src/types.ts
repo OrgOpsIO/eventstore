@@ -166,6 +166,11 @@ export interface StoreSchema {
   readonly scopeKeys: readonly string[];
   /** The scope key that identifies the tenant, if any. Locked shared by appends, exclusive only by tenant-wide guards. */
   readonly tenantScopeKey?: string;
+  /**
+   * Per-deployment secret mixed into every advisory-lock key. Without it the keys are plain
+   * FNV-1a hashes of public strings, so any database role can compute and hold them.
+   */
+  readonly lockSalt?: string;
   /** Per event type: unique payload paths (e.g. `"email"`, `"scopes.magicLinkRequestedId"`). */
   readonly uniques: readonly { readonly type: string; readonly path: string }[];
   /** The id key of an event type (`<lowerFirst(type)>Id` unless declared otherwise). */

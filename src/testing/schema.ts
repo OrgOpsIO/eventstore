@@ -11,6 +11,26 @@ export const conformanceEvents = defineEvents({
   LegacyThing: { data: z.object({ thingId: z.string(), value: z.string() }) },
 });
 
+/**
+ * A registry whose stored payloads may still carry the old field `v`; `upcast` renames it to
+ * `value` on read. Both shapes pass the schema so the old shape can be appended in a test.
+ */
+export const conformanceUpcastEvents = defineEvents({
+  Renamed: {
+    data: z.object({ value: z.string().optional(), v: z.string().optional() }),
+    upcast: (payload) => {
+      if (!("v" in payload)) return payload;
+      const { v, ...rest } = payload;
+      return { ...rest, value: v };
+    },
+  },
+});
+
+/** The schema for the upcast case: non-strict, no scope keys. */
+export function conformanceUpcastSchema(): StoreSchema {
+  return buildSchema([conformanceUpcastEvents], { strict: false });
+}
+
 export interface ConformanceSchemaOptions {
   readonly strict?: boolean;
 }

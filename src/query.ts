@@ -191,12 +191,12 @@ export function conditionLockKeys(
     const declared = Object.entries(filter.scopes ?? {}).filter(([k]) => schema.scopeKeys.includes(k));
     const nonTenant = declared.filter(([k]) => k !== tenantKey);
     if (nonTenant.length > 0) {
-      for (const [key, values] of nonTenant) for (const value of values as readonly string[]) keys.add(scopeLockKey(key, value));
+      for (const [key, values] of nonTenant) for (const value of values as readonly string[]) keys.add(scopeLockKey(key, value, schema.lockSalt));
       continue;
     }
     const tenantOnly = declared.find(([k]) => k === tenantKey);
     if (tenantOnly) {
-      for (const value of tenantOnly[1] as readonly string[]) exclusiveTenants.add(scopeLockKey(tenantKey!, value));
+      for (const value of tenantOnly[1] as readonly string[]) exclusiveTenants.add(scopeLockKey(tenantKey!, value, schema.lockSalt));
       continue;
     }
     if (schema.strict) {
@@ -224,8 +224,8 @@ export function eventLockKeys(
   const sharedTenants = new Set<bigint>();
   const tenantKey = schema.tenantScopeKey;
   const add = (key: string, value: string) => {
-    if (key === tenantKey) sharedTenants.add(scopeLockKey(key, value));
-    else keys.add(scopeLockKey(key, value));
+    if (key === tenantKey) sharedTenants.add(scopeLockKey(key, value, schema.lockSalt));
+    else keys.add(scopeLockKey(key, value, schema.lockSalt));
   };
   for (const event of events) {
     const idKey = schema.idKeyOf(event.type);
@@ -240,10 +240,17 @@ export function eventLockKeys(
   return { keys: [...keys].sort(compareBigint), sharedTenants: [...sharedTenants].sort(compareBigint) };
 }
 
+/** The unsalted global lock key. Stores should prefer `globalLockKey(schema.lockSalt)`. */
 export const GLOBAL_LOCK_KEY = fnv1a64("@orgops/eventstore:global");
 
-export function scopeLockKey(key: string, value: string): bigint {
-  return fnv1a64(`scope:${key}=${value}`);
+/** The global advisory-lock key, salted per deployment when `lockSalt` is configured. */
+export function globalLockKey(salt?: string): bigint {
+  return salt ? fnv1a64(`${salt}:@orgops/eventstore:global`) : GLOBAL_LOCK_KEY;
+}
+
+/** The advisory-lock key of one `(scopeKey, value)` pair, salted per deployment when `lockSalt` is configured. */
+export function scopeLockKey(key: string, value: string, salt?: string): bigint {
+  return fnv1a64(`${salt ? `${salt}:` : ""}scope:${key}=${value}`);
 }
 
 function compareBigint(a: bigint, b: bigint): number {

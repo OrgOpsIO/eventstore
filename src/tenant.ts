@@ -14,6 +14,8 @@ export const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000";
  * A store view bound to one tenant. Every query is narrowed to the tenant's scope; every
  * appended event is stamped with it — and rejected, fail-closed, if it claims another tenant
  * (an earlier in-house store's `scopedToTenant`). The tenant is a scope in the payload, not a column.
+ *
+ * `close()` on a view is a no-op: views share the underlying store, which the root api closes.
  */
 export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId: string): EventStore {
   const key = config.scopeKey;
@@ -29,17 +31,22 @@ export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId
       }
       return { ...f, scopes: { ...(f.scopes ?? {}), [key]: tenantId } };
     });
+  /**
+   * Stamp the tenant onto every event, fail-closed: an event that names another tenant —
+   * in `scopes` or as a flat data field — is rejected before anything is written.
+   */
   const stamp = (events: readonly NewEvent[]): NewEvent[] =>
     events.map((e) => {
+      const data = (e.data ?? {}) as Record<string, unknown>;
+      const flat = Object.prototype.hasOwnProperty.call(data, key) ? data[key] : undefined;
+      if (flat !== undefined && flat !== tenantId) {
+        throw new Error(`eventstore: "${e.type}" carries ${key}=${String(flat)} in its data but is appended to ${tenantId}`);
+      }
       const claimed = e.scopes?.[key];
-      if (claimed === tenantId) return e;
-      if (claimed !== undefined) {
+      if (claimed !== undefined && claimed !== tenantId) {
         throw new Error(`eventstore: "${e.type}" names tenant ${claimed} but is appended to ${tenantId}`);
       }
-      const flat = (e.data as Record<string, unknown>)[key];
-      if (typeof flat === "string" && flat !== tenantId) {
-        throw new Error(`eventstore: "${e.type}" carries ${key}=${flat} but is appended to ${tenantId}`);
-      }
+      if (claimed === tenantId) return e;
       return { ...e, scopes: { ...(e.scopes ?? {}), [key]: tenantId } };
     });
   return {

@@ -3,11 +3,13 @@ import {
   UnindexableContextError,
   UniqueViolationError,
   ValidationError,
+  compareCursor,
+  type Cursor,
   type EventStore,
   type Query,
   type StoreSchema,
 } from "../index.js";
-import { conformanceEvents, conformanceSchema } from "./schema.js";
+import { conformanceEvents, conformanceSchema, conformanceUpcastEvents, conformanceUpcastSchema } from "./schema.js";
 
 export type MakeStore = (schema: StoreSchema) => EventStore | Promise<EventStore>;
 
@@ -110,9 +112,16 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
       ev.NoteAdded({ text: "n1" }, { accountOpenedId: "acc-1" }),
       ev.NoteAdded({ text: "n2" }),
       ev.MoneyDeposited({ amount: 7 }, { accountOpenedId: "acc-2" }),
+      // an undeclared type may carry a declared scope key both as a scope and as a flat field
+      { type: "Tagged", data: { thingId: "t-1" }, scopes: { accountOpenedId: "acc-1" } },
+      { type: "Tagged", data: { thingId: "t-2" }, scopes: { accountOpenedId: "acc-2" } },
     ]);
     const all = (await store.query({})).events;
     const shapes: Query[] = [
+      { scopes: { accountOpenedId: "acc-1", thingId: "t-1" } },
+      { types: ["Tagged", "NoteAdded"], scopes: { accountOpenedId: "acc-1", thingId: "t-1" } },
+      { scopes: { accountOpenedId: ["acc-1", "acc-2"], thingId: ["t-1", "t-9"] } },
+      { types: ["Tagged"], scopes: { thingId: "t-2", accountOpenedId: "acc-2" }, where: [{ thingId: "t-2" }] },
       { types: ["NoteAdded"] },
       { scopes: { accountOpenedId: "acc-1" } },
       { types: ["AccountOpened", "MoneyDeposited", "NoteAdded"], scopes: { accountOpenedId: "acc-1" } },
@@ -343,4 +352,128 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     );
     assert.equal(results.filter((r) => r.ok).length, ids.length);
   });
+
+  withStore("data must not contain the event's own id key or a `scopes` key", async (store) => {
+    await assert.rejects(
+      () => store.append([{ type: "Widget", data: { widgetId: "forged", n: 1 } }]),
+      (e: unknown) => e instanceof ValidationError,
+    );
+    await assert.rejects(
+      () => store.append([{ type: "Widget", data: { scopes: { accountOpenedId: "acc-9" } } }]),
+      (e: unknown) => e instanceof ValidationError,
+    );
+    assert.equal((await store.query({ types: ["Widget"] })).events.length, 0, "nothing stored");
+  });
+
+  withStore("a non-string value at a declared scope key in data is rejected", async (store) => {
+    await assert.rejects(
+      () => store.append([{ type: "Widget", data: { thingId: 42 } }]),
+      (e: unknown) => e instanceof ValidationError,
+    );
+    await assert.rejects(
+      () => store.append([{ type: "Widget", data: { n: 1 }, scopes: { accountOpenedId: "" } }]),
+      (e: unknown) => e instanceof ValidationError,
+    );
+  });
+
+  withStore("where {k: null} matches only a JSON null", async (store) => {
+    await store.append([
+      { type: "Widget", data: { a: null } },
+      { type: "Widget", data: { a: 1 } },
+      { type: "Widget", data: { b: 1 } },
+    ]);
+    const r = await store.query({ types: ["Widget"], where: [{ a: null }] });
+    assert.equal(r.events.length, 1);
+    assert.equal(r.events[0]!.data.a, null);
+  });
+
+  withStore("where predicates go through the wire format (undefined vanishes, Dates become ISO strings)", async (store) => {
+    const at = new Date("2026-01-02T03:04:05.000Z");
+    await store.append([{ type: "Widget", data: { at, n: 1 } }, { type: "Widget", data: { n: 2 } }]);
+    const everything = await store.query({ types: ["Widget"], where: [{ nope: undefined }] });
+    assert.equal(everything.events.length, 2, "an undefined key is no constraint");
+    const dated = await store.query({ types: ["Widget"], where: [{ at }] });
+    assert.equal(dated.events.length, 1);
+    assert.equal(dated.events[0]!.data.at, at.toISOString(), "data is stored as JSON");
+    const asString = await store.query({ types: ["Widget"], where: [{ at: at.toISOString() }] });
+    assert.equal(asString.events.length, 1);
+  });
+
+  withStore("byFilter follows the order of events (desc, limit, several filters)", async (store) => {
+    await store.append([openAccount("a"), ev.NoteAdded({ text: "n1" }), openAccount("b"), openAccount("c"), ev.NoteAdded({ text: "n2" })]);
+    const r = await store.query([{ types: ["AccountOpened"] }, { types: ["NoteAdded"] }], { order: "desc", limit: 4 });
+    assert.equal(r.events.length, 4);
+    assert.deepEqual(
+      r.byFilter[0]!.map((e) => e.sequence),
+      r.events.filter((e) => e.type === "AccountOpened").map((e) => e.sequence),
+    );
+    assert.deepEqual(
+      r.byFilter[1]!.map((e) => e.sequence),
+      r.events.filter((e) => e.type === "NoteAdded").map((e) => e.sequence),
+    );
+    for (let i = 1; i < r.events.length; i++) assert.ok(r.events[i]!.sequence < r.events[i - 1]!.sequence, "descending");
+  });
+
+  withStore("all events of one batch share a transactionId; different batches do not", async (store) => {
+    await store.append([openAccount("a"), openAccount("b")]);
+    await store.append([openAccount("c"), openAccount("d")]);
+    const [a, b, c, d] = (await store.query({ types: ["AccountOpened"] })).events;
+    assert.equal(a!.transactionId, b!.transactionId);
+    assert.equal(c!.transactionId, d!.transactionId);
+    assert.notEqual(a!.transactionId, c!.transactionId);
+    assert.ok(/^\d+$/.test(a!.transactionId), "a decimal string");
+  });
+
+  withStore("a cursor survives a JSON round trip and never re-delivers what it points past", async (store) => {
+    await store.append([openAccount("a"), openAccount("b"), openAccount("c")]);
+    const first = await store.query({ types: ["AccountOpened"] }, { settledOnly: true });
+    if (!first.settledCursor) return; // a fresh Postgres connection may not see its own writes as settled yet
+    const roundTripped = JSON.parse(JSON.stringify(first.settledCursor)) as Cursor;
+    assert.deepEqual(roundTripped, first.settledCursor);
+    const again = await store.query({ types: ["AccountOpened"] }, { settledOnly: true, cursor: roundTripped });
+    assert.ok(again.events.every((e) => compareCursor(e, roundTripped) > 0), "only events beyond the cursor");
+    const seen = new Set(first.events.map((e) => e.sequence));
+    assert.ok(again.events.every((e) => !seen.has(e.sequence)), "no re-delivery");
+  });
+
+  withStore("settledOnly never returns an unsettled event", async (store) => {
+    await store.append([openAccount("a"), openAccount("b")]);
+    const all = await store.query({ types: ["AccountOpened"] });
+    const settled = await store.query({ types: ["AccountOpened"] }, { settledOnly: true });
+    assert.ok(settled.events.every((e) => e.settled));
+    assert.ok(settled.events.length <= all.events.length);
+    assert.equal(settled.contextVersion, all.contextVersion, "the context version ignores settledOnly");
+  });
+
+  withStore("types: [] matches nothing", async (store) => {
+    await store.append([openAccount("a")]);
+    const r = await store.query({ types: [] });
+    assert.equal(r.events.length, 0);
+    assert.equal(r.contextVersion, 0);
+    const mixed = await store.query([{ types: [] }, { types: ["AccountOpened"] }]);
+    assert.equal(mixed.events.length, 1);
+    assert.deepEqual(mixed.byFilter[0], []);
+  });
+
+  withStore("a negative limit and a fractional `after` are rejected before touching the store", async (store) => {
+    await store.append([openAccount("a")]);
+    await assert.rejects(() => store.query({}, { limit: -1 }));
+    await assert.rejects(() => store.query({}, { after: 0.5 }));
+    await assert.rejects(() => store.query({}, { cursor: { transactionId: "x", sequence: 1 } }));
+    assert.equal((await store.query({}, { limit: 0 })).events.length, 0);
+  });
+
+  withStore(
+    "upcast is applied on read by every store",
+    async (store) => {
+      const up = conformanceUpcastEvents;
+      await store.append([up.Renamed({ v: "old" }), up.Renamed({ value: "new" })]);
+      const r = await store.query({ types: ["Renamed"] });
+      assert.deepEqual(
+        r.events.map((e) => e.data),
+        [{ value: "old" }, { value: "new" }],
+      );
+    },
+    conformanceUpcastSchema(),
+  );
 }
