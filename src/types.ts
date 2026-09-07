@@ -1,11 +1,12 @@
 /**
  * Core contract of @orgops/eventstore.
  *
- * Vocabulary follows Rico Fritzsche's Command Context Consistency (CCC) spec, Draft 0.1,
- * and Ralf Westphal's "Scoping Events": an event carries its own `<eventName>Id` and a
+ * The vocabulary and every concept here are the joint work of Ralf Westphal and Rico
+ * Fritzsche (event-orientation, Command Context Consistency, scoping events, the store
+ * contract with its two sequence numbers). An event carries its own `<eventName>Id` and a
  * `scopes` object with back-links to the events it happened in relation to. The store is a
  * single append-only `events` table; everything else the SDK creates is an index or a
- * function on that table.
+ * function on that table. This package is one implementation of their model, nothing more.
  */
 
 /** Back-links to other events: `{ articleDraftedId: "…", workspaceProvisionedId: "…" }`. */

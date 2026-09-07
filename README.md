@@ -2,7 +2,17 @@
 
 **One `events` table in PostgreSQL. Typed events. An atomic conditional append that is actually atomic. Indexes derived from your event declarations.**
 
-Command Context Consistency (Rico Fritzsche) with Westphal scopes, configured once and used anywhere — the way [`@orgops/coax`](https://github.com/OrgOpsIO/coax) does it for LLMs.
+## Whose ideas these are
+
+This library is a realisation of the thinking that **Ralf Westphal** and **Rico Fritzsche** developed together and published as *event-orientation* and *Command Context Consistency*: record what happened instead of what is; no entities, no aggregates; a command reads the facts it needs, decides, and appends only if those facts are still what it read — the command's own context is the consistency boundary; events refer to each other through scopes, not through invented ids; one append-only table is enough. Every concept in this package is theirs, including the event store contract (`query`, `append`, `append_if`, the two sequence numbers that must not be confused) and the reference implementation [`eventstore-typescript`](https://github.com/ricofritzsche/eventstore-typescript) they wrote together.
+
+What this package adds is an implementation on PostgreSQL: it makes the conditional append atomic under concurrency, derives indexes and advisory locks from the event declaration, keeps read cursors gap-free, and wraps it in a typed, configure-once API. None of that would exist without their work. Read them first:
+
+- Ralf Westphal, *Event-Orientation* — https://ralfwestphal.substack.com/s/event-orientation
+- Rico Fritzsche, *Architecture Knowledge Base* and the CCC specification — https://architecture.ricofritzsche.me/
+- Rico Fritzsche, *Autonomous Domain Capabilities* — https://leanpub.com/autonomous-domain-capabilities
+
+Configured once and used anywhere — the way [`@orgops/coax`](https://github.com/OrgOpsIO/coax) does it for LLMs.
 
 ```bash
 npm install @orgops/eventstore zod pg        # plus @types/pg if you use TypeScript with the Postgres store
@@ -114,7 +124,7 @@ From this one declaration you get:
 
 A pre-built store passed as `store` must have been built from the same registries (`buildSchema(events, { tenantScopeKey, strict })`); `configure()` refuses a store whose scope keys, uniques, tenant key or strictness disagree, because those are what its indexes enforce.
 
-On the wire an event is `{ articleDraftedId, title, slug, scopes: { workspaceProvisionedId } }` in a JSONB `payload` column — Ralf Westphal's convention as used in an earlier in-house store. Flat ids (`employeeId` as a plain field) keep working: a scope key matches `scopes.K`, the event's own id, or a top-level string field `K`. The envelope rules hold for every event, declared or not: `data` may not contain the own id key or a `scopes` key, and a value at a declared scope key must be a string.
+On the wire an event is `{ articleDraftedId, title, slug, scopes: { workspaceProvisionedId } }` in a JSONB `payload` column — the convention from Westphal's and Fritzsche's *Scoping Events*, as used in an earlier in-house store. Flat ids (`employeeId` as a plain field) keep working: a scope key matches `scopes.K`, the event's own id, or a top-level string field `K`. The envelope rules hold for every event, declared or not: `data` may not contain the own id key or a `scopes` key, and a value at a declared scope key must be a string.
 
 ### Uniqueness
 
