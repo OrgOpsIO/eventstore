@@ -88,7 +88,7 @@ export interface CommandRuntime {
 
 /**
  * The CCC command cycle: read the context → decide (pure) → record with `appendIf` →
- * on conflict re-read and decide again. Lifted from an earlier in-house store's `run-command`, with the
+ * on conflict re-read and decide again. The classic read/decide/re-read loop, with the
  * re-read replaced by the store's atomic guard.
  *
  * Retries are for version conflicts and transient store failures. A `UniqueViolationError`

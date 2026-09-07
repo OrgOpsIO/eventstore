@@ -18,7 +18,7 @@ export interface InterferenceOptions {
 /**
  * Appends competing events right before the first N `appendIf` calls — after the caller has
  * read its context, before it records. A correct guard must fire; a correct command runner
- * must retry. (Lifted from an earlier in-house store's `createInterferingStore`.)
+ * must retry.
  */
 export function interferingStore(
   inner: EventStore,

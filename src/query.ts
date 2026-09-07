@@ -85,7 +85,7 @@ export function scopeValueOf(event: RecordedEvent<string, unknown>, key: string,
   return typeof flat === "string" ? flat : undefined;
 }
 
-/** Wire payload = `{ [idKey]: id, ...data, scopes? }` (Westphal / an earlier in-house store convention). The id always wins. */
+/** Wire payload = `{ [idKey]: id, ...data, scopes? }` (the *Scoping Events* convention). The id always wins. */
 export function toPayload(event: NewEvent & { id: string }, idKey: string): Record<string, unknown> {
   const { scopes: _ignored, ...data } = event.data as Record<string, unknown>;
   const payload: Record<string, unknown> = { ...data, [idKey]: event.id };

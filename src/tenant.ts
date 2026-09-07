@@ -16,7 +16,7 @@ export const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000";
 /**
  * A store view bound to one tenant. Every query is narrowed to the tenant's scope; every
  * appended event is stamped with it — and rejected, fail-closed, if it claims another tenant
- * (an earlier in-house store's `scopedToTenant`). The tenant is a scope in the payload, not a column.
+ * The tenant is a scope in the payload, not a column.
  *
  * `close()` on a view is a no-op: views share the underlying store, which the root api closes.
  */

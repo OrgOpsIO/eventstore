@@ -11,7 +11,7 @@ const accounts = defineEvents({
   AccountOpened: { data: z.object({ owner: z.string(), email: z.string() }), unique: ["email"] },
   MoneyDeposited: { data: z.object({ amount: z.number() }), scopes: ["accountOpenedId"] },
   MoneyWithdrawn: { data: z.object({ amount: z.number() }), scopes: ["accountOpenedId"] },
-  // flat-id style (an earlier project): the scope value lives in data
+  // flat-id style: the scope value lives in data
   LegacyNote: { data: z.object({ accountOpenedId: z.string(), note: z.string() }) },
 });
 
