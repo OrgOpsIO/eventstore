@@ -228,6 +228,9 @@ function assertSchemaAgrees(store: EventStore, schema: StoreSchema): void {
   if (uniques(own.uniques) !== uniques(schema.uniques)) problems.push(`uniques [${uniques(own.uniques)}] vs [${uniques(schema.uniques)}]`);
   if ((own.tenantScopeKey ?? "") !== (schema.tenantScopeKey ?? "")) problems.push(`tenant key ${own.tenantScopeKey ?? "none"} vs ${schema.tenantScopeKey ?? "none"}`);
   if (own.strict !== schema.strict) problems.push(`strict ${own.strict} vs ${schema.strict}`);
+  if ((own.lockSalt ?? "") !== (schema.lockSalt ?? "")) problems.push("lockSalt differs (two salts = two lock key spaces = no mutual exclusion)");
+  const types = new Set([...schema.uniques.map((u) => u.type), ...own.uniques.map((u) => u.type)]);
+  for (const t of types) if (own.idKeyOf(t) !== schema.idKeyOf(t)) problems.push(`idKey of ${t}: ${own.idKeyOf(t)} vs ${schema.idKeyOf(t)}`);
   if (problems.length > 0) {
     throw new UsageError(
       `eventstore: the store you passed was built with a different schema than configure() derives from your registries — ${problems.join("; ")}. ` +

@@ -1,14 +1,17 @@
-import { fnv1a64 } from "./ids.js";
-import { UnindexableContextError, ValidationError } from "./errors.js";
+import { fnv1a64, lockKeyOf } from "./ids.js";
+import { UnindexableContextError, UsageError, ValidationError } from "./errors.js";
 import type { Filter, NewEvent, Query, QueryOptions, RecordedEvent, StoreSchema } from "./types.js";
 
 export const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_CONTAINS_DEPTH = 64;
+/** Caps on query shapes: every scope value becomes an advisory lock and an index probe. */
+export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 256, wherePredicates: 64 } as const;
 
 /** Normalise a query into a non-empty list of filters with canonical shapes. */
 export function filtersOf(query: Query): Filter[] {
   const list = Array.isArray(query) ? (query as readonly Filter[]) : [query as Filter];
-  if (list.length === 0) throw new Error("eventstore: a query needs at least one filter");
+  if (list.length === 0) throw new UsageError("eventstore: a query needs at least one filter");
+  if (list.length > QUERY_LIMITS.filters) throw new UsageError(`eventstore: a query may have at most ${QUERY_LIMITS.filters} filters`);
   return list.map(normaliseFilter);
 }
 
@@ -21,14 +24,19 @@ export function normaliseFilter(filter: Filter): Filter {
   if (filter.scopes !== undefined) {
     const scopes: Record<string, string[]> = {};
     for (const key of Object.keys(filter.scopes).sort()) {
-      if (!IDENTIFIER.test(key)) throw new Error(`eventstore: invalid scope key "${key}"`);
+      if (!IDENTIFIER.test(key)) throw new UsageError(`eventstore: invalid scope key "${key}"`);
       const raw = filter.scopes[key];
-      const values = typeof raw === "string" ? [raw] : [...new Set(raw ?? [])].sort();
-      if (values.length === 0) throw new Error(`eventstore: scope "${key}" needs at least one value`);
-      for (const v of values) if (typeof v !== "string") throw new Error(`eventstore: scope "${key}" values must be strings`);
+      if (typeof raw !== "string" && !Array.isArray(raw)) throw new UsageError(`eventstore: scope "${key}" must be a string or an array of strings`);
+      const values = typeof raw === "string" ? [raw] : [...new Set(raw)].sort();
+      if (values.length === 0) throw new UsageError(`eventstore: scope "${key}" needs at least one value`);
+      if (values.length > QUERY_LIMITS.scopeValuesPerKey) throw new UsageError(`eventstore: scope "${key}" may have at most ${QUERY_LIMITS.scopeValuesPerKey} values`);
+      for (const v of values) if (typeof v !== "string") throw new UsageError(`eventstore: scope "${key}" values must be strings`);
       scopes[key] = values;
     }
     if (Object.keys(scopes).length > 0) out.scopes = scopes;
+  }
+  if (filter.where !== undefined && filter.where.length > QUERY_LIMITS.wherePredicates) {
+    throw new UsageError(`eventstore: a filter may have at most ${QUERY_LIMITS.wherePredicates} where predicates`);
   }
   if (filter.where !== undefined && filter.where.length > 0) {
     // the wire format is JSON: `undefined` keys vanish, Dates become strings, NaN becomes null
@@ -245,12 +253,17 @@ export const GLOBAL_LOCK_KEY = fnv1a64("@orgops/eventstore:global");
 
 /** The global advisory-lock key, salted per deployment when `lockSalt` is configured. */
 export function globalLockKey(salt?: string): bigint {
-  return salt ? fnv1a64(`${salt}:@orgops/eventstore:global`) : GLOBAL_LOCK_KEY;
+  return salt ? lockKeyOf("@orgops/eventstore:global", salt) : GLOBAL_LOCK_KEY;
+}
+
+/** The install advisory-lock key (session-independent, salted like the others). */
+export function installLockKey(salt?: string): bigint {
+  return lockKeyOf("@orgops/eventstore:install", salt);
 }
 
 /** The advisory-lock key of one `(scopeKey, value)` pair, salted per deployment when `lockSalt` is configured. */
 export function scopeLockKey(key: string, value: string, salt?: string): bigint {
-  return fnv1a64(`${salt ? `${salt}:` : ""}scope:${key}=${value}`);
+  return lockKeyOf(`scope:${key}=${value}`, salt);
 }
 
 function compareBigint(a: bigint, b: bigint): number {

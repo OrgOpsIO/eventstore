@@ -105,7 +105,12 @@ export interface QueryOptions {
   readonly order?: "asc" | "desc";
 }
 
-/** Ties a query to the context version observed when it was read. Pass it to `appendIf`. */
+/**
+ * Ties a query to the context version observed when it was read. Pass it to `appendIf`.
+ * It is an unauthenticated capability: `appendIf` trusts both fields, so a handle must never
+ * come from a client. To expose optimistic concurrency to a browser, send only the version
+ * number and re-pair it with a server-built query.
+ */
 export interface ContextHandle {
   readonly query: Query;
   readonly version: number;

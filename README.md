@@ -148,7 +148,7 @@ The well-known single-statement CTE guard (`WITH context AS (SELECT MAX(...)) IN
 
 **Strict mode** (default) refuses a guard query that has no declared scope key: the query would be neither indexable nor lockable. Set `strict: false` to accept the global lock instead. The tenant key is treated specially: a guard that names only the tenant serialises that tenant (exclusive tenant lock), while every append holds the tenant lock shared — so scope-level guards never contend on it.
 
-**Lock salt.** Advisory-lock keys are hashes of public strings, so any database role could compute and hold them. Pass `lockSalt` (a per-deployment secret) in `configure()` to make them unguessable.
+**Lock salt.** Without a salt, advisory-lock keys are FNV-1a hashes of public strings, so any database role could compute and hold them (a held lock stalls that entity's appends until `lock_timeout`). With `lockSalt` (a per-deployment secret) keys are HMAC-SHA256 values; a key observed in `pg_locks` reveals nothing about the others. Every writer on the same database must use the same salt — introduce or change it with a full restart, not a rolling one.
 
 ### Commands that read nothing
 

@@ -5,6 +5,7 @@
 export {
   GLOBAL_LOCK_KEY,
   globalLockKey,
+  installLockKey,
   conditionLockKeys,
   contains,
   eventLockKeys,
@@ -22,4 +23,4 @@ export {
   queryKey,
   validateEnvelope,
 } from "./query.js";
-export { fnv1a64 } from "./ids.js";
+export { fnv1a64, lockKeyOf } from "./ids.js";

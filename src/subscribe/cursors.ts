@@ -1,4 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import type { Cursor } from "../types.js";
 
@@ -49,16 +50,26 @@ export function fileCursors(path: string): CursorStore {
     try {
       const text = await readFile(path, "utf8");
       const parsed = JSON.parse(text) as Record<string, Cursor>;
-      return parsed && typeof parsed === "object" ? parsed : {};
+      // a prototype-free object: a subscription named "__proto__" must not re-parent the map
+      return parsed && typeof parsed === "object" ? Object.assign(Object.create(null) as Record<string, Cursor>, parsed) : (Object.create(null) as Record<string, Cursor>);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return Object.create(null) as Record<string, Cursor>;
       throw err;
     }
   };
   const write = async (all: Record<string, Cursor>): Promise<void> => {
     await mkdir(dirname(path), { recursive: true });
-    const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
-    await writeFile(tmp, JSON.stringify(all, null, 2), "utf8");
+    // exclusive create with a random name (no symlink following, no predictable path), owner-only,
+    // fsync'd before the atomic rename; the file is meant for ONE process — two instances sharing
+    // it would clobber each other's cursors
+    const tmp = `${path}.${randomBytes(6).toString("hex")}.tmp`;
+    const handle = await open(tmp, "wx", 0o600);
+    try {
+      await handle.writeFile(JSON.stringify(all, null, 2), "utf8");
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
     await rename(tmp, path);
   };
   return {

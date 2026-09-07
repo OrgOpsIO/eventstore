@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 
 /**
  * UUIDv7: time-ordered, so `<eventName>Id` values cluster in B-tree indexes and sort by
@@ -37,4 +37,16 @@ export function fnv1a64(input: string): bigint {
     hash = (hash * prime) & 0xffffffffffffffffn;
   }
   return BigInt.asIntN(64, hash);
+}
+
+/**
+ * Advisory-lock key of a string. Without a salt: FNV-1a 64 (deterministic, public — any
+ * database role can compute it). With a salt: HMAC-SHA256 truncated to 64 bits, so a key
+ * observed in `pg_locks` reveals nothing about the others. FNV-1a with a prefixed salt would
+ * NOT do: its round function is invertible, one observed key recovers the salted state.
+ */
+export function lockKeyOf(input: string, salt?: string): bigint {
+  if (!salt) return fnv1a64(input);
+  const digest = createHmac("sha256", salt).update(input).digest();
+  return BigInt.asIntN(64, digest.readBigUInt64BE(0));
 }

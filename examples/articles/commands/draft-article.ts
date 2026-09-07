@@ -4,6 +4,9 @@ import { articles, foldArticles, type Article } from "../events.js";
 /**
  * The per-tenant slug rule is a CCC rule, not a unique index: slugs are freed when an article
  * is archived, so the context is every article of the workspace (a tenant-wide guard → the
+ * whole workspace is serialised while drafting, and the context grows with the workspace; the
+ * narrower idiom is a SlugClaimed/SlugReleased pair with `slug` declared as a scope key — see
+ * README "Uniqueness" — or a global `unique: ["slug"]` when slugs never need to be released;
  * tenant is locked exclusively while this decides).
  */
 export async function draftArticle(workspaceId: string, input: { title: string; slug: string }) {

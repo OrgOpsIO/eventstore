@@ -13,6 +13,7 @@ import {
   reject,
   type RecordedEventOf,
 } from "../src/index.js";
+import { GLOBAL_LOCK_KEY, globalLockKey, lockKeyOf, scopeLockKey } from "../src/internal.js";
 
 const articles = defineEvents({
   ArticleDrafted: {
@@ -240,6 +241,14 @@ describe("memory store + api", () => {
     await cache.load({ query: { types: ["ArticleDrafted", "ArticleArchived"] }, fold, initial: [] as string[] });
     expect(cache.size).toBe(1); // the second entry (>100 bytes each) evicted the first
     expect(cache.byteSize).toBeLessThanOrEqual(200);
+  });
+
+  it("lock keys are keyed hashes when a salt is configured", () => {
+    expect(scopeLockKey("k", "v")).toBe(scopeLockKey("k", "v"));
+    expect(scopeLockKey("k", "v", "s1")).not.toBe(scopeLockKey("k", "v"));
+    expect(scopeLockKey("k", "v", "s1")).not.toBe(scopeLockKey("k", "v", "s2"));
+    expect(globalLockKey("s1")).not.toBe(GLOBAL_LOCK_KEY);
+    expect(typeof lockKeyOf("x", "s")).toBe("bigint");
   });
 
   it("$parse narrows types", async () => {
