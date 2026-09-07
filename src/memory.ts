@@ -1,6 +1,16 @@
 import { UniqueViolationError } from "./errors.js";
 import { uuidv7 } from "./ids.js";
-import { conditionLockKeys, filtersOf, matchesFilter, toPayload, uniquePathSegments, valueAtPath } from "./query.js";
+import {
+  compareCursor,
+  conditionLockKeys,
+  filtersOf,
+  fromPayload,
+  matchesFilter,
+  normaliseOptions,
+  toPayload,
+  uniquePathSegments,
+  valueAtPath,
+} from "./query.js";
 import { emptySchema } from "./registry.js";
 import type {
   AppendIfOutcome,
@@ -24,19 +34,31 @@ export interface LiveStore {
 }
 
 export interface MemoryStoreOptions {
+  /** Declared events/scopes; default: an empty, non-strict schema. */
   readonly schema?: StoreSchema;
+  /** Source of `recordedAt`. Default: wall clock. */
   readonly clock?: () => Date;
+}
+
+/** A stored row: the wire payload, so `upcast` runs on read exactly as in Postgres. */
+interface Row {
+  readonly sequence: number;
+  readonly type: string;
+  readonly payload: Record<string, unknown>;
+  readonly metadata: Record<string, unknown>;
+  readonly recordedAt: Date;
+  readonly transactionId: string;
 }
 
 /**
  * The semantic reference implementation. Every behaviour of the Postgres store is specified
  * by this one and checked by the shared conformance suite. Single-threaded, so `appendIf` is
- * atomic by construction; all events are settled.
+ * atomic by construction; all events are settled; one transaction id per append batch.
  */
 export class MemoryStore implements EventStore, LiveStore {
   readonly schema: StoreSchema;
   private readonly clock: () => Date;
-  private readonly records: RecordedEvent[] = [];
+  private readonly rows: Row[] = [];
   private readonly listeners = new Set<AppendedListener>();
   private readonly uniqueSeen = new Map<string, Set<string>>();
   private readonly idempotencyKeys = new Set<string>();
@@ -48,7 +70,7 @@ export class MemoryStore implements EventStore, LiveStore {
 
   /** All records, in order. Handy in tests. */
   get events(): readonly RecordedEvent[] {
-    return this.records;
+    return this.rows.map((r) => this.toRecorded(r));
   }
 
   async query(query: Query, options: QueryOptions = {}): Promise<QueryResult> {
@@ -56,41 +78,56 @@ export class MemoryStore implements EventStore, LiveStore {
   }
 
   queryNow(query: Query, options: QueryOptions = {}): QueryResult {
+    normaliseOptions(options);
     const filters = filtersOf(query);
-    const byFilter: RecordedEvent[][] = filters.map(() => []);
-    const all: RecordedEvent[] = [];
+    const hits = new Map<RecordedEvent, boolean[]>();
+    const visible: RecordedEvent[] = [];
     let contextVersion = 0;
-    for (const record of this.records) {
-      let matched = false;
-      filters.forEach((filter, i) => {
-        if (matchesFilter(record, filter, this.schema)) {
-          matched = true;
-          if (this.visible(record, options)) byFilter[i]!.push(record);
-        }
-      });
-      if (!matched) continue;
+    for (const row of this.rows) {
+      const record = this.toRecorded(row);
+      const matched = filters.map((f) => matchesFilter(record, f, this.schema));
+      if (!matched.some(Boolean)) continue;
       if (record.sequence > contextVersion) contextVersion = record.sequence;
-      if (this.visible(record, options)) all.push(record);
+      if (this.visible(record, options)) {
+        visible.push(record);
+        hits.set(record, matched);
+      }
     }
-    let events = all;
+    let events = visible;
     if (options.order === "desc") events = [...events].reverse();
     if (options.limit !== undefined) events = events.slice(0, options.limit);
-    const returnedSet = new Set(events);
     const lastReturned = events.reduce((m, e) => Math.max(m, e.sequence), 0);
-    const settledCursor = cursorOf(events);
     return {
       events,
-      byFilter: byFilter.map((list) => list.filter((e) => returnedSet.has(e))),
+      byFilter: filters.map((_, i) => events.filter((e) => hits.get(e)![i])),
       lastReturned,
       contextVersion,
-      settledCursor,
+      ctx: { query, version: contextVersion },
+      settledCursor: cursorOf(events),
     };
   }
 
   private visible(record: RecordedEvent, options: QueryOptions): boolean {
     if (options.after !== undefined && record.sequence <= options.after) return false;
-    if (options.cursor && record.sequence <= options.cursor.sequence) return false;
+    if (options.settledOnly && !record.settled) return false;
+    if (options.cursor && record.settled && compareCursor(record, options.cursor) <= 0) return false;
     return true;
+  }
+
+  private toRecorded(row: Row): RecordedEvent {
+    const idKey = this.schema.idKeyOf(row.type);
+    const { id, data, scopes } = fromPayload(this.schema.upcast(row.type, row.payload), idKey);
+    return {
+      type: row.type,
+      data,
+      id: id ?? `~${row.sequence}`,
+      scopes,
+      metadata: row.metadata,
+      sequence: row.sequence,
+      recordedAt: row.recordedAt,
+      transactionId: row.transactionId,
+      settled: true,
+    };
   }
 
   async append(events: readonly NewEvent[]): Promise<AppendResult> {
@@ -112,13 +149,16 @@ export class MemoryStore implements EventStore, LiveStore {
       const event = this.schema.validate(raw);
       const id = event.id ?? uuidv7(now.getTime());
       const idKey = this.schema.idKeyOf(event.type);
-      const payload = toPayload({ ...event, id }, idKey);
-      return { event, id, payload };
+      // JSON round trip: the reference store must forget what JSONB forgets (Dates → strings,
+      // `undefined` → missing, NaN → null) so tests against memory behave like production.
+      const payload = jsonRoundTrip(toPayload({ ...event, id }, idKey)) as Record<string, unknown>;
+      const metadata = jsonRoundTrip(event.metadata ?? {}) as Record<string, unknown>;
+      return { event, payload, metadata };
     });
     // Check constraints for the whole batch before committing anything (all or nothing).
     const batchUniques = new Set<string>();
     const batchIdem = new Set<string>();
-    for (const { event, payload } of prepared) {
+    for (const { event, payload, metadata } of prepared) {
       for (const u of this.schema.uniques) {
         if (u.type !== event.type) continue;
         const value = valueAtPath(payload, uniquePathSegments(u.path));
@@ -130,25 +170,21 @@ export class MemoryStore implements EventStore, LiveStore {
         }
         batchUniques.add(`${key}|${serialized}`);
       }
-      const idem = event.metadata?.idempotencyKey;
+      const idem = metadata.idempotencyKey;
       if (typeof idem === "string") {
-        if (this.idempotencyKeys.has(idem) || batchIdem.has(idem)) throw new UniqueViolationError({ idempotencyKey: idem });
+        if (this.idempotencyKeys.has(idem) || batchIdem.has(idem)) throw new UniqueViolationError({ idempotencyKey: true });
         batchIdem.add(idem);
       }
     }
-    const first = this.records.length + 1;
-    // JSON round trip: the reference store must forget what JSONB forgets (Dates → strings,
-    // `undefined` → missing, NaN → null) so tests against memory behave like production.
-    const recorded: RecordedEvent[] = prepared.map(({ event, id }, i) => ({
-      type: event.type,
-      data: jsonRoundTrip(event.data) as Record<string, unknown>,
-      id,
-      scopes: { ...(event.scopes ?? {}) },
-      metadata: jsonRoundTrip(event.metadata ?? {}) as Record<string, unknown>,
+    const first = this.rows.length + 1;
+    const transactionId = String(first);
+    const rows: Row[] = prepared.map(({ event, payload, metadata }, i) => ({
       sequence: first + i,
+      type: event.type,
+      payload,
+      metadata,
       recordedAt: now,
-      transactionId: String(first + i),
-      settled: true,
+      transactionId,
     }));
     for (const key of batchUniques) {
       const [type, path, serialized] = splitUniqueKey(key);
@@ -157,13 +193,16 @@ export class MemoryStore implements EventStore, LiveStore {
       set.add(serialized);
     }
     for (const k of batchIdem) this.idempotencyKeys.add(k);
-    this.records.push(...recorded);
-    const result = { first, last: first + recorded.length - 1, count: recorded.length };
-    for (const listener of this.listeners) {
-      try {
-        listener(recorded);
-      } catch {
-        // a listener must never fail an append
+    this.rows.push(...rows);
+    const result = { first, last: first + rows.length - 1, count: rows.length };
+    if (this.listeners.size > 0) {
+      const recorded = rows.map((r) => this.toRecorded(r));
+      for (const listener of this.listeners) {
+        try {
+          listener(recorded);
+        } catch {
+          // a listener must never fail an append
+        }
       }
     }
     return result;
@@ -183,9 +222,10 @@ function jsonRoundTrip(value: unknown): unknown {
   return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
 }
 
-function cursorOf(events: readonly RecordedEvent[]): Cursor | null {
-  let best: RecordedEvent | undefined;
-  for (const e of events) if (e.settled && (!best || e.sequence > best.sequence)) best = e;
+/** The highest settled `(transactionId, sequence)` among the given records. */
+export function cursorOf(events: readonly RecordedEvent<string, unknown>[]): Cursor | null {
+  let best: RecordedEvent<string, unknown> | undefined;
+  for (const e of events) if (e.settled && (!best || compareCursor(e, best) > 0)) best = e;
   return best ? { transactionId: best.transactionId, sequence: best.sequence } : null;
 }
 

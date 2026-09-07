@@ -104,7 +104,7 @@ describe.skipIf(!url)("PostgresStore", () => {
     await store.append([accounts.AccountOpened({ owner: "C", email: "c@example.com" }, {}, { metadata: { idempotencyKey: "k1" } })]);
     const again = store.append([accounts.AccountOpened({ owner: "C", email: "c2@example.com" }, {}, { metadata: { idempotencyKey: "k1" } })]);
     await expect(again).rejects.toBeInstanceOf(UniqueViolationError);
-    await expect(again).rejects.toMatchObject({ detail: { idempotencyKey: "k1" } });
+    await expect(again).rejects.toMatchObject({ detail: { idempotencyKey: true } });
   });
 
   it("appendIf commits on an unchanged context and reports a conflict otherwise", async () => {

@@ -5,17 +5,50 @@
   "type": "module",
   "license": "MIT",
   "author": "orgops",
-  "keywords": ["event-sourcing", "event-store", "postgres", "ccc", "dcb", "zod", "typescript"],
+  "keywords": [
+    "event-sourcing",
+    "event-store",
+    "postgres",
+    "ccc",
+    "dcb",
+    "zod",
+    "typescript"
+  ],
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js", "require": "./dist/index.cjs" },
-    "./postgres": { "types": "./dist/postgres/index.d.ts", "import": "./dist/postgres/index.js", "require": "./dist/postgres/index.cjs" },
-    "./subscribe": { "types": "./dist/subscribe/index.d.ts", "import": "./dist/subscribe/index.js", "require": "./dist/subscribe/index.cjs" },
-    "./testing": { "types": "./dist/testing/index.d.ts", "import": "./dist/testing/index.js", "require": "./dist/testing/index.cjs" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./postgres": {
+      "types": "./dist/postgres/index.d.ts",
+      "import": "./dist/postgres/index.js",
+      "require": "./dist/postgres/index.cjs"
+    },
+    "./subscribe": {
+      "types": "./dist/subscribe/index.d.ts",
+      "import": "./dist/subscribe/index.js",
+      "require": "./dist/subscribe/index.cjs"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js",
+      "require": "./dist/testing/index.cjs"
+    },
+    "./internal": {
+      "types": "./dist/internal.d.ts",
+      "import": "./dist/internal.js",
+      "require": "./dist/internal.cjs"
+    }
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "LICENSE"],
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
@@ -28,7 +61,9 @@
     "zod": "^4.0.0"
   },
   "peerDependenciesMeta": {
-    "pg": { "optional": true }
+    "pg": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22",
@@ -39,5 +74,7 @@
     "vitest": "^3.0.0",
     "zod": "^4.0.0"
   },
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

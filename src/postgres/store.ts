@@ -2,7 +2,7 @@ import pg from "pg";
 import type { Pool, PoolClient } from "pg";
 import { EventStoreError, UniqueViolationError } from "../errors.js";
 import { fnv1a64, uuidv7 } from "../ids.js";
-import { GLOBAL_LOCK_KEY, conditionLockKeys, eventLockKeys, fromPayload, toPayload } from "../query.js";
+import { GLOBAL_LOCK_KEY, compareCursor, conditionLockKeys, eventLockKeys, filtersOf, fromPayload, normaliseOptions, toPayload } from "../query.js";
 import type {
   AppendIfOutcome,
   AppendResult,
@@ -32,7 +32,8 @@ export interface CreatePostgresStoreOptions {
   readonly connection: string | Pool;
   readonly schema: StoreSchema;
   /** `"auto"` (default): install table/function/indexes on first use. `"none"`: never touch the schema. */
-  readonly schemaMode?: "auto" | "none";
+  /** `"auto"` (default) installs table, function and indexes on first use; `"none"` never runs DDL. */
+  readonly install?: "auto" | "none";
   readonly table?: string;
   readonly adhocQueries?: boolean;
   readonly rls?: boolean;
@@ -61,7 +62,7 @@ export class PostgresStore implements EventStore {
   readonly table: string;
   private readonly pool: Pool;
   private readonly ownsPool: boolean;
-  private readonly schemaMode: "auto" | "none";
+  private readonly install: "auto" | "none";
   private readonly ddl: string[];
   private readonly uniqueByIndex: Map<string, { type: string; path: string }>;
   private readonly idempotencyIndex: string;
@@ -71,7 +72,7 @@ export class PostgresStore implements EventStore {
   constructor(options: CreatePostgresStoreOptions) {
     this.schema = options.schema;
     this.table = options.table ?? "events";
-    this.schemaMode = options.schemaMode ?? "auto";
+    this.install = options.install ?? "auto";
     if (typeof options.connection === "string") {
       this.pool = new pg.Pool({ connectionString: options.connection, max: options.poolSize ?? 10 });
       this.ownsPool = true;
@@ -90,7 +91,7 @@ export class PostgresStore implements EventStore {
     this.fn = quoteIdent(appendFunctionName(this.table));
   }
 
-  /** The DDL this store installs (or would install with `schemaMode: "none"`). */
+  /** The DDL this store installs (or would install with `install: "none"`). */
   get schemaSql(): string {
     return this.ddl.map((s) => `${s};`).join("\n\n");
   }
@@ -107,7 +108,7 @@ export class PostgresStore implements EventStore {
   }
 
   private async install(): Promise<void> {
-    if (this.schemaMode === "none") return;
+    if (this.install === "none") return;
     const client = await this.pool.connect();
     try {
       await client.query("SELECT pg_advisory_lock($1::bigint)", [INSTALL_LOCK_KEY.toString()]);
@@ -123,12 +124,13 @@ export class PostgresStore implements EventStore {
 
   async query(query: Query, options: QueryOptions = {}): Promise<QueryResult> {
     await this.ensureInstalled();
+    normaliseOptions(options);
     const compiled = compileQuery(this.table, query, options);
     const result = await this.pool.query<Row>(compiled.sql, compiled.params);
     const first = result.rows[0];
     const contextVersion = first ? toSafeInt(first.context_version) : 0;
     const events: RecordedEvent[] = [];
-    const filterCount = compileFilters(query).perFilter.length;
+    const filterCount = filtersOf(query).length;
     const byFilter: RecordedEvent[][] = Array.from({ length: filterCount }, () => []);
     let lastReturned = 0;
     let settledCursor: Cursor | null = null;
@@ -137,14 +139,14 @@ export class PostgresStore implements EventStore {
       const event = this.toRecorded(row);
       events.push(event);
       if (event.sequence > lastReturned) lastReturned = event.sequence;
-      if (event.settled && (!settledCursor || event.sequence > settledCursor.sequence)) {
+      if (event.settled && (!settledCursor || compareCursor(event, settledCursor) > 0)) {
         settledCursor = { transactionId: event.transactionId, sequence: event.sequence };
       }
       (row.hits ?? []).forEach((hit, i) => {
         if (hit) byFilter[i]?.push(event);
       });
     }
-    return { events, byFilter, lastReturned, contextVersion, settledCursor };
+    return { events, byFilter, lastReturned, contextVersion, ctx: { query, version: contextVersion }, settledCursor };
   }
 
   private toRecorded(row: Row): RecordedEvent {
@@ -152,13 +154,14 @@ export class PostgresStore implements EventStore {
     const idKey = this.schema.idKeyOf(type);
     const payload = this.schema.upcast(type, row.payload as Record<string, unknown>);
     const { id, data, scopes } = fromPayload(payload, idKey);
+    const sequence = toSafeInt(row.seq as string);
     return {
       type,
       data,
-      id,
+      id: id ?? `~${sequence}`,
       scopes,
       metadata: (row.metadata ?? {}) as RecordedEvent["metadata"],
-      sequence: toSafeInt(row.seq as string),
+      sequence,
       recordedAt: row.recorded_at instanceof Date ? row.recorded_at : new Date(String(row.recorded_at)),
       transactionId: String(row.xid),
       settled: row.settled === true,
@@ -183,13 +186,17 @@ export class PostgresStore implements EventStore {
       const event = this.schema.validate(raw);
       return { ...event, id: event.id ?? uuidv7(now) };
     });
-    const condition = ctx ? conditionLockKeys(ctx.query, this.schema) : { keys: [] as bigint[], exclusiveGlobal: false };
-    const lockKeys = [...new Set([...condition.keys, ...eventLockKeys(prepared, this.schema)].map((k) => k.toString()))].sort(
-      (a, b) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0),
-    );
+    const condition = ctx ? conditionLockKeys(ctx.query, this.schema) : { keys: [] as bigint[], exclusiveGlobal: false, exclusiveTenants: [] as bigint[] };
+    const eventLocks = eventLockKeys(prepared, this.schema);
+    const byValue = (a: string, b: string) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0);
+    // exclusive: the condition's scope pairs, tenant-only guards (exclusive on the tenant), the events' own pairs
+    const lockKeys = [...new Set([...condition.keys, ...condition.exclusiveTenants, ...eventLocks.keys].map((k) => k.toString()))].sort(byValue);
+    // shared: the tenant stamp of the events (a tenant-only guard excludes them; scope-level guards ignore them)
+    const sharedKeys = [...new Set(eventLocks.sharedTenants.map((k) => k.toString()))].filter((k) => !lockKeys.includes(k)).sort(byValue);
     const compiled = ctx ? compileVersionSql(this.table, ctx.query) : null;
     const params = [
       lockKeys,
+      sharedKeys,
       GLOBAL_LOCK_KEY.toString(),
       condition.exclusiveGlobal,
       compiled ? compiled.sql : null,
@@ -201,7 +208,7 @@ export class PostgresStore implements EventStore {
       prepared.map((e) => JSON.stringify(e.metadata ?? {})),
     ];
     const sql = `SELECT ok, actual::text AS actual, first_seq::text AS first_seq, last_seq::text AS last_seq, cnt
-FROM ${this.fn}($1::bigint[], $2::bigint, $3::boolean, $4::text, $5::text[], $6::jsonb[], $7::bigint, $8::text[], $9::jsonb[], $10::jsonb[])`;
+FROM ${this.fn}($1::bigint[], $2::bigint[], $3::bigint, $4::boolean, $5::text, $6::text[], $7::jsonb[], $8::bigint, $9::text[], $10::jsonb[], $11::jsonb[])`;
     let row: { ok: boolean; actual: string; first_seq: string | null; last_seq: string | null; cnt: number } | undefined;
     try {
       const result = await this.pool.query(sql, params);
@@ -224,7 +231,7 @@ FROM ${this.fn}($1::bigint[], $2::bigint, $3::boolean, $4::text, $5::text[], $6:
     if (e && e.code === "23505") {
       const constraint = e.constraint ?? "";
       if (constraint === this.idempotencyIndex) {
-        return new UniqueViolationError({ idempotencyKey: extractKey(e.detail) }, { cause: err });
+        return new UniqueViolationError({ idempotencyKey: true });
       }
       const unique = this.uniqueByIndex.get(constraint);
       if (unique) return new UniqueViolationError({ type: unique.type, path: unique.path }, { cause: err });
@@ -255,10 +262,10 @@ export async function createPostgresStore(options: CreatePostgresStoreOptions): 
   return store;
 }
 
-/** The DDL as text, for DBAs and `schemaMode: "none"` deployments. */
+/** The DDL as text, for DBAs and `install: "none"` deployments. */
 export function printSchemaSql(
   schema: StoreSchema,
-  options: Omit<CreatePostgresStoreOptions, "connection" | "schema" | "schemaMode" | "poolSize" | "clock"> = {},
+  options: Omit<CreatePostgresStoreOptions, "connection" | "schema" | "install" | "poolSize" | "clock"> = {},
 ): string {
   return ddlStatements(schema, { table: options.table ?? "events", ...options })
     .map((s) => `${s};`)

@@ -22,46 +22,51 @@ export interface Metadata {
 }
 
 /** An event that has not been recorded yet. */
-export interface NewEvent<T extends string = string, D = Record<string, unknown>> {
+export interface NewEvent<T extends string = string, D = Record<string, unknown>, Sc extends Scopes = Scopes> {
   readonly type: T;
   readonly data: D;
   /** Scope back-links. Keys declared in the registry are indexed and locked. */
-  readonly scopes?: Scopes;
-  /** The event's own id (`<eventName>Id`). Generated (UUIDv7) when omitted. */
+  readonly scopes?: Sc;
+  /** The event's own id (`<eventName>Id`). Registry creators generate a UUIDv7; stores generate one when still missing. */
   readonly id?: string;
   readonly metadata?: Metadata;
 }
 
 /** An event as returned by the store. */
-export interface RecordedEvent<T extends string = string, D = Record<string, unknown>> {
+export interface RecordedEvent<T extends string = string, D = Record<string, unknown>, Sc extends Scopes = Scopes> {
   readonly type: T;
   readonly data: D;
+  /** The event's own id. A legacy row without one reads back as `~<sequence>`. */
   readonly id: string;
-  readonly scopes: Scopes;
+  readonly scopes: Sc;
   readonly metadata: Metadata;
-  /** Global committed position. Defines order. Safe integer. */
+  /** Global committed position. Safe integer. Defines order within a context. */
   readonly sequence: number;
   readonly recordedAt: Date;
   /**
-   * The transaction that recorded the event (Postgres `xid8` as a decimal string; the
-   * memory store uses the sequence). Together with `sequence` it forms a gap-free cursor.
+   * The transaction that recorded the event (Postgres `xid8` as a decimal string; one per
+   * append batch; the memory store uses the batch's first sequence). Together with
+   * `sequence` it forms the gap-free cursor order `(transactionId, sequence)`.
    */
   readonly transactionId: string;
   /**
    * `true` when no transaction that started before this one is still in flight — i.e. no
    * event with a lower `(transactionId, sequence)` can still appear. Only settled events
-   * may advance a durable cursor.
+   * may advance a durable cursor. A just-committed event is usually NOT yet settled from the
+   * committing connection's point of view; it becomes settled once every older transaction ended.
    */
   readonly settled: boolean;
 }
 
 /**
  * One filter. A record matches when ALL present constraints match:
- * - `types`: the event type is one of these (OR)
+ * - `types`: the event type is one of these (OR). An empty list matches nothing.
  * - `scopes`: for every key, the event's value for that scope key is one of the given values.
  *   An event's value for key K is `scopes[K]`, or its own id when K is its id key, or the
- *   top-level data field K (flat-id compatibility).
- * - `where`: the wire payload contains at least one of these objects (JSONB `@>`, OR)
+ *   top-level string field K of its data (flat-id compatibility).
+ * - `where`: the wire payload contains at least one of these objects (JSONB `@>`, OR).
+ *   Predicates are sent as JSON: `undefined` keys vanish, `Date`s become ISO strings,
+ *   `null` matches only a JSON `null`.
  */
 export interface Filter {
   readonly types?: readonly string[];
@@ -79,24 +84,40 @@ export interface Cursor {
 }
 
 export interface QueryOptions {
-  /** Exclusive sequence cursor: return only records with `sequence > after`. Does NOT narrow the context version. */
+  /**
+   * Exclusive sequence cursor: return only records with `sequence > after`. A convenience for
+   * one-off delta reads; it can miss an event that commits late with a lower sequence, so
+   * durable consumers use `cursor` instead. Never narrows the context version.
+   */
   readonly after?: number;
-  /** Return only settled records. */
+  /** Return only settled records (see `RecordedEvent.settled`). Orders by `(transactionId, sequence)`. */
   readonly settledOnly?: boolean;
   /**
-   * Exclude settled records at or below this cursor. Unsettled records are always returned so a
-   * decision never misses a visible fact; the caller folds them without persisting them.
+   * Exclude settled records at or below this `(transactionId, sequence)` cursor. Unsettled
+   * records are always returned so a decision never misses a visible fact; the caller folds
+   * them without persisting them. Orders by `(transactionId, sequence)`.
    */
   readonly cursor?: Cursor | null;
+  /** Safe non-negative integer. */
   readonly limit?: number;
-  /** Ascending (default) or descending sequence. */
+  /** Ascending (default) or descending. */
   readonly order?: "asc" | "desc";
 }
 
-export interface QueryResult<E extends RecordedEvent = RecordedEvent> {
-  /** Matching records, ascending by sequence (unless `order: "desc"`). */
+/** Ties a query to the context version observed when it was read. Pass it to `appendIf`. */
+export interface ContextHandle {
+  readonly query: Query;
+  readonly version: number;
+}
+
+export interface QueryResult<E extends RecordedEvent<string, unknown> = RecordedEvent> {
+  /**
+   * Matching records. In sequence order, unless `cursor` or `settledOnly` is set — then in
+   * `(transactionId, sequence)` order, which is the only gap-free order across transactions.
+   * Within one lockable context both orders agree.
+   */
   readonly events: readonly E[];
-  /** The same records grouped per filter (a record matching several filters appears in each). */
+  /** The same records grouped per filter, in the order of `events` (a record matching several filters appears in each). */
   readonly byFilter: readonly (readonly E[])[];
   /** Highest sequence among the RETURNED records; 0 when none. A read cursor, not the context. */
   readonly lastReturned: number;
@@ -105,14 +126,10 @@ export interface QueryResult<E extends RecordedEvent = RecordedEvent> {
    * This — and only this — is what `appendIf` guards. 0 when nothing matches.
    */
   readonly contextVersion: number;
+  /** The query paired with `contextVersion`. Pass straight to `appendIf`. */
+  readonly ctx: ContextHandle;
   /** Highest settled `(transactionId, sequence)` among returned records; use it as the next `cursor`. */
   readonly settledCursor: Cursor | null;
-}
-
-/** Ties a query to the context version observed when it was read. Pass it to `appendIf`. */
-export interface ContextHandle {
-  readonly query: Query;
-  readonly version: number;
 }
 
 export interface AppendResult {
@@ -147,13 +164,19 @@ export interface EventStore {
 export interface StoreSchema {
   /** Scope keys that are indexed and locked. */
   readonly scopeKeys: readonly string[];
+  /** The scope key that identifies the tenant, if any. Locked shared by appends, exclusive only by tenant-wide guards. */
+  readonly tenantScopeKey?: string;
   /** Per event type: unique payload paths (e.g. `"email"`, `"scopes.magicLinkRequestedId"`). */
   readonly uniques: readonly { readonly type: string; readonly path: string }[];
   /** The id key of an event type (`<lowerFirst(type)>Id` unless declared otherwise). */
   idKeyOf(type: string): string;
   /** Upcast a stored wire payload of the given type to the current shape (identity by default). */
   upcast(type: string, payload: Record<string, unknown>): Record<string, unknown>;
-  /** Validate (and normalise) event data against the registry; unknown types pass through. Throws `ValidationError`. */
+  /**
+   * Validate and normalise a new event: registry schema for declared types, and for every type
+   * the envelope rules (no `scopes`/id-key collision in `data`, string scope values).
+   * Throws `ValidationError`.
+   */
   validate(event: NewEvent): NewEvent;
   /**
    * `strict`: a condition query must be lockable through declared scope keys. Otherwise the

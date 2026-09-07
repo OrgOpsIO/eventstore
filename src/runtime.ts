@@ -18,8 +18,8 @@ import type {
 
 /** Options of the Postgres store (mirrored here so the core stays driver-free). */
 export interface PostgresOptions {
-  /** `"auto"` (default): create table, function and indexes on first use, under an advisory lock. `"none"`: never touch the schema. */
-  readonly schema?: "auto" | "none";
+  /** `"auto"` (default): create table, function and indexes on first use, under an advisory lock. `"none"`: never touch DDL (use `printSchemaSql`). */
+  readonly install?: "auto" | "none";
   /** Table name. Default `events`. */
   readonly table?: string;
   /** Add a `jsonb_path_ops` GIN index on the payload for ad-hoc `where` queries. Default `false`. */
@@ -160,12 +160,10 @@ async function resolveStore(config: EventStoreConfig, schema: StoreSchema): Prom
   }
   if (config.connection) {
     const { createPostgresStore } = await import("./postgres/index.js");
-    const { schema: schemaMode, ...pg } = config.postgres ?? {};
     return createPostgresStore({
       connection: config.connection,
       schema,
-      schemaMode,
-      ...pg,
+      ...(config.postgres ?? {}),
       tenantScopeKey: config.tenant?.scopeKey,
       clock: config.clock,
     });

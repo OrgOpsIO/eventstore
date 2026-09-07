@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
-import { buildSchema, decision, defineEvents, MemoryStore, reject, runCommand, type CommandSpec } from "../src/index.js";
+import { buildSchema, defineEvents, MemoryStore, reject, runCommand, type CommandSpec } from "../src/index.js";
 import { given, interferingStore, makeEvent, recordingStore, resetSequence, slowStore } from "../src/testing/index.js";
 
 const accounts = defineEvents({
@@ -10,7 +10,11 @@ const accounts = defineEvents({
 });
 const schema = buildSchema([accounts]);
 
-const balance = accounts.$fold(0, {
+const balanceInto = accounts.$fold<number>({
+  MoneyDeposited: (d, s) => s + d.amount,
+  MoneyWithdrawn: (d, s) => s - d.amount,
+});
+const balance = accounts.$foldAll(0, {
   MoneyDeposited: (d, s) => s + d.amount,
   MoneyWithdrawn: (d, s) => s - d.amount,
 });
@@ -19,10 +23,10 @@ function withdraw(accountOpenedId: string, amount: number): CommandSpec<number, 
   return {
     context: accounts.$scope("accountOpenedId", accountOpenedId),
     initial: 0,
-    fold: (events, state) => state + balance(events),
+    fold: balanceInto,
     decide: (state) => {
       if (state < amount) return reject("insufficient-funds", `balance ${state} < ${amount}`);
-      return decision(accounts.MoneyWithdrawn({ amount }, { accountOpenedId }), { balance: state - amount });
+      return { events: [accounts.MoneyWithdrawn({ amount }, { accountOpenedId })], result: { balance: state - amount } };
     },
   };
 }
@@ -52,7 +56,7 @@ describe("given / when / then", () => {
 
   it("thenNothingHappened for a no-op decision", async () => {
     await given([opened], { schema })
-      .when({ context: accounts.$scope("accountOpenedId", "acc-1"), decide: () => decision([]) })
+      .when({ context: accounts.$scope("accountOpenedId", "acc-1"), decide: () => ({ events: [] }) })
       .thenNothingHappened();
   });
 

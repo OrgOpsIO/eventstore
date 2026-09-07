@@ -210,7 +210,7 @@ describe("subscribe", () => {
 
   it("on() rejects stores that cannot push", () => {
     const polling = {
-      query: async () => ({ events: [], byFilter: [], lastReturned: 0, contextVersion: 0, settledCursor: null }),
+      query: async () => ({ events: [], byFilter: [], lastReturned: 0, contextVersion: 0, ctx: { query: {}, version: 0 }, settledCursor: null }),
       append: async () => ({ first: 0, last: 0, count: 0 }),
       appendIf: async () => ({ ok: true as const, appended: { first: 0, last: 0, count: 0 } }),
       close: async () => {},

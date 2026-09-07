@@ -262,7 +262,7 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     await store.append([ev.NoteAdded({ text: "once" }, {}, { metadata: { idempotencyKey: "k-1" } })]);
     await assert.rejects(
       () => store.append([ev.NoteAdded({ text: "twice" }, {}, { metadata: { idempotencyKey: "k-1" } })]),
-      (e: unknown) => e instanceof UniqueViolationError && e.detail.idempotencyKey === "k-1",
+      (e: unknown) => e instanceof UniqueViolationError && e.detail.idempotencyKey === true,
     );
     assert.equal((await store.query({ types: ["NoteAdded"] })).events.length, 1);
   });

@@ -1,7 +1,8 @@
 import type { ZodType, output } from "zod";
-import { defaultIdKey } from "./ids.js";
+import { defaultIdKey, uuidv7 } from "./ids.js";
 import { ValidationError } from "./errors.js";
-import { uniquePathSegments } from "./query.js";
+import { IDENTIFIER, uniquePathSegments, validateEnvelope } from "./query.js";
+import type { Fold } from "./context.js";
 import type { Filter, Metadata, NewEvent, RecordedEvent, Scopes, StoreSchema } from "./types.js";
 
 /** One event type declaration. */
@@ -16,7 +17,7 @@ export interface EventDefinition<S extends ZodType = ZodType, K extends string =
   readonly unique?: readonly string[];
   /** Own-id key on the wire; defaults to `<lowerFirst(Type)>Id`. */
   readonly idKey?: string;
-  /** Upcast an older stored payload to the current shape (runs before parsing on read). */
+  /** Upcast an older stored payload to the current shape (runs on read, before parsing). */
   readonly upcast?: (payload: Record<string, unknown>) => Record<string, unknown>;
 }
 
@@ -26,18 +27,24 @@ type ScopeKeysOf<Def extends EventDefinition> = Def extends EventDefinition<ZodT
 type RequiredScopeKeys<Def extends EventDefinition> = Def["scopes"] extends readonly (infer K extends string)[] ? K : never;
 type OptionalScopeKeys<Def extends EventDefinition> = Def["optionalScopes"] extends readonly (infer K extends string)[] ? K : never;
 
+/** The exact scopes a creator accepts: required keys, optional keys, nothing else. */
+export type ScopesInputOf<Def extends EventDefinition> = Record<RequiredScopeKeys<Def>, string> & Partial<Record<OptionalScopeKeys<Def>, string>>;
+
+/** The scopes a recorded event of this type carries (extra keys such as the tenant stamp are tolerated). */
+export type ScopesOf<Def extends EventDefinition> = ScopesInputOf<Def> & Scopes;
+
 type ScopesArg<Def extends EventDefinition> = [RequiredScopeKeys<Def>] extends [never]
-  ? [scopes?: Partial<Record<OptionalScopeKeys<Def>, string>> & Scopes]
-  : [scopes: Record<RequiredScopeKeys<Def>, string> & Partial<Record<OptionalScopeKeys<Def>, string>> & Scopes];
+  ? [scopes?: Partial<Record<OptionalScopeKeys<Def>, string>>]
+  : [scopes: ScopesInputOf<Def>];
 
 export type DataOf<Def extends EventDefinition> = output<Def["data"]>;
 
 export type NewEventOf<D extends Definitions, N extends keyof D & string = keyof D & string> = {
-  [K in N]: NewEvent<K, DataOf<D[K]>> & { readonly id: string; readonly scopes: Scopes };
+  [K in N]: NewEvent<K, DataOf<D[K]>, ScopesOf<D[K]>> & { readonly id: string; readonly scopes: ScopesOf<D[K]> };
 }[N];
 
 export type RecordedEventOf<D extends Definitions, N extends keyof D & string = keyof D & string> = {
-  [K in N]: RecordedEvent<K, DataOf<D[K]>>;
+  [K in N]: RecordedEvent<K, DataOf<D[K]>, ScopesOf<D[K]>>;
 }[N];
 
 export type AllScopeKeys<D extends Definitions> = { [K in keyof D]: ScopeKeysOf<D[K]> }[keyof D];
@@ -62,7 +69,14 @@ export interface RegistryFilter<D extends Definitions> {
   readonly where?: readonly Readonly<Record<string, unknown>>[];
 }
 
-export type EventRegistry<D extends Definitions = Definitions> = {
+/** The structural part of a registry that stores and configs need — accepts any `defineEvents(...)` result. */
+export interface RegistryLike {
+  readonly $defs: Definitions;
+  readonly $scopeKeys: readonly string[];
+  $validate(event: NewEvent): NewEvent;
+}
+
+export type EventRegistry<D extends Definitions> = {
   readonly [N in keyof D & string]: Creator<D, N>;
 } & {
   readonly $defs: D;
@@ -71,19 +85,32 @@ export type EventRegistry<D extends Definitions = Definitions> = {
   readonly $scopeKeys: readonly string[];
   /** A filter over this registry's types (all of them unless `types` is given). */
   $filter(filter?: RegistryFilter<D>): Filter;
-  /** Everything of this registry that happened in relation to one event: `$scope("articleDraftedId", id)`. */
+  /**
+   * Everything OF THIS REGISTRY that happened in relation to one event: `$scope("articleDraftedId", id)`.
+   * For a cross-registry scope use the free `scope()` helper.
+   */
   $scope(key: AllScopeKeys<D> | (string & {}), value: string | readonly string[]): Filter;
-  /** A typed fold: unknown or unhandled types are skipped. */
-  $fold<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>): (events: readonly RecordedEvent[]) => S;
-  /** Narrow a recorded event to this registry's union (throws for unknown types). */
-  $parse(event: RecordedEvent): RecordedEventOf<D>;
+  /**
+   * The incremental fold `es.context()` and `es.command()` want: `(delta, state) => state`.
+   * Unknown or unhandled types are skipped. A handler must return the next state.
+   */
+  $fold<S>(handlers: FoldHandlers<D, S>): Fold<S>;
+  /** One-shot: fold a complete list from `initial`. Not an incremental fold. */
+  $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>): (events: readonly RecordedEvent[]) => S;
+  /** Narrow a recorded event to this registry's union, re-validating its data against the schema. Throws for unknown types. */
+  $parse(event: RecordedEvent<string, unknown>): RecordedEventOf<D>;
   $is(event: RecordedEvent<string, unknown>): event is RecordedEventOf<D>;
   $idKey(type: keyof D & string): string;
-  /** Validate the data of a new event against its schema. */
+  /** Validate a new event of this registry (schema + envelope rules). */
   $validate(event: NewEvent): NewEvent;
 };
 
 const RESERVED = /^\$/;
+const TYPE_NAME = /^[A-Za-z][A-Za-z0-9_.]*$/;
+
+function zodIssues(issues: readonly { message: string; path: PropertyKey[]; code: string }[]) {
+  return issues.map((i) => ({ message: i.message, path: i.path.map(String), code: i.code }));
+}
 
 /**
  * Declare events once. You get typed creators, typed folds, typed filters — and the store
@@ -94,31 +121,53 @@ const RESERVED = /^\$/;
  *   ArticleDrafted: { data: z.object({ title: z.string(), slug: z.string() }), scopes: ["workspaceProvisionedId"] },
  *   ArticleArchived: { data: z.object({ reason: z.string().optional() }), scopes: ["articleDraftedId"] },
  * });
- * const drafted = articles.ArticleDrafted({ title, slug }, { workspaceProvisionedId });
+ * const drafted = articles.ArticleDrafted({ title, slug }, { workspaceProvisionedId });   // drafted.id is a UUIDv7
  * ```
  */
 export function defineEvents<const D extends Definitions>(defs: D): EventRegistry<D> {
   const types = Object.keys(defs) as (keyof D & string)[];
   for (const t of types) {
     if (RESERVED.test(t)) throw new Error(`eventstore: event type "${t}" must not start with "$"`);
-    if (!/^[A-Za-z][A-Za-z0-9_.]*$/.test(t)) throw new Error(`eventstore: invalid event type "${t}"`);
+    if (!TYPE_NAME.test(t)) throw new Error(`eventstore: invalid event type "${t}"`);
     for (const u of defs[t]?.unique ?? []) uniquePathSegments(u);
+    for (const k of [...(defs[t]?.scopes ?? []), ...(defs[t]?.optionalScopes ?? [])]) {
+      if (!IDENTIFIER.test(k)) throw new Error(`eventstore: invalid scope key "${k}" on ${t}`);
+    }
   }
   const scopeKeys = [...new Set(types.flatMap((t) => [...(defs[t]?.scopes ?? []), ...(defs[t]?.optionalScopes ?? [])]))].sort();
-
   const idKeyOf = (type: string): string => defs[type]?.idKey ?? defaultIdKey(type);
+  const envelope = { idKeyOf, scopeKeys };
 
   const validate = (event: NewEvent): NewEvent => {
     const def = defs[event.type];
-    if (!def) return event;
+    if (!def) {
+      validateEnvelope(event, envelope);
+      return event;
+    }
     const parsed = def.data.safeParse(event.data);
-    if (!parsed.success) throw new ValidationError(event.type, parsed.error.issues);
+    if (!parsed.success) throw new ValidationError(event.type, zodIssues(parsed.error.issues));
+    const withData = { ...event, data: parsed.data as Record<string, unknown> };
+    validateEnvelope(withData, envelope);
     for (const key of def.scopes ?? []) {
       if (typeof event.scopes?.[key] !== "string" || event.scopes[key] === "") {
-        throw new ValidationError(event.type, [{ message: `missing required scope "${key}"` }]);
+        throw new ValidationError(event.type, [{ message: `missing required scope "${key}"`, path: ["scopes", key] }]);
       }
     }
-    return { ...event, data: parsed.data as Record<string, unknown> };
+    return withData;
+  };
+
+  const foldWith = <S>(handlers: FoldHandlers<D, S>) => {
+    const table = handlers as Record<string, ((d: unknown, s: S, e: RecordedEvent) => S) | undefined>;
+    return (events: readonly RecordedEvent[], state: S): S => {
+      for (const event of events) {
+        const handler = table[event.type];
+        if (!handler) continue;
+        const next = handler(event.data, state, event);
+        if (next === undefined) throw new Error(`eventstore: fold handler for "${event.type}" returned undefined; return the next state`);
+        state = next;
+      }
+      return state;
+    };
   };
 
   const registry: Record<string, unknown> = {
@@ -136,21 +185,20 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
     $scope(key: string, value: string | readonly string[]): Filter {
       return { types: [...types], scopes: { [key]: value } };
     },
-    $fold<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>) {
-      return (events: readonly RecordedEvent[]): S => {
-        let state = typeof initial === "function" ? (initial as () => S)() : initial;
-        for (const event of events) {
-          const handler = (handlers as Record<string, ((d: unknown, s: S, e: RecordedEvent) => S) | undefined>)[event.type];
-          if (handler) state = handler(event.data, state, event);
-        }
-        return state;
-      };
+    $fold: <S>(handlers: FoldHandlers<D, S>) => foldWith(handlers),
+    $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>) {
+      const fold = foldWith(handlers);
+      return (events: readonly RecordedEvent[]): S =>
+        fold(events, typeof initial === "function" ? (initial as () => S)() : initial);
     },
-    $parse(event: RecordedEvent) {
-      if (!(event.type in defs)) throw new Error(`eventstore: "${event.type}" is not declared in this registry`);
-      return event;
+    $parse(event: RecordedEvent<string, unknown>) {
+      const def = defs[event.type];
+      if (!def) throw new Error(`eventstore: "${event.type}" is not declared in this registry`);
+      const parsed = def.data.safeParse(event.data);
+      if (!parsed.success) throw new ValidationError(event.type, zodIssues(parsed.error.issues));
+      return { ...event, data: parsed.data };
     },
-    $is(event: RecordedEvent): boolean {
+    $is(event: RecordedEvent<string, unknown>): boolean {
       return event.type in defs;
     },
     $idKey: idKeyOf,
@@ -161,23 +209,16 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
     registry[type] = (data: unknown, ...rest: unknown[]) => {
       const scopes = (rest[0] ?? {}) as Scopes;
       const options = (rest[1] ?? {}) as CreateOptions;
-      const event: NewEvent = { type, data: data as Record<string, unknown>, scopes, ...(options.metadata ? { metadata: options.metadata } : {}) };
-      const valid = validate(event);
-      return { ...valid, id: options.id ?? undefined, scopes };
+      const valid = validate({ type, data: data as Record<string, unknown>, scopes, ...(options.metadata ? { metadata: options.metadata } : {}) });
+      return { ...valid, id: options.id ?? uuidv7(), scopes };
     };
   }
   return registry as EventRegistry<D>;
 }
 
-/** The structural part of a registry that stores and configs need — accepts any `defineEvents(...)` result. */
-export interface RegistryLike {
-  readonly $defs: Definitions;
-  readonly $scopeKeys: readonly string[];
-  $validate(event: NewEvent): NewEvent;
-}
-
 export interface SchemaOptions {
   readonly scopeKeys?: readonly string[];
+  readonly tenantScopeKey?: string;
   readonly strict?: boolean;
 }
 
@@ -186,21 +227,29 @@ export function buildSchema(registries: readonly RegistryLike[], options: Schema
   const defs: Definitions = {};
   for (const r of registries) {
     for (const [type, def] of Object.entries(r.$defs)) {
+      if (!TYPE_NAME.test(type)) throw new Error(`eventstore: invalid event type "${type}"`);
       if (defs[type] && defs[type] !== def) throw new Error(`eventstore: event type "${type}" is declared twice`);
       defs[type] = def;
     }
   }
-  const scopeKeys = [...new Set([...registries.flatMap((r) => r.$scopeKeys), ...(options.scopeKeys ?? [])])].sort();
+  const scopeKeys = [
+    ...new Set([...registries.flatMap((r) => r.$scopeKeys), ...(options.scopeKeys ?? []), ...(options.tenantScopeKey ? [options.tenantScopeKey] : [])]),
+  ].sort();
+  for (const k of scopeKeys) if (!IDENTIFIER.test(k)) throw new Error(`eventstore: invalid scope key "${k}"`);
   const uniques = Object.entries(defs).flatMap(([type, def]) => (def.unique ?? []).map((path) => ({ type, path })));
+  const idKeyOf = (type: string): string => defs[type]?.idKey ?? defaultIdKey(type);
+  const envelope = { idKeyOf, scopeKeys };
   const validateAll = (event: NewEvent): NewEvent => {
     for (const r of registries) if (event.type in r.$defs) return r.$validate(event);
+    validateEnvelope(event, envelope);
     return event;
   };
   return {
     scopeKeys,
+    ...(options.tenantScopeKey ? { tenantScopeKey: options.tenantScopeKey } : {}),
     uniques,
     strict: options.strict ?? true,
-    idKeyOf: (type) => defs[type]?.idKey ?? defaultIdKey(type),
+    idKeyOf,
     upcast: (type, payload) => defs[type]?.upcast?.(payload) ?? payload,
     validate: validateAll,
   };

@@ -152,6 +152,7 @@ export function appendFunctionDdl(table: string): string {
   const fn = quoteIdent(appendFunctionName(table));
   return `CREATE OR REPLACE FUNCTION ${fn}(
   p_lock_keys bigint[],
+  p_shared_keys bigint[],
   p_global_key bigint,
   p_exclusive_global boolean,
   p_version_sql text,
@@ -175,7 +176,9 @@ BEGIN
   ELSE
     PERFORM pg_advisory_xact_lock_shared(p_global_key);
   END IF;
-  PERFORM pg_advisory_xact_lock(k) FROM unnest(p_lock_keys) AS k ORDER BY k;
+  -- lock order everywhere: global → shared tenant stamps → exclusive keys (sorted by the caller)
+  PERFORM pg_advisory_xact_lock_shared(k) FROM (SELECT unnest(p_shared_keys) AS k ORDER BY 1) s;
+  PERFORM pg_advisory_xact_lock(k) FROM (SELECT unnest(p_lock_keys) AS k ORDER BY 1) s;
 
   -- 2. the context version, read after the locks (fresh snapshot). p_version_sql is the
   --    statement compiled by compileVersionSql(): one MAX per scope value, so every branch is

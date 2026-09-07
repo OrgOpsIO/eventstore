@@ -1,7 +1,12 @@
+import { cursorOf } from "./memory.js";
 import { queryKey } from "./query.js";
 import type { ContextHandle, Cursor, EventStore, Query, RecordedEvent } from "./types.js";
 
-export type Fold<S> = (events: readonly RecordedEvent[], state: S) => S;
+/**
+ * An incremental fold: called with a batch of events (the delta) and the state so far.
+ * The phantom parameter keeps a one-shot `(events) => S` from slotting in by arity.
+ */
+export type Fold<S> = (events: readonly RecordedEvent[], state: S, _incremental?: never) => S;
 
 export interface ContextSpec<S> {
   readonly query: Query;
@@ -29,25 +34,34 @@ interface Entry<S> {
 export interface ContextCacheOptions {
   /** Max cached contexts per process (LRU). Default 1000. `0` disables caching. */
   readonly max?: number;
+  /**
+   * Refuse to fold more than this many events in one load (default 100 000). A context that
+   * large needs a narrower query, a snapshot, or a read model — silently truncating it would
+   * make decisions wrong.
+   */
+  readonly maxEvents?: number;
 }
 
 /**
  * Incremental context loading. The cache keeps, per query, the state folded over SETTLED
- * events and the settled cursor. A load reads only what is beyond that cursor, folds the
- * settled part into the cache, folds any unsettled (visible but not yet gap-free) events on
- * top for this decision only, and hands back the CCC context version for `appendIf`.
+ * events and the settled cursor. A load reads only what is beyond that cursor (in
+ * `(transactionId, sequence)` order, the one gap-free order), folds the settled part into the
+ * cache, folds any unsettled events on top for this decision only, and hands back the CCC
+ * context version for `appendIf`.
  *
  * Correctness never depends on the cache: the guard compares the full context version.
  */
 export class ContextCache {
   private readonly entries = new Map<string, Entry<unknown>>();
   private readonly max: number;
+  private readonly maxEvents: number;
 
   constructor(
     private readonly store: EventStore,
     options: ContextCacheOptions = {},
   ) {
     this.max = options.max ?? 1000;
+    this.maxEvents = options.maxEvents ?? 100_000;
   }
 
   async load<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>> {
@@ -55,30 +69,21 @@ export class ContextCache {
     const cached = this.max > 0 ? (this.entries.get(key) as Entry<S> | undefined) : undefined;
     const base: Entry<S> = cached ?? { state: typeof spec.initial === "function" ? (spec.initial as () => S)() : spec.initial, cursor: null };
 
-    const result = await this.store.query(spec.query, { cursor: base.cursor });
+    // `cursor: null` still selects (transactionId, sequence) order, so the settled prefix is exact.
+    const result = await this.store.query(spec.query, { cursor: base.cursor ?? null, limit: this.maxEvents + 1 });
+    if (result.events.length > this.maxEvents) {
+      throw new Error(
+        `eventstore: context ${key.slice(0, 200)} has more than ${this.maxEvents} events; narrow the query or raise contextCache.maxEvents`,
+      );
+    }
     const settled: RecordedEvent[] = [];
     const unsettled: RecordedEvent[] = [];
-    // Records come back ascending; the settled prefix is everything up to the last settled one
-    // only if no unsettled record sits before it — otherwise persist just the gap-free prefix.
-    let gapFree = true;
-    for (const e of result.events) {
-      if (e.settled && gapFree) settled.push(e);
-      else {
-        gapFree = false;
-        unsettled.push(e);
-      }
-    }
-    const persisted: Entry<S> = settled.length > 0
-      ? { state: spec.fold(settled, base.state), cursor: cursorOf(settled) ?? base.cursor }
-      : base;
+    // In (transactionId, sequence) order every settled record precedes every unsettled one.
+    for (const e of result.events) (e.settled && unsettled.length === 0 ? settled : unsettled).push(e);
+    const persisted: Entry<S> = settled.length > 0 ? { state: spec.fold(settled, base.state), cursor: cursorOf(settled) ?? base.cursor } : base;
     if (this.max > 0) this.remember(key, persisted);
     const state = unsettled.length > 0 ? spec.fold(unsettled, persisted.state) : persisted.state;
-    return {
-      state,
-      ctx: { query: spec.query, version: result.contextVersion },
-      delta: result.events,
-      cacheHit: cached !== undefined,
-    };
+    return { state, ctx: result.ctx, delta: result.events, cacheHit: cached !== undefined };
   }
 
   /** Forget one query (or everything). */
@@ -100,9 +105,4 @@ export class ContextCache {
       this.entries.delete(oldest);
     }
   }
-}
-
-function cursorOf(events: readonly RecordedEvent[]): Cursor | null {
-  const last = events[events.length - 1];
-  return last ? { transactionId: last.transactionId, sequence: last.sequence } : null;
 }

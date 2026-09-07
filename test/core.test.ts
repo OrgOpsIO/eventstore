@@ -31,20 +31,20 @@ const articles = defineEvents({
 
 type Article = { id: string; title: string; body: string; archived: boolean };
 
-const foldArticles = articles.$fold<Map<string, Article>>(
-  () => new Map(),
-  {
-    ArticleDrafted: (data, state, e) => new Map(state).set(e.id, { id: e.id, title: data.title, body: "", archived: false }),
-    ArticleContentEdited: (data, state, e) => {
-      const a = state.get(e.scopes.articleDraftedId!);
-      return a ? new Map(state).set(a.id, { ...a, body: data.body }) : state;
-    },
-    ArticleArchived: (_data, state, e) => {
-      const a = state.get(e.scopes.articleDraftedId!);
-      return a ? new Map(state).set(a.id, { ...a, archived: true }) : state;
-    },
+// incremental fold (delta, state) => state — what es.context()/es.command() take
+const foldInto = articles.$fold<Map<string, Article>>({
+  ArticleDrafted: (data, state, e) => new Map(state).set(e.id, { id: e.id, title: data.title, body: "", archived: false }),
+  ArticleContentEdited: (data, state, e) => {
+    const a = state.get(e.scopes.articleDraftedId); // typed: required scope → string
+    return a ? new Map(state).set(a.id, { ...a, body: data.body }) : state;
   },
-);
+  ArticleArchived: (_data, state, e) => {
+    const a = state.get(e.scopes.articleDraftedId);
+    return a ? new Map(state).set(a.id, { ...a, archived: true }) : state;
+  },
+});
+// one-shot fold over a complete list
+const foldArticles = (events: readonly import("../src/index.js").RecordedEvent[]) => foldInto(events, new Map<string, Article>());
 
 const WS = "ws-1";
 
@@ -56,6 +56,9 @@ describe("registry", () => {
   it("creates typed, validated events with the <eventName>Id convention", () => {
     const e = articles.ArticleDrafted({ title: "Hello", slug: "hello" }, { workspaceProvisionedId: WS });
     expect(e.type).toBe("ArticleDrafted");
+    expect(e.id).toMatch(/^[0-9a-f-]{36}$/); // creators generate the id
+    // @ts-expect-error unknown scope key alongside the required one
+    articles.ArticleDrafted({ title: "x", slug: "y" }, { workspaceProvisionedId: WS, bogusId: "z" });
     expect(e.scopes.workspaceProvisionedId).toBe(WS);
     expect(articles.$idKey("ArticleDrafted")).toBe("articleDraftedId");
     expect(() => articles.ArticleDrafted({ title: "", slug: "x" }, { workspaceProvisionedId: WS })).toThrow(ValidationError);
@@ -134,7 +137,7 @@ describe("memory store + api", () => {
     const es = newApi().forTenant(WS);
     const outcome = await es.command<Map<string, Article>, string>({
       context: articles.$filter({ types: ["ArticleDrafted"] }),
-      fold: (events, state) => new Map([...state, ...foldArticles(events)]),
+      fold: foldInto,
       initial: () => new Map(),
       decide: (state, { id }) => {
         if ([...state.values()].some((a) => a.title === "Hello")) return reject("duplicate", "already drafted");
@@ -147,7 +150,7 @@ describe("memory store + api", () => {
     expect(outcome.appended?.count).toBe(1);
     const again = await es.command<Map<string, Article>, string>({
       context: articles.$filter({ types: ["ArticleDrafted"] }),
-      fold: (events, state) => new Map([...state, ...foldArticles(events)]),
+      fold: foldInto,
       initial: () => new Map(),
       decide: (state) => ([...state.values()].some((a) => a.title === "Hello") ? reject("duplicate", "already drafted") : { events: [] }),
     });
