@@ -134,31 +134,28 @@ export class MemoryStore implements EventStore, LiveStore {
   /** The shortest posting list that covers one filter, or `null` when only a scan can. */
   private candidatesFor(filter: Filter): number[] | null {
     let best: number[] | null = null;
-    const consider = (list: number[]) => {
+    // merge several lists only when the union can still beat the best list found so far
+    const considerUnion = (lists: number[][]) => {
+      const total = lists.reduce((n, l) => n + l.length, 0);
+      if (best !== null && best.length <= total && lists.length > 1) return;
+      const list = lists.length === 1 ? lists[0]! : mergeSorted(lists);
       if (best === null || list.length < best.length) best = list;
     };
     if (filter.scopes) {
       for (const [key, values] of Object.entries(filter.scopes)) {
         const byValue = this.byScope.get(key);
         if (!byValue) {
-          // an undeclared flat key is not indexed — but if no row carries the key at all, nothing matches
-          if (!this.schema.scopeKeys.includes(key) && this.flatKeyUsed(key)) continue;
-          return best ?? (this.flatKeyUsed(key) ? null : []);
+          // a key no row carries in `scopes`/as own id: declared keys are fully indexed (flat
+          // fields included) so nothing can match; an undeclared key may sit flat in data → scan
+          if (this.schema.scopeKeys.includes(key)) return [];
+          if (best === null) return null;
+          continue;
         }
-        const lists = (values as readonly string[]).map((v) => byValue.get(v) ?? []);
-        consider(lists.length === 1 ? lists[0]! : mergeSorted(lists));
+        considerUnion((values as readonly string[]).map((v) => byValue.get(v) ?? []));
       }
     }
-    if (filter.types) {
-      const lists = filter.types.map((t) => this.byType.get(t) ?? []);
-      consider(lists.length === 1 ? lists[0]! : mergeSorted(lists));
-    }
+    if (filter.types) considerUnion(filter.types.map((t) => this.byType.get(t) ?? []));
     return best;
-  }
-
-  private flatKeyUsed(key: string): boolean {
-    // conservative: a key that is not a declared scope key may sit flat in any row's data
-    return !this.schema.scopeKeys.includes(key);
   }
 
   private visible(record: RecordedEvent, options: QueryOptions): boolean {
