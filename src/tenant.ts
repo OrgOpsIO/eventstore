@@ -1,6 +1,8 @@
+import { TenantMismatchError } from "./errors.js";
 import { filtersOf } from "./query.js";
 import type { AppendIfOutcome, AppendResult, ContextHandle, EventStore, Filter, NewEvent, Query, QueryOptions, QueryResult } from "./types.js";
 
+/** How the tenant is represented: as a scope key in every event's payload. */
 export interface TenantConfig {
   /** The scope key that identifies the tenant, e.g. `"workspaceProvisionedId"`. Indexed and locked like any scope key. */
   readonly scopeKey: string;
@@ -8,6 +10,7 @@ export interface TenantConfig {
   readonly platformId?: string;
 }
 
+/** The tenant id of platform-level events (accounts, registrations) when none is configured: the nil UUID. */
 export const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000";
 
 /**
@@ -25,7 +28,7 @@ export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId
       if (claimed !== undefined) {
         const values = typeof claimed === "string" ? [claimed] : claimed;
         if (values.length !== 1 || values[0] !== tenantId) {
-          throw new Error(`eventstore: query names tenant ${values.join(",")} but the store is bound to ${tenantId}`);
+          throw new TenantMismatchError(`eventstore: query names tenant ${values.join(",")} but the store is bound to ${tenantId}`);
         }
         return f;
       }
@@ -40,11 +43,11 @@ export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId
       const data = (e.data ?? {}) as Record<string, unknown>;
       const flat = Object.prototype.hasOwnProperty.call(data, key) ? data[key] : undefined;
       if (flat !== undefined && flat !== tenantId) {
-        throw new Error(`eventstore: "${e.type}" carries ${key}=${String(flat)} in its data but is appended to ${tenantId}`);
+        throw new TenantMismatchError(`eventstore: "${e.type}" carries ${key}=${String(flat)} in its data but is appended to ${tenantId}`);
       }
       const claimed = e.scopes?.[key];
       if (claimed !== undefined && claimed !== tenantId) {
-        throw new Error(`eventstore: "${e.type}" names tenant ${claimed} but is appended to ${tenantId}`);
+        throw new TenantMismatchError(`eventstore: "${e.type}" names tenant ${claimed} but is appended to ${tenantId}`);
       }
       if (claimed === tenantId) return e;
       return { ...e, scopes: { ...(e.scopes ?? {}), [key]: tenantId } };

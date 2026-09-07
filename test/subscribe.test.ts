@@ -215,6 +215,7 @@ describe("subscribe", () => {
       appendIf: async () => ({ ok: true as const, appended: { first: 0, last: 0, count: 0 } }),
       close: async () => {},
     };
-    expect(() => on({ types: ["X"] }, () => {}, { store: polling })).toThrow(/LiveStore/);
+    // the type now requires a LiveStore; the runtime check still guards JS callers
+    expect(() => on({ types: ["X"] }, () => {}, { store: polling as unknown as Parameters<typeof on>[2]["store"] })).toThrow(/LiveStore/);
   });
 });

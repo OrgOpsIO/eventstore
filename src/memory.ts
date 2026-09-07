@@ -27,6 +27,7 @@ import type {
   StoreSchema,
 } from "./types.js";
 
+/** Called with the records of one append batch. */
 export type AppendedListener = (events: readonly RecordedEvent[]) => void;
 
 /** Optional capability: a store that can push appended events to in-process listeners. */
@@ -34,6 +35,7 @@ export interface LiveStore {
   onAppended(listener: AppendedListener): () => void;
 }
 
+/** Options of the in-memory reference store. */
 export interface MemoryStoreOptions {
   /** Declared events/scopes; default: an empty, non-strict schema. */
   readonly schema?: StoreSchema;
@@ -352,6 +354,7 @@ function splitUniqueKey(key: string): [string, string, string] {
   return [key.slice(0, first), key.slice(first + 1, second), key.slice(second + 1)];
 }
 
+/** Whether a store can push appended events in-process (`onAppended`). */
 export function isLiveStore(store: EventStore): store is EventStore & LiveStore {
   return typeof (store as Partial<LiveStore>).onAppended === "function";
 }

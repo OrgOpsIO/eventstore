@@ -83,6 +83,7 @@ export interface Cursor {
   readonly sequence: number;
 }
 
+/** Read options. `after` and `cursor` narrow the records, never the context version. */
 export interface QueryOptions {
   /**
    * Exclusive sequence cursor: return only records with `sequence > after`. A convenience for
@@ -110,6 +111,7 @@ export interface ContextHandle {
   readonly version: number;
 }
 
+/** What a read returns: the records, their per-filter grouping, and the three numbers that must not be confused (see fields). */
 export interface QueryResult<E extends RecordedEvent<string, unknown> = RecordedEvent> {
   /**
    * Matching records. In sequence order, unless `cursor` or `settledOnly` is set — then in
@@ -132,17 +134,20 @@ export interface QueryResult<E extends RecordedEvent<string, unknown> = Recorded
   readonly settledCursor: Cursor | null;
 }
 
+/** The consecutive sequence range one append batch received. */
 export interface AppendResult {
   readonly first: number;
   readonly last: number;
   readonly count: number;
 }
 
+/** The version `appendIf` expected versus the one it found. */
 export interface Conflict {
   readonly expected: number;
   readonly actual: number;
 }
 
+/** Result of `appendIf`: committed (`appended`) or refused (`conflict`). Naming rule: `*Outcome` is a discriminated union on `ok`, `*Result` plain data. */
 export type AppendIfOutcome =
   | { readonly ok: true; readonly appended: AppendResult }
   | { readonly ok: false; readonly conflict: Conflict };

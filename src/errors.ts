@@ -1,11 +1,13 @@
 import type { Conflict } from "./types.js";
 
+/** One validation problem: message, JSON path, optional code (Zod's or the SDK's). */
 export interface ValidationIssue {
   readonly message: string;
   readonly path?: readonly (string | number)[];
   readonly code?: string;
 }
 
+/** Base class of every error the store raises; `httpStatus` suggests a status for delivery mechanisms. */
 export class EventStoreError extends Error {
   override readonly name: string = "EventStoreError";
   /** Suggested HTTP status for delivery mechanisms. */
@@ -92,6 +94,30 @@ export class PolicyViolationError extends EventStoreError {
   }
 }
 
+/** A query or event names a tenant other than the one the view is bound to. Fail-closed. */
+export class TenantMismatchError extends EventStoreError {
+  override readonly name = "TenantMismatchError";
+  override readonly httpStatus = 403;
+}
+
+/** A context exceeds `contextCache.maxEvents`; narrow the query, snapshot, or raise the limit. */
+export class ContextTooLargeError extends EventStoreError {
+  override readonly name = "ContextTooLargeError";
+  constructor(
+    readonly key: string,
+    readonly maxEvents: number,
+  ) {
+    super(`eventstore: context ${key.slice(0, 200)} has more than ${maxEvents} events; narrow the query or raise contextCache.maxEvents`);
+  }
+}
+
+/** Base for programming errors surfaced at request time: invalid query shapes, undeclared types. */
+export class UsageError extends EventStoreError {
+  override readonly name = "UsageError";
+  override readonly httpStatus = 400;
+}
+
+/** The ambient `es` was used before `configure()`. */
 export class NotConfiguredError extends EventStoreError {
   override readonly name = "NotConfiguredError";
   constructor() {

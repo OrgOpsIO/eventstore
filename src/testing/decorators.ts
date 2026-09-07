@@ -9,6 +9,7 @@ import type {
   QueryResult,
 } from "../index.js";
 
+/** How often the interfering store injects its events before delegating `appendIf`. */
 export interface InterferenceOptions {
   /** How many `appendIf` calls get interference. Default 1. */
   readonly times?: number;

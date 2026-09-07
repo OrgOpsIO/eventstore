@@ -11,8 +11,10 @@ import {
 } from "../index.js";
 import { conformanceEvents, conformanceSchema, conformanceUpcastEvents, conformanceUpcastSchema } from "./schema.js";
 
+/** Builds a fresh store for one conformance case from the given schema. */
 export type MakeStore = (schema: StoreSchema) => EventStore | Promise<EventStore>;
 
+/** The test framework's `test(name, fn)` — vitest's `it`, jest's `test`, node:test's `test`. */
 export interface ConformanceHooks {
   /** Register one test. Works with vitest/jest `it`, `node:test` `test`, … */
   readonly test: (name: string, fn: () => Promise<void>) => void;

@@ -2,7 +2,8 @@ import { runCommand, type CommandOutcome, type CommandSpec } from "./command.js"
 import { ContextCache, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
 import { ConflictError, NotConfiguredError } from "./errors.js";
 import { MemoryStore } from "./memory.js";
-import { buildSchema, type RegistryLike } from "./registry.js";
+import { buildSchema, type Definitions, type EventRegistry, type RecordedEventOf, type RegistryLike } from "./registry.js";
+import type { CreatePostgresStoreOptions } from "./postgres/store.js";
 import { PLATFORM_TENANT_ID, scopedToTenant, type TenantConfig } from "./tenant.js";
 import type {
   AppendIfOutcome,
@@ -16,20 +17,13 @@ import type {
   StoreSchema,
 } from "./types.js";
 
-/** Options of the Postgres store (mirrored here so the core stays driver-free). */
-export interface PostgresOptions {
-  /** `"auto"` (default): create table, function and indexes on first use, under an advisory lock. `"none"`: never touch DDL (use `printSchemaSql`). */
-  readonly install?: "auto" | "none";
-  /** Table name. Default `events`. */
-  readonly table?: string;
-  /** Add a `jsonb_path_ops` GIN index on the payload for ad-hoc `where` queries. Default `false`. */
-  readonly adhocQueries?: boolean;
-  /** Install a row-level-security policy on the tenant scope (needs a non-owner application role). Default `false`. */
-  readonly rls?: boolean;
-  /** Pool size. Default 10. */
-  readonly poolSize?: number;
-}
+/**
+ * Options of the Postgres store, as accepted by `configure({ postgres })`. Derived from the
+ * store's own option type (type-only import: the core stays driver-free).
+ */
+export type PostgresOptions = Omit<CreatePostgresStoreOptions, "connection" | "schema" | "tenantScopeKey">;
 
+/** What `configure()`/`createEventStore()` take. Nothing here is required: no `connection` means an in-memory store. */
 export interface EventStoreConfig {
   /** Postgres connection string. Loads `@orgops/eventstore/postgres` lazily (peer dependency `pg`). */
   readonly connection?: string;
@@ -57,6 +51,11 @@ export interface EventStoreConfig {
 /** The thing you use. `es` is one of these; `createEventStore()` gives you your own. */
 export interface EventStoreApi extends EventStore {
   readonly schema: StoreSchema;
+  /**
+   * A typed read: every record narrowed to the registry's union and re-validated through
+   * `$parse`. `query` defaults to `registry.$filter()`; a record of an undeclared type throws.
+   */
+  read<D extends Definitions>(registry: EventRegistry<D>, query?: Query, options?: QueryOptions): Promise<QueryResult<RecordedEventOf<D>>>;
   /** Run a CCC command: read → decide → `appendIf`, retrying on conflict. */
   command<S, R = void>(spec: CommandSpec<S, R>): Promise<CommandOutcome<R>>;
   /** Load a context incrementally (cached per query in this view). */
@@ -87,6 +86,7 @@ function hasTenantSessions(store: EventStore): store is TenantSessionStore {
   return typeof (store as Partial<TenantSessionStore>).withTenant === "function";
 }
 
+/** An explicit, non-global instance (libraries, tests, several stores in one process). */
 export function createEventStore(config: EventStoreConfig): EventStoreApi {
   const schema = buildSchema(config.events ?? [], {
     scopeKeys: config.scopeKeys ?? [],
@@ -141,6 +141,15 @@ function buildApi(parts: ApiParts): EventStoreApi {
     schema,
     async query(query: Query, options?: QueryOptions): Promise<QueryResult> {
       return (await view()).query(query, options);
+    },
+    async read(registry, query, options) {
+      const result = await (await view()).query(query ?? registry.$filter(), options);
+      const parsed = new Map(result.events.map((e) => [e, registry.$parse(e)] as const));
+      return {
+        ...result,
+        events: result.events.map((e) => parsed.get(e)!),
+        byFilter: result.byFilter.map((list) => list.map((e) => parsed.get(e)!)),
+      };
     },
     async append(events: readonly NewEvent[]): Promise<AppendResult> {
       return (await view()).append(events);
@@ -216,6 +225,7 @@ export function configure(config: EventStoreConfig): EventStoreApi {
   return ambient;
 }
 
+/** Whether `configure()` has been called in this process. */
 export function isConfigured(): boolean {
   return ambient !== undefined;
 }
@@ -236,6 +246,7 @@ export const es: EventStoreApi = {
     return current().schema;
   },
   query: (q, o) => current().query(q, o),
+  read: (r, q, o) => current().read(r, q, o),
   append: (e) => current().append(e),
   appendIf: (e, c) => current().appendIf(e, c),
   appendIfOrThrow: (e, c) => current().appendIfOrThrow(e, c),

@@ -16,30 +16,56 @@
   ],
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
     },
     "./postgres": {
-      "types": "./dist/postgres/index.d.ts",
-      "import": "./dist/postgres/index.js",
-      "require": "./dist/postgres/index.cjs"
+      "import": {
+        "types": "./dist/postgres/index.d.ts",
+        "default": "./dist/postgres/index.js"
+      },
+      "require": {
+        "types": "./dist/postgres/index.d.cts",
+        "default": "./dist/postgres/index.cjs"
+      }
     },
     "./subscribe": {
-      "types": "./dist/subscribe/index.d.ts",
-      "import": "./dist/subscribe/index.js",
-      "require": "./dist/subscribe/index.cjs"
+      "import": {
+        "types": "./dist/subscribe/index.d.ts",
+        "default": "./dist/subscribe/index.js"
+      },
+      "require": {
+        "types": "./dist/subscribe/index.d.cts",
+        "default": "./dist/subscribe/index.cjs"
+      }
     },
     "./testing": {
-      "types": "./dist/testing/index.d.ts",
-      "import": "./dist/testing/index.js",
-      "require": "./dist/testing/index.cjs"
+      "import": {
+        "types": "./dist/testing/index.d.ts",
+        "default": "./dist/testing/index.js"
+      },
+      "require": {
+        "types": "./dist/testing/index.d.cts",
+        "default": "./dist/testing/index.cjs"
+      }
     },
     "./internal": {
-      "types": "./dist/internal.d.ts",
-      "import": "./dist/internal.js",
-      "require": "./dist/internal.cjs"
-    }
+      "import": {
+        "types": "./dist/internal.d.ts",
+        "default": "./dist/internal.js"
+      },
+      "require": {
+        "types": "./dist/internal.d.cts",
+        "default": "./dist/internal.cjs"
+      }
+    },
+    "./package.json": "./package.json"
   },
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -57,7 +83,7 @@
     "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
-    "pg": ">=8.11.0",
+    "pg": ">=8.11.0 <9",
     "zod": "^4.0.0"
   },
   "peerDependenciesMeta": {
@@ -76,5 +102,17 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OrgOpsIO/eventstore.git"
+  },
+  "homepage": "https://github.com/OrgOpsIO/eventstore#readme",
+  "bugs": {
+    "url": "https://github.com/OrgOpsIO/eventstore/issues"
   }
 }

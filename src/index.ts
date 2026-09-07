@@ -54,5 +54,5 @@ export { PLATFORM_TENANT_ID, scopedToTenant } from "./tenant.js";
 export type { TenantConfig } from "./tenant.js";
 export { configure, createEventStore, es, isConfigured, reset } from "./runtime.js";
 export type { EventStoreApi, EventStoreConfig, PostgresOptions } from "./runtime.js";
-export { uuidv7, defaultIdKey, fnv1a64 } from "./ids.js";
-export { compareCursor, filtersOf, matchesFilter, normaliseOptions, queryKey, scope, validateEnvelope } from "./query.js";
+export { uuidv7, defaultIdKey } from "./ids.js";
+export { compareCursor, scope } from "./query.js";

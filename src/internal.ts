@@ -15,5 +15,11 @@ export {
   uniquePathSegments,
   valueAtPath,
   IDENTIFIER,
+  filtersOf,
+  matchesFilter,
+  normaliseFilter,
+  normaliseOptions,
+  queryKey,
+  validateEnvelope,
 } from "./query.js";
 export { fnv1a64 } from "./ids.js";

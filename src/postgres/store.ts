@@ -39,6 +39,7 @@ import {
   uniquePathSegmentsSql,
 } from "./sql.js";
 
+/** Per-connection Postgres timeouts in milliseconds. */
 export interface PoolTimeouts {
   /** `statement_timeout` per connection. Default 30 000 ms. */
   readonly statementMs?: number;
@@ -48,6 +49,7 @@ export interface PoolTimeouts {
   readonly idleInTransactionMs?: number;
 }
 
+/** Options of the Postgres store. */
 export interface CreatePostgresStoreOptions {
   /** Connection string, or an existing `pg.Pool` you own (then `close()` leaves it alone and `timeouts` are not applied). */
   readonly connection: string | Pool;
@@ -100,6 +102,7 @@ interface Runner {
   query<T extends pg.QueryResultRow = pg.QueryResultRow>(sql: string, params?: unknown[]): Promise<pg.QueryResult<T>>;
 }
 
+/** The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v2` for atomic conditional appends. */
 export class PostgresStore implements EventStore {
   readonly schema: StoreSchema;
   readonly table: string;
@@ -432,6 +435,7 @@ FROM ${this.fn}($1::bigint[], $2::bigint[], $3::bigint, $4::boolean, $5::text, $
   }
 }
 
+/** Create a Postgres store (installs the schema lazily unless `install: "none"`). */
 export async function createPostgresStore(options: CreatePostgresStoreOptions): Promise<PostgresStore> {
   const store = new PostgresStore(options);
   await store.ensureInstalled();

@@ -1,4 +1,4 @@
-import { isLiveStore } from "../memory.js";
+import { isLiveStore, type LiveStore } from "../memory.js";
 import { filtersOf, matchesFilter } from "../query.js";
 import { emptySchema } from "../registry.js";
 import type { Cursor, EventStore, Query, RecordedEvent, StoreSchema } from "../types.js";
@@ -7,10 +7,13 @@ import { memoryCursors, type CursorStore } from "./cursors.js";
 export { fileCursors, memoryCursors } from "./cursors.js";
 export type { CursorStore } from "./cursors.js";
 
+/** Receives one batch of settled events; the cursor advances only after it resolves. */
 export type SubscriptionHandler = (events: readonly RecordedEvent[]) => Promise<void> | void;
 
+/** What to do after a failed batch: retry with back-off, skip it, or stop the subscription. */
 export type ErrorDecision = "retry" | "skip" | "stop";
 
+/** Options of a durable subscription: store, cursor persistence, start position, polling, error policy. */
 export interface SubscribeOptions {
   readonly store: EventStore;
   /** Where the cursor is remembered. Default: in memory (replay after restart). */
@@ -28,6 +31,7 @@ export interface SubscribeOptions {
   readonly onError?: (error: unknown, batch: readonly RecordedEvent[]) => ErrorDecision;
 }
 
+/** A running subscription: wait for catch-up, stop, inspect the cursor. */
 export interface Subscription {
   readonly name: string;
   /**
@@ -232,15 +236,16 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
   };
 }
 
+export interface OnOptions {
+  /** A store that pushes appended events in-process (`MemoryStore`). The Postgres store polls; use `subscribe` there. */
+  readonly store: EventStore & LiveStore;
+}
+
 /**
  * In-process, fire-and-forget reaction to appended events matching `query`. Only for stores
  * that push (`LiveStore`, e.g. `MemoryStore`); no cursor, no replay, at-most-once. Use it for
  * SSE fan-out and similar conveniences — use `subscribe` for anything that must not be lost.
  */
-export interface OnOptions {
-  readonly store: EventStore;
-}
-
 export function on(query: Query, handler: (events: readonly RecordedEvent[]) => void, options: OnOptions): () => void {
   const store = options.store;
   if (!isLiveStore(store)) {

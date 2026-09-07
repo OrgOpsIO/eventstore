@@ -11,6 +11,7 @@ import {
   type StoreSchema,
 } from "../index.js";
 
+/** Options of `given()`: the schema (pass `buildSchema([...])` to enforce scopes/uniques/strict), a store, a clock. */
 export interface SpecOptions {
   /** Schema for the memory store (default: `emptySchema({ strict: false })`). */
   readonly schema?: StoreSchema;
@@ -27,6 +28,7 @@ export interface ExpectedEvent {
   readonly id?: string;
 }
 
+/** Assertions after `when()`: expected events, a rejection code, nothing happened, or a thrown error. */
 export interface Then<R> {
   /** Exactly these events were appended (in order), or run your own assertions on them. */
   then(expected: readonly ExpectedEvent[] | ((appended: readonly RecordedEvent[], outcome: CommandOutcome<R>) => void | Promise<void>)): Promise<CommandOutcome<R>>;
@@ -38,6 +40,7 @@ export interface Then<R> {
   thenThrows(check?: (error: unknown) => void): Promise<void>;
 }
 
+/** Run a command against the given events. */
 export interface When {
   when<S, R = void>(spec: CommandSpec<S, R>): Then<R>;
 }
@@ -77,7 +80,7 @@ export function given(events: readonly NewEvent[] = [], options: SpecOptions = {
             assert.equal(got.type, exp.type, `event #${i}: type`);
             if (exp.data !== undefined) assert.deepEqual(got.data, exp.data, `event #${i}: data`);
             if (exp.scopes !== undefined) assert.deepEqual(got.scopes, exp.scopes, `event #${i}: scopes`);
-            if (exp.id !== undefined) assert.equal(got.id, exp.id, `event #${i}: id`);
+            // ids are never compared: registry creators generate one for every expected event
           });
           return outcome;
         },

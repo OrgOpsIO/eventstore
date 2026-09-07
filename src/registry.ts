@@ -1,6 +1,6 @@
 import type { ZodType, output } from "zod";
 import { defaultIdKey, uuidv7 } from "./ids.js";
-import { ValidationError } from "./errors.js";
+import { UsageError, ValidationError } from "./errors.js";
 import { IDENTIFIER, uniquePathSegments, validateEnvelope } from "./query.js";
 import type { Fold } from "./context.js";
 import type { Filter, Metadata, NewEvent, RecordedEvent, Scopes, StoreSchema } from "./types.js";
@@ -21,6 +21,7 @@ export interface EventDefinition<S extends ZodType = ZodType, K extends string =
   readonly upcast?: (payload: Record<string, unknown>) => Record<string, unknown>;
 }
 
+/** The shape `defineEvents` takes: event type name → definition. */
 export type Definitions = Record<string, EventDefinition>;
 
 type ScopeKeysOf<Def extends EventDefinition> = Def extends EventDefinition<ZodType, infer K> ? K : never;
@@ -39,32 +40,40 @@ type ScopesArg<Def extends EventDefinition> = [RequiredScopeKeys<Def>] extends [
     : [scopes?: Partial<Record<OptionalScopeKeys<Def>, string>>]
   : [scopes: ScopesInputOf<Def>];
 
+/** The parsed data type of one event definition. */
 export type DataOf<Def extends EventDefinition> = output<Def["data"]>;
 
+/** The union of events a registry's creators produce. */
 export type NewEventOf<D extends Definitions, N extends keyof D & string = keyof D & string> = {
   [K in N]: NewEvent<K, DataOf<D[K]>, ScopesOf<D[K]>> & { readonly id: string; readonly scopes: ScopesOf<D[K]> };
 }[N];
 
+/** The union of recorded events of a registry (narrow on `type`). */
 export type RecordedEventOf<D extends Definitions, N extends keyof D & string = keyof D & string> = {
   [K in N]: RecordedEvent<K, DataOf<D[K]>, ScopesOf<D[K]>>;
 }[N];
 
+/** Every scope key any event of the registry declares. */
 export type AllScopeKeys<D extends Definitions> = { [K in keyof D]: ScopeKeysOf<D[K]> }[keyof D];
 
+/** Optional explicit `id` and envelope `metadata` for a creator call. */
 export interface CreateOptions {
   readonly id?: string;
   readonly metadata?: Metadata;
 }
 
+/** A typed event constructor: `(data, scopes?, options?) => NewEvent` with the id generated. */
 export type Creator<D extends Definitions, N extends keyof D & string> = (
   data: DataOf<D[N]>,
   ...rest: [...ScopesArg<D[N]>, options?: CreateOptions]
 ) => NewEventOf<D, N>;
 
+/** One handler per event type, each receiving typed `data`, the state, and the typed recorded event. */
 export type FoldHandlers<D extends Definitions, S> = {
   readonly [N in keyof D & string]?: (data: DataOf<D[N]>, state: S, event: RecordedEventOf<D, N>) => S;
 };
 
+/** A filter restricted to this registry's types and scope keys. */
 export interface RegistryFilter<D extends Definitions> {
   readonly types?: readonly (keyof D & string)[];
   readonly scopes?: Partial<Record<AllScopeKeys<D> | (string & {}), string | readonly string[]>>;
@@ -78,6 +87,7 @@ export interface RegistryLike {
   $validate(event: NewEvent): NewEvent;
 }
 
+/** The result of `defineEvents`: one typed creator per event type plus the `$`-prefixed helpers. */
 export type EventRegistry<D extends Definitions> = {
   readonly [N in keyof D & string]: Creator<D, N>;
 } & {
@@ -199,7 +209,7 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
     },
     $parse(event: RecordedEvent<string, unknown>) {
       const def = defs[event.type];
-      if (!def) throw new Error(`eventstore: "${event.type}" is not declared in this registry`);
+      if (!def) throw new UsageError(`eventstore: "${event.type}" is not declared in this registry`);
       const parsed = def.data.safeParse(event.data);
       if (!parsed.success) throw new ValidationError(event.type, zodIssues(parsed.error.issues));
       return { ...event, data: parsed.data };
@@ -222,6 +232,7 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
   return registry as EventRegistry<D>;
 }
 
+/** Store-level options merged into a schema: extra scope keys, the tenant key, the lock salt, strictness. */
 export interface SchemaOptions {
   readonly scopeKeys?: readonly string[];
   readonly tenantScopeKey?: string;

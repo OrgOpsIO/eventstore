@@ -1,3 +1,4 @@
+import { ContextTooLargeError } from "./errors.js";
 import { cursorOf } from "./memory.js";
 import { queryKey } from "./query.js";
 import type { ContextHandle, Cursor, EventStore, Query, RecordedEvent } from "./types.js";
@@ -73,9 +74,7 @@ export class ContextCache {
     // `cursor: null` still selects (transactionId, sequence) order, so the settled prefix is exact.
     const result = await this.store.query(spec.query, { cursor: base.cursor ?? null, limit: this.maxEvents + 1 });
     if (result.events.length > this.maxEvents) {
-      throw new Error(
-        `eventstore: context ${key.slice(0, 200)} has more than ${this.maxEvents} events; narrow the query or raise contextCache.maxEvents`,
-      );
+      throw new ContextTooLargeError(key, this.maxEvents);
     }
     const settled: RecordedEvent[] = [];
     const unsettled: RecordedEvent[] = [];

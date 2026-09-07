@@ -5,23 +5,28 @@
 Command Context Consistency (Rico Fritzsche) with Westphal scopes, configured once and used anywhere — the way [`@orgops/coax`](https://github.com/OrgOpsIO/coax) does it for LLMs.
 
 ```bash
-npm install @orgops/eventstore zod pg
+npm install @orgops/eventstore zod pg        # plus @types/pg if you use TypeScript with the Postgres store
 ```
 
-`zod` (v4) is a peer dependency. `pg` is only needed for the Postgres store.
+`zod` (v4) is a peer dependency (its types appear in the public API). `pg` is only needed for the Postgres store.
 
 ## Configure once, use `es` everywhere
 
 ```ts
-// server/plugins/eventstore.ts — once at startup
-import { configure } from "@orgops/eventstore";
+// server/plugins/eventstore.ts — once at startup (Nuxt/Nitro shown; any entry point works)
+import { configure, es } from "@orgops/eventstore";
 import { articles } from "../features/articles/events";
 import { accounts } from "../features/accounts/events";
 
-configure({
-  connection: process.env.DATABASE_URL!,
-  events: [articles, accounts],                       // typing, validation, indexes, locks, uniques
-  tenant: { scopeKey: "workspaceProvisionedId" },     // the tenant is a scope in the payload, not a column
+export default defineNitroPlugin(async (nitro) => {
+  configure({
+    connection: process.env.DATABASE_URL!,
+    events: [articles, accounts],                       // typing, validation, indexes, locks, uniques
+    tenant: { scopeKey: "workspaceProvisionedId" },     // the tenant is a scope in the payload, not a column
+    lockSalt: process.env.EVENTSTORE_LOCK_SALT,         // per-deployment secret for advisory-lock keys
+  });
+  await es.store();                                     // install the schema now, fail fast at boot
+  nitro.hooks.hook("close", () => es.close());          // one pool per process
 });
 ```
 
@@ -39,15 +44,35 @@ const outcome = await es.forTenant(workspaceId).command({
     return { events: [articles.ArticleContentEdited({ body }, { articleDraftedId: articleId })] };
   },
 });
-// { ok: true, appended } | { ok: false, code, reason, missing? } | conflict after retries
+// { ok: true, result, appended, attempts } | { ok: false, code, reason, missing?, conflict?, attempts }
 ```
 
-On first use the SDK creates the table, its function and every index it needs — idempotently, under an advisory lock, so concurrent boots are safe. In locked-down environments pass `postgres: { install: "none" }` and hand the DDL to a DBA:
+On first use the SDK creates the table, its function and every index it needs — idempotently, under an advisory lock, so concurrent boots are safe. In locked-down environments pass `postgres: { install: "none" }` and hand the DDL to a DBA — with the same Postgres options, so the printed DDL matches what the store expects:
 
 ```ts
 import { printSchemaSql } from "@orgops/eventstore/postgres";
-console.log(printSchemaSql(es.schema, { table: "events" }));
+const pg = { table: "events", rls: true, grantExecuteTo: ["app"] } as const;
+configure({ connection, events: [articles], tenant: { scopeKey: "workspaceProvisionedId" }, postgres: { ...pg, install: "none" } });
+console.log(printSchemaSql(es.schema, pg));
 ```
+
+Mapping outcomes to HTTP in an h3 handler:
+
+```ts
+import { EventStoreError, httpStatusOf, type CommandOutcome } from "@orgops/eventstore";
+
+export function unwrap<R>(outcome: CommandOutcome<R>): R {
+  if (outcome.ok) return outcome.result;
+  throw createError({ statusCode: httpStatusOf(outcome), statusMessage: outcome.reason, data: { code: outcome.code, conflict: outcome.conflict } });
+}
+export function toHttpError(error: unknown): unknown {
+  return error instanceof EventStoreError ? createError({ statusCode: error.httpStatus, statusMessage: error.message, data: { name: error.name } }) : error;
+}
+```
+
+### What a scope is
+
+An event carries its own id (`articleDraftedId`) and, in `scopes`, the ids of the events it happened *in relation to*. `ArticleDrafted` happens in relation to a workspace; `ArticleContentEdited` happens in relation to the drafted article. There are no streams and no aggregate ids — a scope key is a back-link to another event, and `articles.$scope("articleDraftedId", id)` reads exactly the events that link back to it, root event included. Because the store indexes and *locks* every declared scope key, "the events this decision reads" and "the rows the guard locks" are the same set. Pick scope keys from the questions your decisions ask, not from your tables.
 
 ## Declare events once
 
@@ -69,17 +94,29 @@ export const articles = defineEvents({
     data: z.object({ reason: z.string().optional() }),
     scopes: ["articleDraftedId"],
   },
+  ArticleImported: {
+    data: z.object({ title: z.string() }),
+    scopes: ["workspaceProvisionedId"],
+    optionalScopes: ["importRunStartedId"],   // may carry it; indexed and locked all the same
+    idKey: "articleId",                       // default would be articleImportedId
+    upcast: (p) => ("headline" in p ? { ...p, title: p.headline } : p),   // runs on read, before parsing
+  },
 });
 ```
 
 From this one declaration you get:
 
 - **typed constructors**: `articles.ArticleDrafted({ title, slug }, { workspaceProvisionedId })` — wrong fields, missing scopes and unknown scope keys are compile errors; invalid values throw `ValidationError`. The constructor generates the event's own id (`articleDraftedId`, a UUIDv7) unless you pass `{ id }` in the third argument, so `drafted.id` is usable right away.
-- **typed folds**: `articles.$fold({ ArticleDrafted: (data, state, event) => … })` is the incremental fold `(delta, state) => state` that `es.context()` and `es.command()` take; `event.scopes.workspaceProvisionedId` is a `string`, not `string | undefined`. `articles.$foldAll(initial, handlers)` folds a complete list in one go and is deliberately not assignable to the incremental shape.
+- **typed folds**: `articles.$fold({ ArticleDrafted: (data, state, event) => … })` builds the incremental fold `(delta, state) => state` that `es.context()` and `es.command()` take; `event.scopes.workspaceProvisionedId` is a `string`, not `string | undefined`. `articles.$foldAll(initial, handlers)` folds a complete list in one go and is deliberately not assignable to the incremental shape.
 - **typed filters**: `articles.$scope("articleDraftedId", id)` is everything of this registry that happened in relation to that article, root event included; the free `scope(key, id)` does the same across registries; `articles.$filter({ types: [...], scopes: {...} })` for anything else.
-- **the store schema**: a B-tree per declared scope key, a unique index per `unique` path, an idempotency-key index, `(event_type, sequence_number)`, `(transaction_id, sequence_number)`.
+- **typed reads**: `es.read(articles, query?)` returns the registry's union, re-validated through `$parse`, so `event.type === "ArticleDrafted"` narrows `event.data`.
+- **the store schema**: a B-tree per declared scope key (plus `CREATE STATISTICS` on the same expression), a unique index per `unique` path, an idempotency-key index (per tenant when a tenant scope key is configured), `(transaction_id, sequence_number)` for cursor reads. `postgres: { typeIndex: true }` adds `(event_type, sequence_number)` for type-only reads; `adhocQueries: true` adds a GIN index for `where`.
 
 On the wire an event is `{ articleDraftedId, title, slug, scopes: { workspaceProvisionedId } }` in a JSONB `payload` column — Ralf Westphal's convention as used in an earlier in-house store. Flat ids (`employeeId` as a plain field) keep working: a scope key matches `scopes.K`, the event's own id, or a top-level string field `K`. The envelope rules hold for every event, declared or not: `data` may not contain the own id key or a `scopes` key, and a value at a declared scope key must be a string.
+
+### Uniqueness
+
+A `unique` path becomes a partial unique index on the events table, scoped to that event type: `unique: ["slug"]` on `ArticleDrafted` means no two `ArticleDrafted` rows share a slug, across all tenants. It is enforced by Postgres, not by your decision — a concurrent duplicate raises `UniqueViolationError` (409) *after* the guard passed, and `es.command()` deliberately does not retry it. So: check it in `decide` for the good error message, and let the index be the truth. `unique: ["scopes.magicLinkRequestedId"]` makes a back-link single-use — the standard way to model "consume this token once". A value that can be released and re-claimed (a per-tenant slug that frees up on archive) is not a `unique` path; it is a CCC rule in `decide` over a tenant-wide context.
 
 ## The store contract
 
@@ -137,15 +174,16 @@ const platform = es.forPlatform();       // accounts, registrations: the nil-UUI
 ```ts
 import { subscribe, fileCursors, resetCursor, on } from "@orgops/eventstore/subscribe";
 
+const cursors = fileCursors("./data/cursors.json");   // default: memoryCursors() (replays from `from` after a restart)
 const sub = subscribe("search-index", articles.$filter(), async (events) => { … }, {
   store: await es.store(),
-  cursors: fileCursors("./data/cursors.json"),   // default: in memory (replays from `from` after a restart)
+  cursors,
   onError: (error, batch) => "retry",            // or "skip" | "stop"; batch is empty for store errors
 });
 await sub.whenCaughtUp();                        // resolves on the next empty page
 await resetCursor("search-index", cursors);      // forget the cursor → replay from `from`
 
-on(articles.$filter(), (events) => sse.push(events), { store: memoryStore });   // in-process, fire-and-forget, LiveStore only
+on(articles.$filter(), (events) => sse.push(events), { store: memoryStore });   // in-process, fire-and-forget; the store must be a LiveStore (MemoryStore)
 ```
 
 Durable, gap-free, at-least-once: reads settled events beyond a `(transactionId, sequence)` cursor, advances only after your handler resolved, retries with back-off. `events` stays the only table — the cursor store is pluggable.
@@ -155,9 +193,13 @@ Durable, gap-free, at-least-once: reads settled events beyond a `(transactionId,
 ```ts
 import { given, conformanceSuite, interferingStore } from "@orgops/eventstore/testing";
 
-await given([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: ws })])
-  .when(archiveArticle(id))
-  .then([articles.ArticleArchived({}, { articleDraftedId: id })]);
+const drafted = articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: ws });
+await given([drafted], { schema: buildSchema([articles]) })     // pass the schema, or scopes/uniques/strict are not enforced
+  .when(archiveArticle(drafted.id))                              // a function returning a CommandSpec
+  .then([{ type: "ArticleArchived", scopes: { articleDraftedId: drafted.id } }]);   // ids are never compared
+
+// your own store implementation? run the same behavioural spec the SDK runs against MemoryStore and Postgres
+describe("my store", () => conformanceSuite((schema) => new MyStore({ schema }), { test: it }));
 ```
 
 `MemoryStore` is the semantic reference; the conformance suite runs the same behavioural spec against it and against Postgres. `interferingStore` injects competing appends between read and write so your retry paths are exercised.
@@ -172,9 +214,14 @@ await given([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvi
 | `ValidationError` | 400 — `issues` lists message, path and code |
 | `UnindexableContextError` | 400 — a guard query without a declared scope key in strict mode |
 | `TransientError` | 503 — deadlock victim, serialization failure, lock timeout; `es.command()` retries these |
-| `PolicyViolationError` | 403 — row-level security refused the statement |
+| `PolicyViolationError` | 403 — the database refused the statement: an RLS policy, or a missing `GRANT` on the table or the append function |
+| `TenantMismatchError` | 403 — a query or event names a tenant other than the view's |
+| `UsageError` | 400 — a programming error surfaced at request time (undeclared type in `$parse`, invalid query shape) |
+| `ContextTooLargeError` | 500 — a context exceeds `contextCache.maxEvents` |
+| `NotConfiguredError` | 500 — `es` used before `configure()` |
+| `EventStoreError` | 500 — base class; unmapped store failure |
 
-Every error extends `EventStoreError` and carries `httpStatus` and, where there is one, `cause`.
+Every error the store raises extends `EventStoreError` and carries `httpStatus` and, where there is one, `cause`. Invalid declarations (`defineEvents` with a bad type name) throw plain `Error`s at module load.
 
 ## What it deliberately does not do
 
@@ -198,9 +245,11 @@ const store = createEventStore({ connection, events: [articles] });   // no glob
 
 - **Install.** With `install: "auto"` (default) the first query or append creates the table, the `es_scope()` function, the append function and every index, idempotently and under a session advisory lock, so concurrent boots do not race. With `install: "none"` nothing is touched; print the DDL with `printSchemaSql(es.schema)` and run it yourself.
 - **Adding a scope key or a unique path** adds an index. On a large table prefer running the printed `CREATE INDEX` statement as `CONCURRENTLY` yourself before deploying the declaration.
-- **`es_scope()`** is the expression every scope index, the unique indexes and the RLS policy are built on. It is `IMMUTABLE` by contract: if its body ever changes, `REINDEX` the table. The SDK does not change it in place.
+- **`es_scope()`** is the expression every scope index, the unique indexes and the RLS policy are built on. It is an inlinable `IMMUTABLE` SQL function, so the *inlined expression* is what the indexes store: when the SDK ships a new body (it is fingerprinted), the installer drops and recreates the scope indexes — plan a maintenance window on a large table, or run the printed statements yourself.
 - **Roles for RLS.** The install runs as the table owner; the application connects as a non-owner role (`FORCE ROW LEVEL SECURITY` applies to everyone but a superuser). Tenant views bind `app.current_tenant` per transaction with `set_config(..., true)`, never session-wide, so pooled connections cannot leak a tenant.
-- **Advisory locks** are transaction-scoped and released on commit or rollback; set `lock_timeout` on the application role so a stuck holder degrades to `TransientError` instead of a hang.
+- **Timeouts.** The SDK sets `lock_timeout` (10 s), `statement_timeout` (30 s) and `idle_in_transaction_session_timeout` (30 s) per connection, so a stuck lock holder degrades to `TransientError` instead of a hang; tune them with `postgres: { timeouts: { lockMs, statementMs, idleInTransactionMs } }`. If you pass your own `pg.Pool` as `connection`, set them yourself — the SDK does not touch a pool it did not create, and `close()` leaves it open.
+- **Durability knobs.** Single-event appends are bound by commit durability: `synchronous_commit = off` (per session or transaction) gives +40–75 % on them and loses at most the last ~600 ms on a crash — acceptable for many event stores, never for money. Batches of 50 barely change (group commit already amortises fsync); at four writers the raw ceiling on our test box was ~200 000 events/s.
+- **Migrating an existing `events` table** (an earlier in-house store shape): rename `sequence` → `sequence_number`, add `metadata jsonb NOT NULL DEFAULT '{}'`, add `transaction_id xid8 NOT NULL DEFAULT pg_current_xact_id()` (backfill legacy rows with one low constant such as `'3'::xid8` so they sort before every future row), then run `printSchemaSql(es.schema, pg)` for functions and indexes (`CREATE INDEX … CONCURRENTLY` outside a transaction) and boot with `install: "none"`. Legacy rows without an own id read back as `id: "~<sequence>"`; a durable subscriber must start at `{ transactionId: "3", sequence: 0 }`, not `"now"`. See `research/40-migration-an earlier in-house store.md` for the full plan.
 - **Every writer through the SDK.** See the invariant under "The store contract".
 
 ## License

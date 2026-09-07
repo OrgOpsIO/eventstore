@@ -13,10 +13,12 @@ export interface Rejection {
   readonly conflict?: Conflict;
 }
 
+/** A business rejection with a machine-readable `code` (HTTP 422 via `httpStatusOf`). */
 export function reject(code: string, reason: string, options: { missing?: boolean } = {}): Rejection {
   return { ok: false, code, reason, ...(options.missing ? { missing: true } : {}) };
 }
 
+/** A rejection because the subject does not exist (HTTP 404 via `httpStatusOf`). */
 export function rejectMissing(code: string, reason: string): Rejection {
   return reject(code, reason, { missing: true });
 }
@@ -28,8 +30,10 @@ export interface Decision<R = void> {
   readonly result?: R;
 }
 
+/** What `decide` returns: a `Decision` (events, optional result) or a `Rejection`. */
 export type Decided<R> = Decision<R> | Rejection;
 
+/** Narrow a `Decided` to `Rejection`. */
 export function isRejection(decided: Decided<unknown>): decided is Rejection {
   return (decided as Rejection).ok === false;
 }
@@ -43,6 +47,7 @@ export interface DecideTools {
   readonly attempt: number;
 }
 
+/** A command: its context query, an optional incremental fold, and the pure `decide`. */
 export interface CommandSpec<S, R> {
   /** The context: all events the decision depends on. Also the consistency boundary. */
   readonly context: Query;
@@ -56,12 +61,15 @@ export interface CommandSpec<S, R> {
   readonly noCache?: boolean;
 }
 
+/** Result of `es.command()`: `ok` with `result`/`appended`/`attempts`, or a `Rejection` (incl. the conflict code). */
 export type CommandOutcome<R = void> =
   | { readonly ok: true; readonly result: R; readonly appended: AppendResult | null; readonly attempts: number }
   | (Rejection & { readonly attempts: number });
 
+/** The `code` of the rejection a command returns after exhausting its retries on conflicts. */
 export const CONFLICT_CODE = "conflict";
 
+/** What `runCommand` needs: the store, optionally a context cache, a clock and a back-off strategy. */
 export interface CommandRuntime {
   readonly store: EventStore;
   readonly cache?: ContextCache;

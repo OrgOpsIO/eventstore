@@ -2,6 +2,7 @@ import { defaultIdKey, uuidv7, type Metadata, type RecordedEvent, type Scopes } 
 
 let counter = 0;
 
+/** Overrides for `makeEvent`: id, scopes, metadata, sequence, transactionId, settled, recordedAt. */
 export interface MakeEventExtra {
   readonly id?: string;
   readonly scopes?: Scopes;

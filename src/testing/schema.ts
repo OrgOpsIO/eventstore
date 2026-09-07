@@ -31,6 +31,7 @@ export function conformanceUpcastSchema(): StoreSchema {
   return buildSchema([conformanceUpcastEvents], { strict: false });
 }
 
+/** Options of `conformanceSchema()`: strictness. */
 export interface ConformanceSchemaOptions {
   readonly strict?: boolean;
 }
