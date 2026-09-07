@@ -104,12 +104,14 @@ export function createEventStore(config: EventStoreConfig): EventStoreApi {
     }
     return storePromise;
   };
-  return buildApi({ schema, store, config, tenantId: undefined, views: new Map() });
+  return buildApi({ schema, store, created: () => storePromise !== undefined, config, tenantId: undefined, views: new Map() });
 }
 
 interface ApiParts {
   readonly schema: StoreSchema;
   readonly store: () => Promise<EventStore>;
+  /** Whether the lazy store has been created — `close()` must not connect just to disconnect. */
+  readonly created: () => boolean;
   readonly config: EventStoreConfig;
   readonly tenantId: string | undefined;
   /** Tenant views, shared by the root api and every view, so `forTenant(id)` is memoised. */
@@ -186,7 +188,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       cache?.invalidate(query);
     },
     async close(): Promise<void> {
-      if (tenantId === undefined) await (await parts.store()).close();
+      if (tenantId === undefined && parts.created()) await (await parts.store()).close();
     },
   };
   return api;

@@ -447,6 +447,19 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     assert.equal(settled.contextVersion, all.contextVersion, "the context version ignores settledOnly");
   });
 
+  withStore("an undeclared scope key matches via scopes, own id and flat data — and the reference store's index is a superset", async (store) => {
+    // `commentId` is declared by nobody: rows carry it as own id, in `scopes`, and flat in data
+    await store.append([{ type: "CommentPosted", data: { text: "root" }, id: "c-1" }]);
+    await store.append([{ type: "ReplyPosted", data: { text: "reply" }, scopes: { commentPostedId: "c-1" } }]);
+    await store.append([{ type: "LegacyRef", data: { commentPostedId: "c-1", note: "flat" } }]);
+    await store.append([{ type: "LegacyRef", data: { commentPostedId: "c-2", note: "other" } }]);
+    const r = await store.query({ scopes: { commentPostedId: "c-1" } });
+    assert.deepEqual(r.events.map((e) => e.type), ["CommentPosted", "ReplyPosted", "LegacyRef"]);
+    assert.equal(r.contextVersion, 3);
+    const typed = await store.query({ types: ["LegacyRef"], scopes: { commentPostedId: "c-1" } });
+    assert.deepEqual(typed.events.map((e) => e.data.note), ["flat"]);
+  });
+
   withStore("types: [] matches nothing", async (store) => {
     await store.append([openAccount("a")]);
     const r = await store.query({ types: [] });

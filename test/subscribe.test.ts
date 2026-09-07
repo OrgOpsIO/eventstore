@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { MemoryStore, type RecordedEvent } from "../src/index.js";
+import { MemoryStore, type EventStore, type RecordedEvent } from "../src/index.js";
 import { fileCursors, memoryCursors, on, resetCursor, subscribe, type CursorStore } from "../src/subscribe/index.js";
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -217,5 +217,38 @@ describe("subscribe", () => {
     };
     // the type now requires a LiveStore; the runtime check still guards JS callers
     expect(() => on({ types: ["X"] }, () => {}, { store: polling as unknown as Parameters<typeof on>[2]["store"] })).toThrow(/LiveStore/);
+  });
+
+  it("whenCaughtUp() registered after an in-flight read waits for the next empty page", async () => {
+    const inner = new MemoryStore();
+    let release: (() => void) | undefined;
+    let stallNext = false;
+    const stalling: EventStore = {
+      ...inner,
+      query: async (q, o) => {
+        const result = await inner.query(q, o);
+        if (stallNext) {
+          stallNext = false;
+          await new Promise<void>((r) => (release = r));
+        }
+        return result;
+      },
+      append: (e) => inner.append(e),
+      appendIf: (e, c) => inner.appendIf(e, c),
+      close: () => inner.close(),
+    };
+    const seen: string[] = [];
+    const sub = subscribe("late", { types: ["Late"] }, (events) => { seen.push(...events.map((e) => e.type)); }, { store: stalling, pollIntervalMs: 20 });
+    await sub.whenCaughtUp();
+    stallNext = true;
+    const inFlight = sub.whenCaughtUp(); // triggers a poll whose read snapshot is empty, then stalls
+    await new Promise((r) => setTimeout(r, 10));
+    await inner.append([{ type: "Late", data: {} }]);
+    const afterAppend = sub.whenCaughtUp(); // must not be resolved by the stalled poll's empty page
+    release?.();
+    await inFlight;
+    await afterAppend;
+    expect(seen).toEqual(["Late"]);
+    await sub.stop();
   });
 });

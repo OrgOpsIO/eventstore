@@ -17,7 +17,11 @@ export interface EventDefinition<S extends ZodType = ZodType, K extends string =
   readonly unique?: readonly string[];
   /** Own-id key on the wire; defaults to `<lowerFirst(Type)>Id`. */
   readonly idKey?: string;
-  /** Upcast an older stored payload to the current shape (runs on read, before parsing). */
+  /**
+   * Upcast an older stored payload to the current shape (runs on read, before parsing). It may
+   * reshape `data` only: the own id and the `scopes` object are read from the stored payload,
+   * because that is what the store indexed, locked and matched on.
+   */
   readonly upcast?: (payload: Record<string, unknown>) => Record<string, unknown>;
 }
 

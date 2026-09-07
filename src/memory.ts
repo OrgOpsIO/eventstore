@@ -145,14 +145,13 @@ export class MemoryStore implements EventStore, LiveStore {
     };
     if (filter.scopes) {
       for (const [key, values] of Object.entries(filter.scopes)) {
-        const byValue = this.byScope.get(key);
-        if (!byValue) {
-          // a key no row carries in `scopes`/as own id: declared keys are fully indexed (flat
-          // fields included) so nothing can match; an undeclared key may sit flat in data → scan
-          if (this.schema.scopeKeys.includes(key)) return [];
+        if (!this.schema.scopeKeys.includes(key)) {
+          // an undeclared key may sit flat in any row's data and is not posted → only a scan is a superset
           if (best === null) return null;
           continue;
         }
+        const byValue = this.byScope.get(key);
+        if (!byValue) return []; // declared keys are fully indexed (scopes, own id, flat data): nothing carries it
         considerUnion((values as readonly string[]).map((v) => byValue.get(v) ?? []));
       }
     }
@@ -176,18 +175,21 @@ export class MemoryStore implements EventStore, LiveStore {
   private toRecorded(row: Row): RecordedEvent {
     if (row.recorded) return row.recorded;
     const idKey = this.idKeyOf(row.type);
-    const { id, data, scopes } = fromPayload(this.schema.upcast(row.type, row.payload), idKey);
-    row.recorded = {
+    // id and scopes come from the RAW payload — that is what the index matched on (Postgres: es_scope);
+    // `upcast` may reshape data, never scope keys or the id.
+    const raw = fromPayload(row.payload, idKey);
+    const { data } = fromPayload(this.schema.upcast(row.type, row.payload), idKey);
+    row.recorded = Object.freeze({
       type: row.type,
-      data,
-      id: id ?? `~${row.sequence}`,
-      scopes,
-      metadata: row.metadata,
+      data: Object.freeze(data),
+      id: raw.id ?? `~${row.sequence}`,
+      scopes: Object.freeze(raw.scopes),
+      metadata: Object.freeze({ ...row.metadata }),
       sequence: row.sequence,
       recordedAt: row.recordedAt,
       transactionId: row.transactionId,
       settled: true,
-    };
+    });
     return row.recorded;
   }
 

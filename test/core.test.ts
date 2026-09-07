@@ -179,6 +179,16 @@ describe("memory store + api", () => {
     expect(second.ctx.version).toBe(2);
   });
 
+  it("es.read(registry) narrows and re-validates", async () => {
+    const es = newApi().forTenant(WS);
+    await es.append([articles.ArticleDrafted({ title: "R", slug: "r" }, { workspaceProvisionedId: WS })]);
+    const read = await es.read(articles);
+    const first = read.events[0]!;
+    if (first.type === "ArticleDrafted") expect(first.data.title).toBe("R");
+    expect(read.byFilter[0]).toHaveLength(1);
+    expect(read.ctx.version).toBe(1);
+  });
+
   it("$parse narrows types", async () => {
     const store = new MemoryStore({ schema: buildSchema([articles], { strict: false }) });
     await store.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);

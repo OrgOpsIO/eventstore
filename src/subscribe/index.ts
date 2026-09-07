@@ -116,16 +116,22 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
 
   const poll = async (): Promise<void> => {
     wakeRequested = false;
+    // only waiters registered BEFORE this read may be told "caught up" by its empty page;
+    // a waiter that arrives while the read is in flight waits for the next poll
+    const waitersBeforeRead = caughtUpWaiters;
+    caughtUpWaiters = [];
     try {
       const result = await store.query(query, { settledOnly: true, cursor, limit: batchSize });
       if (stopped) return;
       if (result.events.length === 0) {
         backoffMs = 0;
-        resolveCaughtUp();
+        for (const w of waitersBeforeRead) w();
+        if (caughtUpWaiters.length > 0) wakeRequested = true;
         // a push that arrived while this poll was in flight must not wait a full interval
         schedule(wakeRequested ? 0 : pollIntervalMs);
         return;
       }
+      caughtUpWaiters = [...waitersBeforeRead, ...caughtUpWaiters];
       const decision = await deliver(result.events);
       if (decision === "stop") {
         shutdown(); // not `stop()`: that would await this very poll
@@ -147,6 +153,7 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
       // Poll again right away: more may be waiting (full page) or a push arrived meanwhile.
       schedule(0);
     } catch (error) {
+      caughtUpWaiters = [...waitersBeforeRead, ...caughtUpWaiters]; // nobody was told "caught up"
       // store/cursor errors: ask onError (with an empty batch), default to back-off and retry
       let decision: ErrorDecision = "retry";
       try {
