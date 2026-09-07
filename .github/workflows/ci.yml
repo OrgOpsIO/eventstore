@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: es
+          POSTGRES_PASSWORD: es
+          POSTGRES_DB: es_sdk_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U es" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+        env:
+          ES_TEST_DATABASE_URL: postgres://es:es@localhost:5432/es_sdk_test
+      - run: npm run build
+      - run: npx --yes @arethetypeswrong/cli --pack . --ignore-rules no-resolution
