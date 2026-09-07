@@ -17,12 +17,15 @@ export type {
 } from "./types.js";
 export {
   ConflictError,
+  ContextTooLargeError,
   EventStoreError,
   NotConfiguredError,
   PolicyViolationError,
+  TenantMismatchError,
   TransientError,
   UnindexableContextError,
   UniqueViolationError,
+  UsageError,
   ValidationError,
 } from "./errors.js";
 export type { ValidationIssue } from "./errors.js";

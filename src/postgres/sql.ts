@@ -6,13 +6,19 @@
  * - `es_scope(payload, key)` — plpgsql IMMUTABLE, string-only: `scopes->>key`, else the
  *   top-level `key` field. Every declared scope key gets a partial B-tree on
  *   `(es_scope(payload,'K'), sequence_number)`. Because the function body feeds those indexes,
- *   its definition is fingerprinted (`COMMENT ON FUNCTION … 'es:<sha256>'`); when a newer SDK
- *   ships a different body the installer replaces it and `REINDEX`es the scope indexes.
- * - `es_append_if_v2(...)` — the conditional append (locks → fresh-snapshot version check →
+ *   its definition is fingerprinted (`COMMENT ON FUNCTION … 'es:<sha256>'`). When a newer SDK
+ *   ships a different body while a fingerprinted one is installed, the installer REFUSES to
+ *   touch it (the inlined expression is stored in every scope index and statistics object; a
+ *   rebuild blocks writes) and throws the exact statements to run — or rebuilds inline when
+ *   `rebuildScopeIndexes: true` is passed. A function without a fingerprint (pre-fingerprint
+ *   build) is replaced and commented without touching the indexes.
+ * - `es_append_if_v3(...)` — the conditional append (locks → fresh-snapshot version check →
  *   insert) in one round trip. `SECURITY INVOKER`, `search_path` pinned to the table's schema,
  *   `EXECUTE` revoked from `PUBLIC` and granted to the installing role plus `grantExecuteTo`.
- *   Requires READ COMMITTED (it raises `ES001` otherwise). Versioned by name; old unversioned
- *   functions are dropped once, never on every boot.
+ *   Requires READ COMMITTED (it raises `ES001` otherwise). Locks are taken in ONE pass sorted
+ *   by key, each with its mode (shared for tenant stamps, exclusive otherwise) — two passes
+ *   would not be a global order and deadlock (verified). Versioned by name; older versions are
+ *   dropped once, never on every boot.
  * - `(event_type, sequence_number)`, `(transaction_id, sequence_number)`, one partial UNIQUE
  *   index per declared `unique` path, one UNIQUE index on the idempotency key (per tenant when
  *   a tenant scope key is configured), optional GIN `jsonb_path_ops` for ad-hoc `where`.
@@ -21,7 +27,12 @@
  *   use `store.withTenant(id)` so every statement runs with that setting.
  *
  * Roles: install as the table owner (`install: "auto"`, the default; concurrent boots are
- * serialised by an advisory lock). Application roles need `SELECT, INSERT` on the table,
+ * serialised by a transaction-scoped advisory lock inside one DDL transaction, with
+ * `statement_timeout` lifted for the install — so it also works behind a transaction pooler).
+ * RLS: `ENABLE`/`FORCE ROW LEVEL SECURITY` are issued only when `pg_class` says they are not
+ * set yet (the ALTER takes an AccessExclusiveLock even when it is a no-op); the policy is
+ * recreated only when its expression does not reference the configured tenant key.
+ * `printSchemaSql` prints the unconditional form (DROP + CREATE POLICY) for migration tools. Application roles need `SELECT, INSERT` on the table,
  * `USAGE` on its sequence and `EXECUTE` on the append function (`grantExecuteTo`). Locked-down
  * environments run `printSchemaSql()` through their migration tool and set `install: "none"`.
  *
@@ -44,7 +55,10 @@ import type { Filter, Query, QueryOptions, StoreSchema } from "../types.js";
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-export const APPEND_FUNCTION_VERSION = 2;
+export const APPEND_FUNCTION_VERSION = 3;
+
+/** Argument types of the current append function, for GRANT/REVOKE/COMMENT statements. */
+export const APPEND_SIGNATURE = "(bigint[], boolean[], bigint, boolean, text, text[], jsonb[], bigint, text[], jsonb[], jsonb[])";
 
 export function assertIdentifier(name: string, what: string): string {
   if (!IDENTIFIER.test(name)) throw new Error(`eventstore/postgres: invalid ${what} "${name}"`);
@@ -76,7 +90,7 @@ export function indexName(table: string, kind: string, detail: string): string {
   return `${base.slice(0, 54)}_${short(base)}`;
 }
 
-/** Versioned name of the append function: `es_append_if_v2` for `events`, `es_fn_<table>_append_if_v2` otherwise. */
+/** Versioned name of the append function: `es_append_if_v3` for `events`, `es_fn_<table>_append_if_v3` otherwise. */
 export function appendFunctionName(table: string, version: number = APPEND_FUNCTION_VERSION): string {
   const suffix = version === 1 ? "" : `_v${version}`;
   return table === "events" ? `es_append_if${suffix}` : indexName(table, "append", `if${suffix}`).replace(/^es_/, "es_fn_");
@@ -174,6 +188,25 @@ export function scopeStatisticsDdl(table: string, key: string): string {
   return `CREATE STATISTICS IF NOT EXISTS ${quoteIdent(scopeStatisticsName(table, key))} ON ${SCOPE_FUNCTION_NAME}(payload, ${quoteLiteral(key)}) FROM ${t}`;
 }
 
+/**
+ * The statements that bring the scope indexes and statistics in line with a changed
+ * `es_scope` body, in an order that keeps reads working: concurrent index builds first.
+ * Run them by hand in a quiet window, or pass `rebuildScopeIndexes: true` to the store.
+ */
+export function scopeRebuildStatements(schema: StoreSchema, table: string, schemaName?: string): string[] {
+  const t = quoteIdent(assertIdentifier(table, "table name"));
+  const statements: string[] = [scopeFunctionDdl(schemaName)];
+  for (const key of schema.scopeKeys) {
+    const expr = `${SCOPE_FUNCTION_NAME}(payload, ${quoteLiteral(key)})`;
+    statements.push(`DROP STATISTICS IF EXISTS ${quoteIdent(scopeStatisticsName(table, key))}`);
+    statements.push(`DROP INDEX CONCURRENTLY IF EXISTS ${quoteIdent(scopeIndexName(table, key))}`);
+    statements.push(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${quoteIdent(scopeIndexName(table, key))} ON ${t} ((${expr}), sequence_number) WHERE ${expr} IS NOT NULL`);
+    statements.push(scopeStatisticsDdl(table, key));
+  }
+  statements.push(`COMMENT ON FUNCTION ${SCOPE_FUNCTION_NAME}(jsonb, text) IS ${quoteLiteral(scopeFunctionFingerprint(schemaName))}`);
+  return statements;
+}
+
 export function scopeFunctionFingerprint(schemaName?: string): string {
   return `es:${sha256(scopeFunctionDdl(schemaName))}`;
 }
@@ -197,7 +230,7 @@ export function scopeIndexDdl(table: string, key: string): string {
 /** Statements that maintain access rights on the append function. */
 export function grantStatements(table: string, options: Pick<DdlOptions, "grantExecuteTo">): string[] {
   const fn = quoteIdent(appendFunctionName(table));
-  const signature = `${fn}(bigint[], bigint[], bigint, boolean, text, text[], jsonb[], bigint, text[], jsonb[], jsonb[])`;
+  const signature = `${fn}${APPEND_SIGNATURE}`;
   const statements = [`REVOKE EXECUTE ON FUNCTION ${signature} FROM PUBLIC`, `GRANT EXECUTE ON FUNCTION ${signature} TO CURRENT_USER`];
   for (const role of options.grantExecuteTo ?? []) {
     statements.push(`GRANT EXECUTE ON FUNCTION ${signature} TO ${quoteIdent(assertIdentifier(role, "role name"))}`);
@@ -255,7 +288,7 @@ export function ddlStatements(schema: StoreSchema, options: DdlOptions): string[
 
   statements.push(appendFunctionDdl(table, options.schemaName));
   statements.push(
-    `COMMENT ON FUNCTION ${quoteIdent(appendFunctionName(table))}(bigint[], bigint[], bigint, boolean, text, text[], jsonb[], bigint, text[], jsonb[], jsonb[]) IS ${quoteLiteral(appendFunctionFingerprint(table, options.schemaName))}`,
+    `COMMENT ON FUNCTION ${quoteIdent(appendFunctionName(table))}${APPEND_SIGNATURE} IS ${quoteLiteral(appendFunctionFingerprint(table, options.schemaName))}`,
   );
   statements.push(...grantStatements(table, options));
 
@@ -278,13 +311,16 @@ export function ddlStatements(schema: StoreSchema, options: DdlOptions): string[
  * advisory locks of step 1 — a single-statement CTE cannot give that guarantee. Under
  * REPEATABLE READ or SERIALIZABLE the whole transaction shares one snapshot and the guard
  * would be stale, hence the isolation check. Do not declare it STABLE.
+ *
+ * `p_lock_keys`/`p_lock_modes` are parallel arrays (mode true = exclusive), sorted by the
+ * caller; the function sorts again anyway.
  */
 export function appendFunctionDdl(table: string, schemaName?: string): string {
   const t = quoteIdent(assertIdentifier(table, "table name"));
   const fn = quoteIdent(appendFunctionName(table));
   return `CREATE OR REPLACE FUNCTION ${fn}(
   p_lock_keys bigint[],
-  p_shared_keys bigint[],
+  p_lock_modes boolean[],
   p_global_key bigint,
   p_exclusive_global boolean,
   p_version_sql text,
@@ -315,9 +351,11 @@ BEGIN
   ELSE
     PERFORM pg_advisory_xact_lock_shared(p_global_key);
   END IF;
-  -- lock order everywhere: global → shared tenant stamps → exclusive keys (sorted by the caller)
-  PERFORM pg_advisory_xact_lock_shared(k) FROM (SELECT unnest(p_shared_keys) AS k ORDER BY 1) s;
-  PERFORM pg_advisory_xact_lock(k) FROM (SELECT unnest(p_lock_keys) AS k ORDER BY 1) s;
+  -- lock order everywhere: global first, then ONE pass over all keys sorted by key, each in its
+  -- mode (true = exclusive). Two passes (all shared, then all exclusive) are not a global order
+  -- and deadlock when a shared key sorts above an exclusive one.
+  PERFORM CASE WHEN s.excl THEN pg_advisory_xact_lock(s.k) ELSE pg_advisory_xact_lock_shared(s.k) END
+  FROM (SELECT u.k, u.excl FROM unnest(p_lock_keys, p_lock_modes) AS u(k, excl) ORDER BY u.k) s;
 
   -- 2. the context version, read after the locks (fresh snapshot). p_version_sql is the
   --    statement compiled by compileVersionSql(): one MAX per scope value, so every branch is

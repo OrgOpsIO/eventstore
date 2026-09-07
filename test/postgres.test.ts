@@ -47,7 +47,7 @@ describe.skipIf(!url)("PostgresStore", () => {
     expect(ddl).toContain("CREATE TABLE IF NOT EXISTS");
     expect(ddl).toContain(scopeIndexName(TABLE, "accountOpenedId"));
     expect(ddl).toContain("es_fn_");
-    expect(ddl).toContain("_v2");
+    expect(ddl).toContain("_v3");
     expect(ddl).toContain("REVOKE EXECUTE");
     expect(ddl).toContain("SET search_path");
     // functions are fingerprinted; a second install replaces nothing
@@ -74,7 +74,7 @@ describe.skipIf(!url)("PostgresStore", () => {
     const err = await store.withClient(async (c) => {
       await c.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
       try {
-        await c.query(`SELECT * FROM "${appendFunctionName(TABLE)}"($1::bigint[], $2::bigint[], 1, false, NULL, '{}', '{}', 0, $3::text[], $4::jsonb[], $5::jsonb[])`, [
+        await c.query(`SELECT * FROM "${appendFunctionName(TABLE)}"($1::bigint[], $2::boolean[], 1, false, NULL, '{}', '{}', 0, $3::text[], $4::jsonb[], $5::jsonb[])`, [
           [],
           [],
           ["MoneyDeposited"],
@@ -324,9 +324,8 @@ describe.skipIf(!url)("PostgresStore with rls: true and a non-owner role", () =>
     await b.append([tenantAccounts.AccountOpened({ owner: "B" }, { tenantId: "tenant-b" }, { id: "acc-b" })]);
     expect((await a.query({ types: ["AccountOpened"] })).events.map((e) => e.id)).toEqual(["acc-a"]);
     expect((await b.query({ types: ["AccountOpened"] })).events.map((e) => e.id)).toEqual(["acc-b"]);
-    // without a tenant session the policy hides everything from the app role (fail closed);
-    // the test owner is a superuser and bypasses RLS by definition, so it is not asserted here
-    expect((await app.query({ types: ["AccountOpened"] })).events).toEqual([]);
+    // the root store refuses to run without a tenant session when rls is on (it would see nothing)
+    await expect(app.query({ types: ["AccountOpened"] })).rejects.toThrow(/withTenant/);
     // a row that names tenant B written through tenant A's session violates WITH CHECK
     await expect(a.append([tenantAccounts.AccountOpened({ owner: "X" }, { tenantId: "tenant-b" })])).rejects.toBeInstanceOf(PolicyViolationError);
     // the guard works inside the tenant session

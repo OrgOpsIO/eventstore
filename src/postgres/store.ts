@@ -1,8 +1,8 @@
 import pg from "pg";
 import type { Pool, PoolClient } from "pg";
-import { EventStoreError, PolicyViolationError, TransientError, UniqueViolationError } from "../errors.js";
+import { EventStoreError, PolicyViolationError, TransientError, UniqueViolationError, UsageError } from "../errors.js";
 import { fnv1a64, uuidv7 } from "../ids.js";
-import { GLOBAL_LOCK_KEY, compareCursor, conditionLockKeys, eventLockKeys, filtersOf, fromPayload, normaliseOptions, toPayload } from "../query.js";
+import { compareCursor, conditionLockKeys, eventLockKeys, fromPayload, globalLockKey, normaliseOptions, toPayload } from "../query.js";
 import type {
   AppendIfOutcome,
   AppendResult,
@@ -17,6 +17,7 @@ import type {
   StoreSchema,
 } from "../types.js";
 import {
+  APPEND_SIGNATURE,
   SCOPE_FUNCTION_NAME,
   appendFunctionDdl,
   appendFunctionFingerprint,
@@ -33,7 +34,9 @@ import {
   scopeFunctionFingerprint,
   scopeIndexDdl,
   scopeIndexName,
+  scopeRebuildStatements,
   scopeStatisticsDdl,
+  scopeStatisticsName,
   tableDdl,
   uniqueIndexes,
   uniquePathSegmentsSql,
@@ -71,6 +74,12 @@ export interface CreatePostgresStoreOptions {
   readonly timeouts?: PoolTimeouts;
   /** Largest batch one append may carry. Default 10 000. */
   readonly maxBatchSize?: number;
+  /**
+   * When the installed `es_scope()` body differs from this SDK's (fingerprint mismatch), rebuild
+   * the scope indexes and statistics inline during install. Blocks writes for the duration on a
+   * large table. Default `false`: the installer throws the statements to run by hand instead.
+   */
+  readonly rebuildScopeIndexes?: boolean;
 }
 
 const INSTALL_LOCK_KEY = fnv1a64("@orgops/eventstore:install");
@@ -102,7 +111,7 @@ interface Runner {
   query<T extends pg.QueryResultRow = pg.QueryResultRow>(sql: string, params?: unknown[]): Promise<pg.QueryResult<T>>;
 }
 
-/** The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v2` for atomic conditional appends. */
+/** The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v3` for atomic conditional appends. */
 export class PostgresStore implements EventStore {
   readonly schema: StoreSchema;
   readonly table: string;
@@ -114,13 +123,17 @@ export class PostgresStore implements EventStore {
   private readonly idempotencyIndex: string;
   private readonly fn: string;
   private readonly maxBatchSize: number;
+  private readonly rebuildScopeIndexes: boolean;
   private installed: Promise<void> | undefined;
+  /** Non-fatal install findings (e.g. `COMMENT ON FUNCTION` refused because this role is not the owner). */
+  readonly installWarnings: string[] = [];
 
   constructor(options: CreatePostgresStoreOptions) {
     this.schema = options.schema;
     this.table = options.table ?? "events";
     this.installMode = options.install ?? "auto";
     this.maxBatchSize = options.maxBatchSize ?? 10_000;
+    this.rebuildScopeIndexes = options.rebuildScopeIndexes ?? false;
     if (typeof options.connection === "string") {
       const timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
       // session defaults travel in the libpq `options` parameter: no extra round trip, no
@@ -171,11 +184,18 @@ export class PostgresStore implements EventStore {
     if (this.installMode === "none") return;
     const client = await this.pool.connect();
     try {
-      await client.query("SELECT pg_advisory_lock($1::bigint)", [INSTALL_LOCK_KEY.toString()]);
+      // One DDL transaction: the install lock is transaction-scoped (cannot leak behind a
+      // transaction pooler), and statement_timeout is lifted for it (an index build on a large
+      // table must not be killed after 30 s and retried forever).
+      await client.query("BEGIN");
       try {
+        await client.query("SET LOCAL statement_timeout = 0");
+        await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [INSTALL_LOCK_KEY.toString()]);
         await this.installUnderLock(client);
-      } finally {
-        await client.query("SELECT pg_advisory_unlock($1::bigint)", [INSTALL_LOCK_KEY.toString()]);
+        await client.query("COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        throw err;
       }
     } finally {
       client.release();
@@ -184,8 +204,10 @@ export class PostgresStore implements EventStore {
 
   /**
    * Table and indexes are `IF NOT EXISTS`. Functions are replaced only when their fingerprint
-   * (a comment on the function) differs from ours — and when `es_scope` changed, every scope
-   * index built on it is reindexed. Nothing is dropped on a routine boot.
+   * (a comment on the function) differs from ours. A changed `es_scope` body is never applied
+   * silently: the inlined expression lives in every scope index, so the installer either throws
+   * the rebuild statements or, with `rebuildScopeIndexes: true`, rebuilds inline. Nothing is
+   * dropped on a routine boot.
    */
   private async installUnderLock(client: PoolClient): Promise<void> {
     const schemaName = (await client.query<{ s: string }>("SELECT current_schema() AS s")).rows[0]?.s ?? "public";
@@ -196,21 +218,34 @@ export class PostgresStore implements EventStore {
 
     const scopeFp = scopeFunctionFingerprint(schemaName);
     const currentScopeFp = await functionFingerprint(client, SCOPE_FUNCTION_NAME, schemaName);
-    const scopeChanged = currentScopeFp !== null && currentScopeFp !== scopeFp;
+    // null: no function yet; "": a pre-fingerprint build (replace, indexes untouched — same
+    // semantics); a different fingerprint: a real body change, indexes are stale.
+    const scopeChanged = currentScopeFp !== null && currentScopeFp !== "" && currentScopeFp !== scopeFp;
+    if (scopeChanged && !this.rebuildScopeIndexes) {
+      throw new EventStoreError(
+        `eventstore/postgres: the installed es_scope() differs from this SDK's; its inlined expression is stored in the scope indexes. ` +
+          `Run these statements in a quiet window (or pass rebuildScopeIndexes: true to do it inline, blocking writes):\n` +
+          scopeRebuildStatements(this.schema, this.table, schemaName)
+            .map((x) => `${x};`)
+            .join("\n"),
+      );
+    }
     if (currentScopeFp !== scopeFp) {
+      if (scopeChanged) {
+        // inline rebuild: drop the dependents first, then the body, then recreate below
+        for (const key of this.schema.scopeKeys) {
+          await client.query(`DROP STATISTICS IF EXISTS ${quoteIdent(scopeStatisticsName(this.table, key))}`);
+          await client.query(`DROP INDEX IF EXISTS ${quoteIdent(scopeIndexName(this.table, key))}`);
+        }
+      }
       await client.query(scopeFunctionDdl(schemaName));
-      await client.query(`COMMENT ON FUNCTION ${SCOPE_FUNCTION_NAME}(jsonb, text) IS ${quoteLiteral(scopeFp)}`);
+      await this.comment(client, `${SCOPE_FUNCTION_NAME}(jsonb, text)`, scopeFp);
     }
 
     if (this.ddlOptions.typeIndex) {
       await client.query(`CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(this.table, "type", "seq"))} ON ${t} (event_type, sequence_number)`);
     }
     await client.query(`CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(this.table, "xid", "seq"))} ON ${t} (transaction_id, sequence_number)`);
-    if (scopeChanged) {
-      // es_scope is inlined into index expressions at creation: a changed body means the stored
-      // expression is stale, and only a rebuild (not REINDEX) picks the new one up.
-      for (const key of this.schema.scopeKeys) await client.query(`DROP INDEX IF EXISTS ${quoteIdent(scopeIndexName(this.table, key))}`);
-    }
     for (const key of this.schema.scopeKeys) {
       await client.query(scopeIndexDdl(this.table, key));
       await client.query(scopeStatisticsDdl(this.table, key));
@@ -239,32 +274,66 @@ export class PostgresStore implements EventStore {
     const appendFp = appendFunctionFingerprint(this.table, schemaName);
     if ((await functionFingerprint(client, fnName, schemaName)) !== appendFp) {
       await client.query(appendFunctionDdl(this.table, schemaName));
-      await client.query(
-        `COMMENT ON FUNCTION ${quoteIdent(fnName)}(bigint[], bigint[], bigint, boolean, text, text[], jsonb[], bigint, text[], jsonb[], jsonb[]) IS ${quoteLiteral(appendFp)}`,
-      );
+      await this.comment(client, `${quoteIdent(fnName)}${APPEND_SIGNATURE}`, appendFp);
     }
     for (const statement of grantStatements(this.table, opts)) await client.query(statement);
-    // one-off: the unversioned v1 function nobody calls any more
-    const legacy = await client.query<{ sig: string }>(
-      "SELECT p.oid::regprocedure::text AS sig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = $1 AND n.nspname = $2",
-      [appendFunctionName(this.table, 1), schemaName],
-    );
-    for (const row of legacy.rows) await client.query(`DROP FUNCTION IF EXISTS ${row.sig}`);
+    // one-off: older versions nobody calls any more
+    for (const version of [1, 2]) {
+      const legacy = await client.query<{ sig: string }>(
+        "SELECT p.oid::regprocedure::text AS sig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = $1 AND n.nspname = $2",
+        [appendFunctionName(this.table, version), schemaName],
+      );
+      for (const row of legacy.rows) await client.query(`DROP FUNCTION IF EXISTS ${row.sig}`);
+    }
 
     if (this.ddlOptions.rls) {
       const key = tenantKey as string;
       const policy = indexName(this.table, "tenant", "isolation");
       const expr = `${SCOPE_FUNCTION_NAME}(payload, ${quoteLiteral(key)}) = current_setting('app.current_tenant', true)`;
-      await client.query(`ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY`);
-      await client.query(`ALTER TABLE ${t} FORCE ROW LEVEL SECURITY`);
-      const existing = await client.query("SELECT 1 FROM pg_policies WHERE schemaname = $1 AND tablename = $2 AND policyname = $3", [schemaName, this.table, policy]);
-      if (existing.rowCount === 0) {
+      // ALTER TABLE takes an AccessExclusiveLock even when it changes nothing: only when needed
+      const flags = await client.query<{ rls: boolean; force: boolean }>(
+        "SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS force FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $1 AND n.nspname = $2",
+        [this.table, schemaName],
+      );
+      if (!flags.rows[0]?.rls) await client.query(`ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY`);
+      if (!flags.rows[0]?.force) await client.query(`ALTER TABLE ${t} FORCE ROW LEVEL SECURITY`);
+      // the policy is recreated only when its expression does not reference the configured key
+      const existing = await client.query<{ qual: string | null }>(
+        "SELECT qual FROM pg_policies WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+        [schemaName, this.table, policy],
+      );
+      const qual = existing.rows[0]?.qual ?? null;
+      const upToDate = qual !== null && qual.includes(`'${key}'::text`) && qual.includes("app.current_tenant");
+      if (!upToDate) {
+        if (qual !== null) await client.query(`DROP POLICY IF EXISTS ${quoteIdent(policy)} ON ${t}`);
         await client.query(`CREATE POLICY ${quoteIdent(policy)} ON ${t} USING (${expr}) WITH CHECK (${expr})`);
       }
     }
   }
 
+  /** `COMMENT ON FUNCTION` needs ownership; a non-owner installer keeps going with a warning (savepoint keeps the transaction alive). */
+  private async comment(client: PoolClient, target: string, fingerprint: string): Promise<void> {
+    await client.query("SAVEPOINT es_comment");
+    try {
+      await client.query(`COMMENT ON FUNCTION ${target} IS ${quoteLiteral(fingerprint)}`);
+      await client.query("RELEASE SAVEPOINT es_comment");
+    } catch (err) {
+      await client.query("ROLLBACK TO SAVEPOINT es_comment");
+      if ((err as { code?: string }).code !== "42501") throw err;
+      this.installWarnings.push(`could not fingerprint ${target}: this role does not own it; the function will be re-created on every boot`);
+    }
+  }
+
+  private assertRlsSession(): void {
+    if (this.ddlOptions.rls) {
+      throw new UsageError(
+        "eventstore/postgres: rls is enabled — call withTenant(tenantId) (or es.forTenant()) for reads and writes; the root store has no tenant session and would see nothing",
+      );
+    }
+  }
+
   async query(query: Query, options: QueryOptions = {}): Promise<QueryResult> {
+    this.assertRlsSession();
     await this.ensureInstalled();
     return this.queryWith(this.pool, query, options);
   }
@@ -301,8 +370,11 @@ export class PostgresStore implements EventStore {
   private toRecorded(row: Row): RecordedEvent {
     const type = row.event_type as string;
     const idKey = this.schema.idKeyOf(type);
-    const payload = this.schema.upcast(type, row.payload as Record<string, unknown>);
-    const { id, data, scopes } = fromPayload(payload, idKey);
+    const raw = row.payload as Record<string, unknown>;
+    // id and scopes come from the RAW payload — what es_scope() matched and locked on; only
+    // `data` goes through `upcast` (an upcast may reshape data, never scope keys or the id)
+    const { id, scopes } = fromPayload(raw, idKey);
+    const { data } = fromPayload(this.schema.upcast(type, raw), idKey);
     const sequence = toSafeInt(row.seq as string);
     return {
       type,
@@ -318,6 +390,7 @@ export class PostgresStore implements EventStore {
   }
 
   async append(events: readonly NewEvent[]): Promise<AppendResult> {
+    this.assertRlsSession();
     await this.ensureInstalled();
     const outcome = await this.writeWith(this.pool, events, null);
     if (!outcome.ok) throw new EventStoreError("eventstore/postgres: unconditional append reported a conflict");
@@ -325,6 +398,7 @@ export class PostgresStore implements EventStore {
   }
 
   async appendIf(events: readonly NewEvent[], ctx: ContextHandle): Promise<AppendIfOutcome> {
+    this.assertRlsSession();
     await this.ensureInstalled();
     return this.writeWith(this.pool, events, ctx);
   }
@@ -339,19 +413,13 @@ export class PostgresStore implements EventStore {
       const event = this.schema.validate(raw);
       return { ...event, id: event.id ?? uuidv7(now) };
     });
-    const condition = ctx ? conditionLockKeys(ctx.query, this.schema) : { keys: [] as bigint[], exclusiveGlobal: false, exclusiveTenants: [] as bigint[] };
-    const eventLocks = eventLockKeys(prepared, this.schema);
-    const byValue = (a: string, b: string) => (BigInt(a) < BigInt(b) ? -1 : BigInt(a) > BigInt(b) ? 1 : 0);
-    // exclusive: the condition's scope pairs, tenant-only guards (exclusive on the tenant), the events' own pairs
-    const lockKeys = [...new Set([...condition.keys, ...condition.exclusiveTenants, ...eventLocks.keys].map((k) => k.toString()))].sort(byValue);
-    // shared: the tenant stamp of the events (a tenant-only guard excludes them; scope-level guards ignore them)
-    const sharedKeys = [...new Set(eventLocks.sharedTenants.map((k) => k.toString()))].filter((k) => !lockKeys.includes(k)).sort(byValue);
+    const plan = this.lockPlan(prepared, ctx);
     const compiled = ctx ? compileVersionSql(this.table, ctx.query, undefined, this.schema) : null;
     const params = [
-      lockKeys,
-      sharedKeys,
-      GLOBAL_LOCK_KEY.toString(),
-      condition.exclusiveGlobal,
+      plan.keys,
+      plan.modes,
+      plan.globalKey,
+      plan.exclusiveGlobal,
       compiled ? compiled.sql : null,
       compiled ? compiled.texts : [],
       compiled ? compiled.jsons : [],
@@ -361,7 +429,7 @@ export class PostgresStore implements EventStore {
       prepared.map((e) => JSON.stringify(e.metadata ?? {})),
     ];
     const sql = `SELECT ok, actual::text AS actual, first_seq::text AS first_seq, last_seq::text AS last_seq, cnt
-FROM ${this.fn}($1::bigint[], $2::bigint[], $3::bigint, $4::boolean, $5::text, $6::text[], $7::jsonb[], $8::bigint, $9::text[], $10::jsonb[], $11::jsonb[])`;
+FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::text, $6::text[], $7::jsonb[], $8::bigint, $9::text[], $10::jsonb[], $11::jsonb[])`;
     let row: AppendRow | undefined;
     try {
       const result = await runner.query<AppendRow>(sql, params);
@@ -380,6 +448,27 @@ FROM ${this.fn}($1::bigint[], $2::bigint[], $3::bigint, $4::boolean, $5::text, $
   }
 
   /**
+   * The advisory locks one append takes: one list sorted by key with a parallel mode list
+   * (true = exclusive). Exclusive: the condition's scope pairs, tenant-only guards (on the
+   * tenant key), the events' own pairs. Shared: the events' tenant stamps. Exclusive wins on a
+   * duplicate. The global key is salted per deployment like every other key.
+   */
+  lockPlan(events: readonly (NewEvent & { id: string })[], ctx: ContextHandle | null): { keys: string[]; modes: boolean[]; globalKey: string; exclusiveGlobal: boolean } {
+    const condition = ctx ? conditionLockKeys(ctx.query, this.schema) : { keys: [] as bigint[], exclusiveGlobal: false, exclusiveTenants: [] as bigint[] };
+    const eventLocks = eventLockKeys(events, this.schema);
+    const modeOf = new Map<bigint, boolean>();
+    for (const k of eventLocks.sharedTenants) modeOf.set(k, false);
+    for (const k of [...condition.keys, ...condition.exclusiveTenants, ...eventLocks.keys]) modeOf.set(k, true);
+    const sorted = [...modeOf.keys()].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return {
+      keys: sorted.map((k) => k.toString()),
+      modes: sorted.map((k) => modeOf.get(k)!),
+      globalKey: globalLockKey(this.schema.lockSalt).toString(),
+      exclusiveGlobal: condition.exclusiveGlobal,
+    };
+  }
+
+  /**
    * Map driver errors to the SDK's vocabulary. Unique violations never carry the offending
    * value (pg puts it into `detail`), transient conditions become `TransientError`.
    */
@@ -394,7 +483,13 @@ FROM ${this.fn}($1::bigint[], $2::bigint[], $3::bigint, $4::boolean, $5::text, $
       return new UniqueViolationError({ path: constraint });
     }
     if (e.code && TRANSIENT_SQLSTATES.has(e.code)) return new TransientError(e.code, { cause: err });
-    if (e.code === "42501") return new PolicyViolationError(e.message ?? "row-level security policy violated", { cause: err });
+    if (e.code === "42501") {
+      if (this.ddlOptions.rls) return new PolicyViolationError(e.message ?? "row-level security policy violated", { cause: err });
+      return new EventStoreError(
+        `eventstore/postgres: permission denied — the application role needs SELECT, INSERT on the table, USAGE on its sequence and EXECUTE on the append function (grantExecuteTo): ${e.message ?? ""}`,
+        { cause: err },
+      );
+    }
     if (e.code === "ES001") return new EventStoreError(`eventstore/postgres: ${e.message ?? "READ COMMITTED required"}`, { cause: err });
     return err;
   }
