@@ -41,6 +41,18 @@ export interface MemoryStoreOptions {
   readonly schema?: StoreSchema;
   /** Source of `recordedAt`. Default: wall clock. */
   readonly clock?: () => Date;
+  /**
+   * Simulate Postgres transaction semantics (tests only). `allocateId` decides the
+   * `transactionId` of a batch (default: the batch's first sequence — monotone with the
+   * sequence, so no inversion); `isSettled` decides whether a record is settled right now
+   * (default: always). With these, the memory store can reproduce an xid/sequence inversion
+   * and in-flight transactions, so cursor and cache behaviour can be specified here and
+   * checked against Postgres.
+   */
+  readonly transactions?: {
+    readonly allocateId?: (first: number, count: number) => string;
+    readonly isSettled?: (transactionId: string, sequence: number) => boolean;
+  };
 }
 
 /** A stored row: the wire payload, so `upcast` runs on read exactly as in Postgres. */
@@ -77,10 +89,14 @@ export class MemoryStore implements EventStore, LiveStore {
   private readonly uniqueSeen = new Map<string, Set<string>>();
   private readonly idempotencyKeys = new Set<string>();
   private readonly idKeys = new Map<string, string>();
+  private readonly allocateId: (first: number, count: number) => string;
+  private readonly isSettled: ((transactionId: string, sequence: number) => boolean) | undefined;
 
   constructor(options: MemoryStoreOptions = {}) {
     this.schema = options.schema ?? emptySchema();
     this.clock = options.clock ?? (() => new Date());
+    this.allocateId = options.transactions?.allocateId ?? ((first) => String(first));
+    this.isSettled = options.transactions?.isSettled;
   }
 
   /** All records, in order. Handy in tests. */
@@ -109,6 +125,7 @@ export class MemoryStore implements EventStore, LiveStore {
       }
     }
     let events = visible;
+    if (options.cursor !== undefined || options.settledOnly) events = [...events].sort(compareCursor);
     if (options.order === "desc") events = [...events].reverse();
     if (options.limit !== undefined) events = events.slice(0, options.limit);
     const lastReturned = events.reduce((m, e) => Math.max(m, e.sequence), 0);
@@ -173,6 +190,15 @@ export class MemoryStore implements EventStore, LiveStore {
   }
 
   private toRecorded(row: Row): RecordedEvent {
+    if (this.isSettled) {
+      // settledness may change between reads: never memoise it
+      const base = this.toRecordedBase(row);
+      return { ...base, settled: this.isSettled(row.transactionId, row.sequence) };
+    }
+    return this.toRecordedBase(row);
+  }
+
+  private toRecordedBase(row: Row): RecordedEvent {
     if (row.recorded) return row.recorded;
     const idKey = this.idKeyOf(row.type);
     // id and scopes come from the RAW payload — that is what the index matched on (Postgres: es_scope);
@@ -240,7 +266,8 @@ export class MemoryStore implements EventStore, LiveStore {
       }
     }
     const first = this.rows.length + 1;
-    const transactionId = String(first);
+    const transactionId = this.allocateId(first, prepared.length);
+    if (!/^\d+$/.test(transactionId)) throw new Error("eventstore: transactions.allocateId must return a decimal string");
     const rows: Row[] = prepared.map(({ event, payload, metadata }, i) => ({
       sequence: first + i,
       type: event.type,
