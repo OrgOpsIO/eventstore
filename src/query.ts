@@ -124,8 +124,9 @@ export function validateEnvelope(event: NewEvent, schema: Pick<StoreSchema, "idK
   if (Object.prototype.hasOwnProperty.call(data, idKey)) issues.push({ message: `data must not contain the event's own id key "${idKey}"`, path: [idKey] });
   if (Object.prototype.hasOwnProperty.call(data, "scopes")) issues.push({ message: "data must not contain a `scopes` key; pass scopes separately", path: ["scopes"] });
   for (const key of schema.scopeKeys) {
-    if (Object.prototype.hasOwnProperty.call(data, key) && data[key] !== undefined && typeof data[key] !== "string") {
-      issues.push({ message: `"${key}" is a declared scope key; its value must be a string`, path: [key] });
+    // `null`/`undefined` mean "no such scope" in both stores (es_scope yields NULL, memory ignores it)
+    if (Object.prototype.hasOwnProperty.call(data, key) && data[key] !== undefined && data[key] !== null && typeof data[key] !== "string") {
+      issues.push({ message: `"${key}" is a declared scope key; its value must be a string or null`, path: [key] });
     }
   }
   for (const [key, value] of Object.entries(event.scopes ?? {})) {

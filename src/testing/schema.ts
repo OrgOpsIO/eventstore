@@ -8,7 +8,7 @@ export const conformanceEvents = defineEvents({
   MoneyWithdrawn: { data: z.object({ amount: z.number().positive() }), scopes: ["accountOpenedId"] },
   NoteAdded: { data: z.object({ text: z.string() }), optionalScopes: ["accountOpenedId"] },
   /** Flat-id compatibility: no `scopes`, the id lives in the data. */
-  LegacyThing: { data: z.object({ thingId: z.string(), value: z.string() }) },
+  LegacyThing: { data: z.object({ thingId: z.string().nullable(), value: z.string() }) },
 });
 
 /**

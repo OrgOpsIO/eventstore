@@ -460,6 +460,15 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     assert.deepEqual(typed.events.map((e) => e.data.note), ["flat"]);
   });
 
+  withStore("a declared scope key may be null in data: it is simply not a scope", async (store) => {
+    await store.append([{ type: "LegacyThing", data: { thingId: null, value: "no thing" } }]);
+    const r = await store.query({ scopes: { thingId: "x" } });
+    assert.equal(r.events.length, 0);
+    const all = await store.query({ types: ["LegacyThing"] });
+    assert.equal(all.events.length, 1);
+    assert.equal((all.events[0]!.data as { thingId: unknown }).thingId, null);
+  });
+
   withStore("types: [] matches nothing", async (store) => {
     await store.append([openAccount("a")]);
     const r = await store.query({ types: [] });

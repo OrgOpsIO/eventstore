@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1 (2026-09-08)
+
+- A declared scope key may be `null` in `data`: it then simply is not a scope (`es_scope` yields NULL, the memory store ignores it). Previously the envelope check rejected it; existing stores that write `categoryDefinedId: null` for "no category" need no change.
+
 ## 0.1.0 (2026-09-08)
 
 First cut of `@orgops/eventstore`, built in one night from the research in `research/`. Every concept is the joint work of Ralf Westphal and Rico Fritzsche (event-orientation, Command Context Consistency, scoping events); this package is an implementation of it on PostgreSQL.
