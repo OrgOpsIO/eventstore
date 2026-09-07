@@ -83,6 +83,15 @@ export class TransientError extends EventStoreError {
   }
 }
 
+/** Row-level security refused the statement (`rls: true`): the row belongs to another tenant. */
+export class PolicyViolationError extends EventStoreError {
+  override readonly name = "PolicyViolationError";
+  override readonly httpStatus = 403;
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(`eventstore: ${message}`, options);
+  }
+}
+
 export class NotConfiguredError extends EventStoreError {
   override readonly name = "NotConfiguredError";
   constructor() {
