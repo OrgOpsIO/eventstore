@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased, 2026-09-08)
+## 0.1.0 (2026-09-08)
 
 First cut of `@orgops/eventstore`, built in one night from the research in `research/`. Every concept is the joint work of Ralf Westphal and Rico Fritzsche (event-orientation, Command Context Consistency, scoping events); this package is an implementation of it on PostgreSQL.
 
