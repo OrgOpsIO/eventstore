@@ -346,3 +346,60 @@ describe.skipIf(!url)("PostgresStore with rls: true and a non-owner role", () =>
     );
   });
 });
+
+const directory = defineEvents({
+  AccountRegistered: { data: z.object({ email: z.string(), name: z.string() }), scopes: ["tenantId"], unique: ["email"] },
+  TokenIssued: { data: z.object({ token: z.string(), note: z.string() }), scopes: ["accountRegisteredId", "tenantId"], unique: ["token"] },
+});
+const directorySchema = buildSchema([directory], { strict: true, tenantScopeKey: "tenantId" });
+const DIR_TABLE = "es_rls_directory";
+
+describe.skipIf(!url)("PostgresStore with rls: true — statistics and omit through a non-owner role", () => {
+  let owner: PostgresStore;
+  let app: PostgresStore;
+
+  beforeAll(async () => {
+    const admin = new pg.Pool({ connectionString: url, max: 1 });
+    await admin.query(`DROP TABLE IF EXISTS "${DIR_TABLE}" CASCADE`);
+    await admin.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${APP_ROLE}') THEN CREATE ROLE ${APP_ROLE} LOGIN PASSWORD '${APP_ROLE}'; END IF; END $$`);
+    await admin.end();
+    owner = new PostgresStore({ connection: url!, schema: directorySchema, table: DIR_TABLE, rls: true, grantExecuteTo: [APP_ROLE], poolSize: 4 });
+    await owner.ensureInstalled();
+    await owner.withClient(async (c) => {
+      await c.query(`GRANT USAGE ON SCHEMA public TO ${APP_ROLE}`);
+      await c.query(`GRANT SELECT, INSERT ON "${DIR_TABLE}" TO ${APP_ROLE}`);
+      await c.query(`GRANT USAGE, SELECT ON SEQUENCE "${DIR_TABLE}_sequence_number_seq" TO ${APP_ROLE}`);
+    });
+    const appUrl = new URL(url!);
+    appUrl.username = APP_ROLE;
+    appUrl.password = APP_ROLE;
+    app = new PostgresStore({ connection: appUrl.toString(), schema: directorySchema, table: DIR_TABLE, rls: true, install: "none", poolSize: 4 });
+    const a = app.withTenant("tenant-a");
+    const b = app.withTenant("tenant-b");
+    await a.append([directory.AccountRegistered({ email: "a@example.com", name: "A" }, { tenantId: "tenant-a" }, { id: "acc-a" })]);
+    await b.append([directory.AccountRegistered({ email: "b@example.com", name: "B" }, { tenantId: "tenant-b" }, { id: "acc-b" })]);
+    await b.append([directory.TokenIssued({ token: "tok-b", note: "x".repeat(2000) }, { accountRegisteredId: "acc-b", tenantId: "tenant-b" })]);
+  });
+
+  afterAll(async () => {
+    await app.close();
+    await owner.close();
+  });
+
+  it("statistics through a tenant session count only that tenant, and omit trims inside the session", async () => {
+    const a = app.withTenant("tenant-a");
+    const b = app.withTenant("tenant-b");
+    expect((await a.statistics()).map((s) => [s.type, s.count])).toEqual([["AccountRegistered", 1]]);
+    expect((await b.statistics()).map((s) => [s.type, s.count])).toEqual([
+      ["AccountRegistered", 1],
+      ["TokenIssued", 1],
+    ]);
+    // `bytes` is the stored size: 2 000 repeated characters compress to far less than their text length
+    const tokenBytes = (await b.statistics({ types: ["TokenIssued"] }))[0]!.bytes;
+    expect(tokenBytes).toBeGreaterThan(0);
+    expect(tokenBytes).toBeLessThan(2000);
+    const trimmed = await b.query({ types: ["TokenIssued"] }, { omit: ["note"] });
+    expect(trimmed.events[0]?.data).toEqual({ token: "tok-b" });
+    expect(trimmed.events[0]?.scopes).toEqual({ accountRegisteredId: "acc-b", tenantId: "tenant-b" });
+  });
+});

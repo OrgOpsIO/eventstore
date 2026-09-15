@@ -662,6 +662,28 @@ export function compileVersionSql(
   return { sql, texts, jsons };
 }
 
+/**
+ * Count, stored payload bytes (`pg_column_size`: what is on disk, compressed when TOASTed — no
+ * payload is detoasted or fetched) and last sequence per event type, over the rows a query
+ * matches. int8 arrives as text.
+ */
+export function compileStatistics(tableOrTarget: string | Target, query: Query = {}): { sql: string; params: unknown[] } {
+  const target = targetOf(tableOrTarget);
+  const collector = createParamCollector();
+  const compiled = compileFilters(query, collector, target.schemaName);
+  const anchors = [
+    compiled.sql.includes("$1::text[]") ? null : "coalesce(array_length($1::text[], 1), 0) >= 0",
+    compiled.sql.includes("$2::jsonb[]") ? null : "coalesce(array_length($2::jsonb[], 1), 0) >= 0",
+  ].filter((a): a is string => a !== null);
+  const where = [`(${compiled.sql})`, ...anchors].join(" AND ");
+  const sql = `SELECT event_type, count(*)::text AS cnt, coalesce(sum(pg_column_size(payload)), 0)::text AS bytes, max(sequence_number)::text AS last_seq
+FROM ${tableRef(target)}
+WHERE ${where}
+GROUP BY event_type
+ORDER BY event_type`;
+  return { sql, params: [collector.texts, collector.jsons] };
+}
+
 /** `settled` relative to a snapshot xmin hoisted into the `ctx` CTE. */
 export const SETTLED_SQL = "transaction_id < ctx.xmin";
 
@@ -698,6 +720,8 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
       `NOT (${SETTLED_SQL} AND (transaction_id, sequence_number) <= (${param(options.cursor.transactionId)}::xid8, ${param(String(options.cursor.sequence))}::bigint))`,
     );
   }
+  // the projection: keys stripped in SQL, so a trimmed field never travels
+  const payload = options.omit && options.omit.length > 0 ? `payload - ${param(options.omit)}::text[]` : "payload";
   const dir = options.order === "desc" ? "DESC" : "ASC";
   const tupleOrder = options.cursor !== undefined || options.settledOnly === true;
   const orderBy = tupleOrder ? `transaction_id ${dir}, sequence_number ${dir}` : `sequence_number ${dir}`;
@@ -719,7 +743,7 @@ SELECT ctx.v AS context_version,
        e.sequence_number AS seq, e.event_type, e.payload, e.metadata, e.recorded_at, e.xid, e.settled, e.hits
 FROM ctx
 LEFT JOIN LATERAL (
-  SELECT sequence_number, event_type, payload, metadata, recorded_at,
+  SELECT sequence_number, event_type, ${payload} AS payload, metadata, recorded_at,
          transaction_id AS xid, (${SETTLED_SQL}) AS settled, ${hits} AS hits
   FROM ${t}
   WHERE ${conds.join(" AND ")}

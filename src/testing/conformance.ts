@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import {
   UnindexableContextError,
   UniqueViolationError,
+  UsageError,
   ValidationError,
   compareCursor,
   type Cursor,
   type EventStore,
   type Query,
+  type StatisticsStore,
   type StoreSchema,
 } from "../index.js";
 import { conformanceEvents, conformanceSchema, conformanceUpcastEvents, conformanceUpcastSchema } from "./schema.js";
@@ -497,7 +499,75 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
         r.events.map((e) => e.data),
         [{ value: "old" }, { value: "new" }],
       );
+      // `omit` names the CURRENT key: a payload the upcast reshapes is trimmed after the upcast too
+      const trimmed = await store.query({ types: ["Renamed"] }, { omit: ["value"] });
+      assert.deepEqual(
+        trimmed.events.map((e) => e.data),
+        [{}, {}],
+      );
     },
     conformanceUpcastSchema(),
   );
+
+  withStore("omit trims data keys of every returned record, never its identity; matching and the version see everything", async (store) => {
+    await store.append([openAccount("mary", "acc-1"), openAccount("bob", "acc-2")]);
+    await store.append([ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" }, { metadata: { actor: "m" } })]);
+    const full = await store.query({ scopes: { accountOpenedId: "acc-1" } });
+    const trimmed = await store.query({ scopes: { accountOpenedId: "acc-1" } }, { omit: ["owner", "amount", "notThere"] });
+    assert.deepEqual(
+      trimmed.events.map((e) => e.data),
+      [{}, {}],
+    );
+    assert.deepEqual(
+      trimmed.events.map((e) => e.id),
+      ["acc-1", full.events[1]!.id],
+    );
+    assert.deepEqual(trimmed.events[1]!.scopes, { accountOpenedId: "acc-1" });
+    assert.equal(trimmed.events[1]!.metadata.actor, "m");
+    assert.equal(trimmed.contextVersion, full.contextVersion);
+    assert.equal(trimmed.lastReturned, full.lastReturned);
+    assert.deepEqual(trimmed.byFilter[0]!.map((e) => e.sequence), full.events.map((e) => e.sequence));
+    // a `where` on an omitted key still matches: the predicate runs on the stored payload
+    const byOwner = await store.query({ types: ["AccountOpened"], where: [{ owner: "bob" }] }, { omit: ["owner"] });
+    assert.deepEqual(byOwner.events.map((e) => e.id), ["acc-2"]);
+    assert.deepEqual(byOwner.events[0]!.data, {});
+    // an untouched record is returned as is
+    const untouched = await store.query({ types: ["AccountOpened"] }, { omit: ["nope"] });
+    assert.deepEqual(untouched.events.map((e) => e.data), [{ owner: "mary" }, { owner: "bob" }]);
+    // identity is never trimmed
+    await assert.rejects(() => store.query({ types: ["AccountOpened"] }, { omit: ["scopes"] }), UsageError);
+    await assert.rejects(() => store.query({ types: ["AccountOpened"] }, { omit: ["accountOpenedId"] }), UsageError);
+    await assert.rejects(() => store.query({}, { omit: [""] }), UsageError);
+  });
+
+  withStore("statistics: count, bytes and last sequence per type, narrowed by a query, without a payload (optional capability)", async (store) => {
+    const s = store as EventStore & Partial<StatisticsStore>;
+    if (typeof s.statistics !== "function") return; // a conforming store may lack it
+    assert.deepEqual(await s.statistics(), []);
+    await store.append([openAccount("a", "acc-1"), openAccount("b", "acc-2")]);
+    await store.append([
+      ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" }),
+      ev.MoneyDeposited({ amount: 6 }, { accountOpenedId: "acc-2" }),
+      ev.MoneyDeposited({ amount: 7 }, { accountOpenedId: "acc-1" }),
+    ]);
+    const all = await s.statistics();
+    assert.deepEqual(
+      all.map((x) => [x.type, x.count, x.lastSequence]),
+      [
+        ["AccountOpened", 2, 2],
+        ["MoneyDeposited", 3, 5],
+      ],
+    );
+    assert.ok(all.every((x) => x.bytes > 0));
+    const one = await s.statistics({ scopes: { accountOpenedId: "acc-1" } });
+    assert.deepEqual(
+      one.map((x) => [x.type, x.count, x.lastSequence]),
+      [
+        ["AccountOpened", 1, 1],
+        ["MoneyDeposited", 2, 5],
+      ],
+    );
+    assert.deepEqual(await s.statistics({ types: [] }), []);
+    assert.deepEqual((await s.statistics([{ types: ["AccountOpened"] }, { types: ["AccountOpened"] }])).map((x) => x.count), [2]);
+  });
 }

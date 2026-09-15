@@ -1,6 +1,6 @@
 import { TenantMismatchError } from "./errors.js";
 import { filtersOf } from "./query.js";
-import type { AppendIfOutcome, AppendResult, ContextHandle, EventStore, Filter, NewEvent, Query, QueryOptions, QueryResult } from "./types.js";
+import type { AppendIfOutcome, AppendResult, ContextHandle, EventStore, Filter, NewEvent, Query, QueryOptions, QueryResult, StatisticsStore } from "./types.js";
 
 /** How the tenant is represented: as a scope key in every event's payload. */
 export interface TenantConfig {
@@ -20,7 +20,12 @@ export const PLATFORM_TENANT_ID = "00000000-0000-0000-0000-000000000000";
  *
  * `close()` on a view is a no-op: views share the underlying store, which the root api closes.
  */
-export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId: string, idKeyOf?: (type: string) => string): EventStore {
+export function scopedToTenant(
+  inner: EventStore & Partial<StatisticsStore>,
+  config: TenantConfig,
+  tenantId: string,
+  idKeyOf?: (type: string) => string,
+): EventStore & Partial<StatisticsStore> {
   const key = config.scopeKey;
   const narrow = (query: Query): Filter[] =>
     filtersOf(query).map((f) => {
@@ -58,7 +63,7 @@ export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId
       }
       return { ...e, scopes: { ...(e.scopes ?? {}), [key]: tenantId } };
     });
-  return {
+  const view: EventStore & Partial<StatisticsStore> = {
     query(query: Query, options?: QueryOptions): Promise<QueryResult> {
       return inner.query(narrow(query), options);
     },
@@ -72,4 +77,7 @@ export function scopedToTenant(inner: EventStore, config: TenantConfig, tenantId
       return Promise.resolve();
     },
   };
+  // statistics narrow like any read
+  if (typeof inner.statistics === "function") view.statistics = (query: Query = {}) => inner.statistics!(narrow(query));
+  return view;
 }

@@ -192,6 +192,37 @@ describe("memory store + api", () => {
     expect(read.ctx.version).toBe(1);
   });
 
+  it("es.read(registry, query, { omit }) trims typed data; a projection never reaches a decision", async () => {
+    const es = newApi().forTenant(WS);
+    const drafted = articles.ArticleDrafted({ title: "R", slug: "r" }, { workspaceProvisionedId: WS });
+    await es.append([drafted, articles.ArticleContentEdited({ body: "x".repeat(100) }, { articleDraftedId: drafted.id })]);
+    const read = await es.read(articles, undefined, { omit: ["body"] });
+    const edited = read.events[1]!;
+    if (edited.type === "ArticleContentEdited") {
+      // @ts-expect-error `body` was omitted — the type says so
+      void edited.data.body;
+      expect(edited.data).toEqual({});
+      expect(edited.scopes.articleDraftedId).toBe(drafted.id);
+    }
+    const first = read.events[0]!;
+    if (first.type === "ArticleDrafted") expect(first.data.title).toBe("R");
+    // a key the schema does not know is ignored by the trimmed re-validation
+    expect((await es.read(articles, undefined, { omit: ["nope"] })).events).toHaveLength(2);
+    // the full read still re-validates completely
+    const full = await es.read(articles);
+    if (full.events[1]!.type === "ArticleContentEdited") expect(full.events[1]!.data.body).toHaveLength(100);
+  });
+
+  it("es.statistics() narrows to the tenant view", async () => {
+    const api = newApi();
+    const ws1 = api.forTenant(WS);
+    const ws2 = api.forTenant("ws-2");
+    await ws1.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
+    await ws2.append([articles.ArticleDrafted({ title: "B", slug: "b" }, { workspaceProvisionedId: "ws-2" })]);
+    expect((await ws1.statistics()).map((s) => [s.type, s.count])).toEqual([["ArticleDrafted", 1]]);
+    expect((await api.statistics()).map((s) => [s.type, s.count])).toEqual([["ArticleDrafted", 2]]);
+  });
+
   it("close() never connects a store that was never used", async () => {
     let created = 0;
     const api = createEventStore({ store: (schema) => (created++, new MemoryStore({ schema })) });

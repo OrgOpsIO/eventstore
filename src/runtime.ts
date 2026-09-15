@@ -14,7 +14,9 @@ import type {
   Query,
   QueryOptions,
   QueryResult,
+  StatisticsStore,
   StoreSchema,
+  TypeStatistics,
 } from "./types.js";
 
 /**
@@ -61,7 +63,16 @@ export interface EventStoreApi extends EventStore {
    * A typed read: every record narrowed to the registry's union and re-validated through
    * `$parse`. `query` defaults to `registry.$filter()`; a record of an undeclared type throws.
    */
-  read<D extends Definitions>(registry: EventRegistry<D>, query?: Query, options?: QueryOptions): Promise<QueryResult<RecordedEventOf<D>>>;
+  read<D extends Definitions, K extends string = never>(
+    registry: EventRegistry<D>,
+    query?: Query,
+    options?: QueryOptions & { readonly omit?: readonly K[] },
+  ): Promise<QueryResult<RecordedEventOf<D, keyof D & string, K>>>;
+  /**
+   * Count, stored bytes and last sequence per event type — no payload is fetched. On a tenant
+   * view narrowed to the tenant. Throws `UsageError` on a store without the capability.
+   */
+  statistics(query?: Query): Promise<readonly TypeStatistics[]>;
   /** Run a CCC command: read → decide → `appendIf`, retrying on conflict. */
   command<R = void>(spec: RawCommandSpec<R>): Promise<CommandOutcome<R>>;
   command<S, R = void>(spec: CommandSpec<S, R>): Promise<CommandOutcome<R>>;
@@ -155,14 +166,19 @@ function buildApi(parts: ApiParts): EventStoreApi {
     async query(query: Query, options?: QueryOptions): Promise<QueryResult> {
       return (await view()).query(query, options);
     },
-    async read(registry, query, options) {
+    read: (async (registry: EventRegistry<Definitions>, query?: Query, options?: QueryOptions) => {
       const result = await (await view()).query(query ?? registry.$filter(), options);
-      const parsed = new Map(result.events.map((e) => [e, registry.$parse(e)] as const));
+      const parsed = new Map(result.events.map((e) => [e, registry.$parse(e, options?.omit)] as const));
       return {
         ...result,
         events: result.events.map((e) => parsed.get(e)!),
         byFilter: result.byFilter.map((list) => list.map((e) => parsed.get(e)!)),
       };
+    }) as EventStoreApi["read"],
+    async statistics(query) {
+      const v = (await view()) as EventStore & Partial<StatisticsStore>;
+      if (typeof v.statistics !== "function") throw new UsageError("eventstore: this store has no statistics() (the memory and Postgres stores do)");
+      return v.statistics(query);
     },
     async append(events: readonly NewEvent[]): Promise<AppendResult> {
       return (await view()).append(events);
@@ -306,6 +322,7 @@ export const es: EventStoreApi = {
     return current().schema;
   },
   query: (q, o) => current().query(q, o),
+  statistics: (q) => current().statistics(q),
   read: (r, q, o) => current().read(r, q, o),
   append: (e) => current().append(e),
   appendIf: (e, c) => current().appendIf(e, c),

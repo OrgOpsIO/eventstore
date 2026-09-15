@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 (2026-09-15)
+
+Two things applications had to do with raw SQL beside the package, now inside it. Both are reads; the store stays append-only. Deliberately still outside: cross-tenant directory functions and tenant erasure.
+
+- **`omit`** on `query`/`read`: top-level `data` keys every returned record leaves out — a projection for lists that do not need a large field (an article body). The Postgres store strips them in SQL (`payload - '{…}'`), so the field never travels. `where` and `contextVersion` see the full record; `scopes` and the own id key are refused; `es.read` re-validates without the omitted keys and types `data` as `Omit<…>`. Decisions (`command`, `context`) have no `omit`.
+- **`statistics(query?)`** on both stores, on the api and on tenant views (narrowed): count, stored bytes (`pg_column_size`, no payload fetched) and last sequence per event type.
+- New optional capability interface `StatisticsStore`; `EventStore` is unchanged, so custom stores keep compiling. `TypeStatistics` and `TrimmedDataOf` exported.
+- Operations: a recipe for erasing a tenant (the one write the package deliberately does not offer).
+
 ## 0.1.1 (2026-09-08)
 
 - A declared scope key may be `null` in `data`: it then simply is not a scope (`es_scope` yields NULL, the memory store ignores it). Previously the envelope check rejected it; existing stores that write `categoryDefinedId: null` for "no category" need no change.

@@ -5,7 +5,7 @@ import type { Filter, NewEvent, Query, QueryOptions, RecordedEvent, StoreSchema 
 export const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_CONTAINS_DEPTH = 64;
 /** Caps on query shapes: every scope value becomes an advisory lock and an index probe. */
-export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 256, wherePredicates: 64 } as const;
+export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 256, wherePredicates: 64, omitKeys: 64 } as const;
 
 /** Normalise a query into a non-empty list of filters with canonical shapes. */
 export function filtersOf(query: Query): Filter[] {
@@ -62,7 +62,28 @@ export function normaliseOptions(options: QueryOptions = {}): QueryOptions {
   if (options.order !== undefined && options.order !== "asc" && options.order !== "desc") {
     throw new Error(`eventstore: \`order\` must be "asc" or "desc"`);
   }
+  if (options.omit !== undefined) {
+    if (!Array.isArray(options.omit)) throw new UsageError("eventstore: `omit` must be an array of data keys");
+    if (options.omit.length > QUERY_LIMITS.omitKeys) throw new UsageError(`eventstore: \`omit\` may name at most ${QUERY_LIMITS.omitKeys} keys`);
+    for (const key of options.omit) {
+      if (typeof key !== "string" || key === "") throw new UsageError("eventstore: `omit` keys must be non-empty strings");
+      if (key === "scopes") throw new UsageError("eventstore: `omit` cannot drop `scopes` — an event's back-links are its identity");
+    }
+  }
   return options;
+}
+
+/** Refuse an `omit` list that would drop the event's own id (identity is never trimmed). */
+export function assertOmittable(omit: readonly string[], idKey: string, type: string): void {
+  if (omit.includes(idKey)) throw new UsageError(`eventstore: \`omit\` cannot drop "${idKey}", the own id key of ${type}`);
+}
+
+/** `data` without the omitted top-level keys (the same object when none of them is present). */
+export function trimData(data: Record<string, unknown>, omit: readonly string[]): Record<string, unknown> {
+  if (!omit.some((k) => Object.prototype.hasOwnProperty.call(data, k))) return data;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(data)) if (!omit.includes(k)) out[k] = v;
+  return out;
 }
 
 /** Stable string key of a query — used for context caches and lock derivation. */

@@ -13,7 +13,9 @@ export type {
   QueryResult,
   RecordedEvent,
   Scopes,
+  StatisticsStore,
   StoreSchema,
+  TypeStatistics,
 } from "./types.js";
 export {
   ConflictError,
@@ -47,6 +49,7 @@ export type {
   RegistryFilter,
   RegistryLike,
   SchemaOptions,
+  TrimmedDataOf,
 } from "./registry.js";
 export { MemoryStore, cursorOf, isLiveStore } from "./memory.js";
 export type { AppendedListener, LiveStore, MemoryStoreOptions } from "./memory.js";

@@ -1,6 +1,7 @@
 import { UniqueViolationError } from "./errors.js";
 import { uuidv7 } from "./ids.js";
 import {
+  assertOmittable,
   compareCursor,
   conditionLockKeys,
   filtersOf,
@@ -8,6 +9,7 @@ import {
   matchesFilter,
   normaliseOptions,
   toPayload,
+  trimData,
   uniquePathSegments,
   valueAtPath,
 } from "./query.js";
@@ -24,7 +26,9 @@ import type {
   QueryOptions,
   QueryResult,
   RecordedEvent,
+  StatisticsStore,
   StoreSchema,
+  TypeStatistics,
 } from "./types.js";
 
 /** Called with the records of one append batch. */
@@ -77,7 +81,7 @@ interface Row {
  * not O(store). Every candidate is still verified with the full filter predicate, so the
  * index can only speed things up, never change an answer.
  */
-export class MemoryStore implements EventStore, LiveStore {
+export class MemoryStore implements EventStore, LiveStore, StatisticsStore {
   readonly schema: StoreSchema;
   private readonly clock: () => Date;
   private readonly rows: Row[] = [];
@@ -120,8 +124,10 @@ export class MemoryStore implements EventStore, LiveStore {
       if (!matched.some(Boolean)) continue;
       if (record.sequence > contextVersion) contextVersion = record.sequence;
       if (this.visible(record, options)) {
-        visible.push(record);
-        hits.set(record, matched);
+        // matching and the version saw the full record; only what is returned is trimmed
+        const shown = options.omit ? this.trimmed(record, options.omit) : record;
+        visible.push(shown);
+        hits.set(shown, matched);
       }
     }
     let events = visible;
@@ -137,6 +143,30 @@ export class MemoryStore implements EventStore, LiveStore {
       ctx: { query, version: contextVersion },
       settledCursor: cursorOf(events),
     };
+  }
+
+  /** Count, JSON bytes and last sequence per type, over the records a query matches (all when none is given). */
+  async statistics(query: Query = {}): Promise<readonly TypeStatistics[]> {
+    const filters = filtersOf(query);
+    const byType = new Map<string, { count: number; bytes: number; lastSequence: number }>();
+    for (const index of this.candidates(filters)) {
+      const row = this.rows[index]!;
+      const record = this.toRecorded(row);
+      if (!filters.some((f) => matchesFilter(record, f, this.schema))) continue;
+      const entry = byType.get(row.type) ?? { count: 0, bytes: 0, lastSequence: 0 };
+      entry.count++;
+      entry.bytes += Buffer.byteLength(JSON.stringify(row.payload));
+      if (row.sequence > entry.lastSequence) entry.lastSequence = row.sequence;
+      byType.set(row.type, entry);
+    }
+    return [...byType.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([type, s]) => ({ type, ...s }));
+  }
+
+  /** The record without the omitted data keys; the own id key is refused. */
+  private trimmed(record: RecordedEvent, omit: readonly string[]): RecordedEvent {
+    assertOmittable(omit, this.idKeyOf(record.type), record.type);
+    const data = trimData(record.data as Record<string, unknown>, omit);
+    return data === record.data ? record : Object.freeze({ ...record, data: Object.freeze(data) });
   }
 
   /** Ascending row indices that could match any of the filters (superset; verified by the caller). */

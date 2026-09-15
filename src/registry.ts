@@ -52,9 +52,12 @@ export type NewEventOf<D extends Definitions, N extends keyof D & string = keyof
   [K in N]: NewEvent<K, DataOf<D[K]>, ScopesOf<D[K]>> & { readonly id: string; readonly scopes: ScopesOf<D[K]> };
 }[N];
 
-/** The union of recorded events of a registry (narrow on `type`). */
-export type RecordedEventOf<D extends Definitions, N extends keyof D & string = keyof D & string> = {
-  [K in N]: RecordedEvent<K, DataOf<D[K]>, ScopesOf<D[K]>>;
+/** The data of an event definition without the keys a read omitted (`es.read(…, { omit })`). */
+export type TrimmedDataOf<Def extends EventDefinition, Omitted extends string = never> = [Omitted] extends [never] ? DataOf<Def> : Omit<DataOf<Def>, Omitted>;
+
+/** The union of recorded events of a registry (narrow on `type`); `Omitted` names data keys a read left out. */
+export type RecordedEventOf<D extends Definitions, N extends keyof D & string = keyof D & string, Omitted extends string = never> = {
+  [K in N]: RecordedEvent<K, TrimmedDataOf<D[K], Omitted>, ScopesOf<D[K]>>;
 }[N];
 
 /** Every scope key any event of the registry declares. */
@@ -128,8 +131,12 @@ export type EventRegistry<D extends Definitions> = {
    * by accident and silently ignore the cached state.
    */
   $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>): (events: readonly RecordedEvent[], state?: undefined) => S;
-  /** Narrow a recorded event to this registry's union, re-validating its data against the schema. Throws for unknown types. */
-  $parse(event: RecordedEvent<string, unknown>): RecordedEventOf<D>;
+  /**
+   * Narrow a recorded event to this registry's union, re-validating its data against the schema.
+   * Throws for unknown types. With `omit` (the keys a read left out) an object schema is
+   * validated without those keys; a non-object schema is not re-validated.
+   */
+  $parse<K extends string = never>(event: RecordedEvent<string, unknown>, omit?: readonly K[]): RecordedEventOf<D, keyof D & string, K>;
   $is(event: RecordedEvent<string, unknown>): event is RecordedEventOf<D>;
   $idKey(type: keyof D & string): string;
   /** Validate a new event of this registry (schema + envelope rules). */
@@ -155,6 +162,37 @@ function zodIssues(issues: readonly { message: string; path: PropertyKey[]; code
  * const drafted = articles.ArticleDrafted({ title, slug }, { workspaceProvisionedId });   // drafted.id is a UUIDv7
  * ```
  */
+/** A Zod object schema, as far as `$parse` needs it: a `shape` and `omit()`. */
+interface ObjectLike extends ZodType {
+  readonly shape: Record<string, unknown>;
+  omit(mask: Record<string, true>): ZodType;
+}
+
+function isObjectLike(schema: ZodType): schema is ObjectLike {
+  const s = schema as Partial<ObjectLike>;
+  return typeof s.omit === "function" && s.shape !== null && typeof s.shape === "object";
+}
+
+/** Per data schema: omitted keys → the object schema without them; `null` when the schema is not an object. */
+const trimmedSchemas = new WeakMap<ZodType, Map<string, ZodType | null>>();
+
+function trimmedSchema(schema: ZodType, omit: readonly string[]): ZodType | null {
+  let byKeys = trimmedSchemas.get(schema);
+  if (!byKeys) trimmedSchemas.set(schema, (byKeys = new Map()));
+  const key = JSON.stringify([...new Set(omit)].sort());
+  let trimmed = byKeys.get(key);
+  if (trimmed === undefined) {
+    if (!isObjectLike(schema)) trimmed = null;
+    else {
+      const mask: Record<string, true> = {};
+      for (const k of omit) if (Object.prototype.hasOwnProperty.call(schema.shape, k)) mask[k] = true;
+      trimmed = Object.keys(mask).length > 0 ? schema.omit(mask) : schema;
+    }
+    byKeys.set(key, trimmed);
+  }
+  return trimmed;
+}
+
 export function defineEvents<const D extends Definitions>(defs: D): EventRegistry<D> {
   const types = Object.keys(defs) as (keyof D & string)[];
   for (const t of types) {
@@ -240,10 +278,12 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
       return (events: readonly RecordedEvent[]): S =>
         fold(events, typeof initial === "function" ? (initial as () => S)() : initial);
     },
-    $parse(event: RecordedEvent<string, unknown>) {
+    $parse(event: RecordedEvent<string, unknown>, omit?: readonly string[]) {
       const def = defs[event.type];
       if (!def) throw new UsageError(`eventstore: "${event.type}" is not declared in this registry`);
-      const parsed = def.data.safeParse(event.data);
+      const schema = omit && omit.length > 0 ? trimmedSchema(def.data, omit) : def.data;
+      if (!schema) return { ...event };
+      const parsed = schema.safeParse(event.data);
       if (!parsed.success) throw new ValidationError(event.type, zodIssues(parsed.error.issues));
       return { ...event, data: parsed.data };
     },

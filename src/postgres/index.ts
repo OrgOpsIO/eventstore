@@ -9,6 +9,7 @@ export {
   appendFunctionName,
   compileFilters,
   compileQuery,
+  compileStatistics,
   compileVersionSql,
   ddlStatements,
   leadingScopeKey,

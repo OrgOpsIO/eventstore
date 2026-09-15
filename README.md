@@ -133,7 +133,7 @@ A `unique` path becomes a partial unique index on the events table, scoped to th
 ## The store contract
 
 ```ts
-const read = await es.query(query, { after?, cursor?, settledOnly?, limit?, order? });
+const read = await es.query(query, { after?, cursor?, settledOnly?, limit?, order?, omit? });
 // read.events            matching records (sequence order; (transactionId, sequence) order with `cursor`/`settledOnly`)
 // read.byFilter          the same records grouped per filter, in the order of `events` (DCB-style multi-filter contexts)
 // read.contextVersion    highest sequence of ALL matching records — the guard. Never narrowed by `after`, `cursor`, `limit`.
@@ -149,6 +149,15 @@ await es.appendIfOrThrow(events, read.ctx);       // throws ConflictError (httpS
 `contextVersion` and `lastReturned` are two different numbers on purpose (CCC spec, Draft 0.1). Using the read cursor as the expected version silently defeats the guard; `read.ctx` exists so you never build the pair by hand.
 
 **One invariant every deployment must keep:** every writer goes through `append`/`appendIf`. A row inserted by anything else (a migration script, a second service, a DBA) takes no advisory lock, so a concurrent guard can miss it. If you must bulk-load, do it through the SDK's batch `append`.
+
+### Reads that leave a field out
+
+```ts
+const list = await es.read(articles, articles.$filter({ types: ["ArticleDrafted", "ArticleContentEdited"] }), { omit: ["body"] });
+list.events[0].data.body;   // compile error: omitted
+```
+
+`omit` names top-level `data` keys that every returned record leaves out — a projection for lists and overviews that do not need the large field. The Postgres store strips the keys in SQL (`payload - '{body}'`), so the field never travels; `where` and `contextVersion` still see the whole record. Identity is never trimmed: `scopes` and the event's own id key are refused with `UsageError`. `es.read` re-validates against the schema without the omitted keys and types `data` accordingly. Decisions have no `omit`: `command()` and `context()` read complete facts.
 
 ### Why `appendIf` is a PL/pgSQL function
 
@@ -192,6 +201,15 @@ const platform = es.forPlatform();       // accounts, registrations: the nil-UUI
 ```
 
 `forTenant(id)` is memoised: calling it per request returns the same view with its own context cache. `close()` on a view is a no-op; close the root api. Optionally `postgres: { rls: true }` installs a row-level-security policy on the same expression the index uses and binds every statement of a tenant view to `app.current_tenant` (needs a non-owner application role; see the Operations section).
+
+### Statistics
+
+```ts
+await es.forTenant(ws).statistics();                       // [{ type, count, bytes, lastSequence }, …] per event type
+await es.statistics(articles.$filter({ types: ["ArticleContentEdited"] }));
+```
+
+Count, stored bytes and last sequence per event type, narrowed by a query like any read and by the tenant on a tenant view. Postgres sums `pg_column_size(payload)` — the on-disk size, compressed where TOASTed — without fetching a payload; the memory store reports JSON text length. `statistics()` is an optional store capability (`StatisticsStore`); a custom store may lack it, and the api then throws `UsageError`. Deliberately not in the package: a cross-tenant directory ("whose account, token or key is this?") — under RLS that is a `SECURITY DEFINER` function of the application, owned and audited there.
 
 ## Subscriptions (`@orgops/eventstore/subscribe`)
 
@@ -253,6 +271,7 @@ Every error the store raises extends `EventStoreError` and carries `httpStatus` 
 - No read models in the core; indexes are not read models.
 - No `CREATE DATABASE` at runtime.
 - No DCB tags: scopes in the payload carry the same information, and the store indexes them.
+- No delete. The store is append-only; erasing a tenant is an operator's act with its own proof — see "Erasing a tenant" under Operations.
 
 ## Explicit instance
 
@@ -272,6 +291,7 @@ const store = createEventStore({ connection, events: [articles] });   // no glob
 - **`es_scope()`** is the expression every scope index, the tenant-keyed idempotency index and the RLS policy are built on. It is an inlinable `IMMUTABLE` SQL function, so the *inlined expression* is what the indexes store. The SDK fingerprints its body on the function and on every index built from it; when the installed body differs from what an index was built with, the installer refuses to continue and throws an error listing the exact statements (`DROP/CREATE INDEX CONCURRENTLY`, statistics, comments) — run them yourself, or pass `postgres: { rebuildScopeIndexes: true }` to rebuild inline during a maintenance window. With the inlined body a stale index is a performance problem (the planner stops matching it); with an opaque body it would be a correctness problem, which is why the gate exists.
 - **`upcast`** may reshape an event's `data` on read; the own id and the `scopes` object always come from the stored payload, because that is what the store indexed, locked and matched on.
 - **Roles for RLS.** The install runs as the table owner; the application connects as a non-owner role (`FORCE ROW LEVEL SECURITY` applies to everyone but a superuser). Tenant views bind `app.current_tenant` per transaction with `set_config(..., true)`, never session-wide, so pooled connections cannot leak a tenant.
+- **Erasing a tenant** (a right-to-erasure request, a closed workspace) is not an SDK call: the store is append-only, and deletion should stay a deliberate, logged act of the operator. The recipe: (1) stop the tenant's traffic; (2) as the table owner, `DELETE FROM events WHERE es_scope(payload, '<tenantKey>') = $1` — the tenant scope index makes it a range delete; under `rls` run it in a transaction with `set_config('app.current_tenant', $1, true)`; (3) `es.forTenant(id).invalidate()` in every process, or restart them — a context cache may still hold the folded state; (4) durable subscribers need nothing: cursors are `(transactionId, sequence)` positions, and gaps are ordinary; (5) idempotency keys and unique values of the tenant are free again — decide whether that is what you want; (6) record the proof as an event on the platform tenant (a `TenantErased` with the count from `statistics()` taken before the delete) — that is the Löschnachweis, and it is the only row about the tenant that remains.
 - **Timeouts.** The SDK sets `lock_timeout` (10 s), `statement_timeout` (30 s) and `idle_in_transaction_session_timeout` (30 s) per connection, so a stuck lock holder degrades to `TransientError` instead of a hang; tune them with `postgres: { timeouts: { lockMs, statementMs, idleInTransactionMs } }`. If you pass your own `pg.Pool` as `connection`, set them yourself — the SDK does not touch a pool it did not create, and `close()` leaves it open.
 - **Durability knobs.** Single-event appends are bound by commit durability: `synchronous_commit = off` (per session or transaction) gives +40–75 % on them and loses at most the last ~600 ms on a crash — acceptable for many event stores, never for money. Batches of 50 barely change (group commit already amortises fsync); at four writers the raw ceiling on our test box was ~200 000 events/s.
 - **Migrating an existing `events` table** (one with a `sequence` column and JSONB payloads in the same convention): rename `sequence` → `sequence_number`, add `metadata jsonb NOT NULL DEFAULT '{}'`, add `transaction_id xid8 NOT NULL DEFAULT pg_current_xact_id()` (backfill legacy rows with one low constant such as `'3'::xid8` so they sort before every future row), then run `printSchemaSql(es.schema, pg)` for functions and indexes (`CREATE INDEX … CONCURRENTLY` outside a transaction) and boot with `install: "none"`. Legacy rows without an own id read back as `id: "~<sequence>"`; a durable subscriber must start at `{ transactionId: "3", sequence: 0 }`, not `"now"`.

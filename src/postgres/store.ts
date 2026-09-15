@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from "pg";
 import { EventStoreError, PolicyViolationError, TransientError, UniqueViolationError, UsageError } from "../errors.js";
 import { uuidv7 } from "../ids.js";
 import {
+  assertOmittable,
   compareCursor,
   conditionLockKeys,
   eventLockKeys,
@@ -11,6 +12,7 @@ import {
   installLockKey,
   normaliseOptions,
   toPayload,
+  trimData,
 } from "../query.js";
 import type {
   AppendIfOutcome,
@@ -23,7 +25,9 @@ import type {
   QueryOptions,
   QueryResult,
   RecordedEvent,
+  StatisticsStore,
   StoreSchema,
+  TypeStatistics,
 } from "../types.js";
 import {
   APPEND_SIGNATURE,
@@ -35,6 +39,7 @@ import {
   appendFunctionFingerprint,
   appendFunctionName,
   compileQuery,
+  compileStatistics,
   ddlStatements,
   grantStatements,
   idempotencyIndexDdl,
@@ -132,6 +137,13 @@ interface Row {
   hits: boolean[] | null;
 }
 
+interface StatisticsRow {
+  event_type: string;
+  cnt: string;
+  bytes: string;
+  last_seq: string;
+}
+
 interface AppendRow {
   ok: boolean;
   actual: string;
@@ -159,7 +171,7 @@ export interface LockPlan {
  * The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v4`
  * for atomic conditional appends. Every statement is schema-qualified.
  */
-export class PostgresStore implements EventStore {
+export class PostgresStore implements EventStore, StatisticsStore {
   readonly schema: StoreSchema;
   readonly table: string;
   /** Postgres namespace of the table and functions. */
@@ -473,7 +485,7 @@ export class PostgresStore implements EventStore {
     let settledCursor: Cursor | null = null;
     for (const row of result.rows) {
       if (row.seq === null || row.event_type === null || row.payload === null) continue;
-      const event = this.toRecorded(row);
+      const event = this.toRecorded(row, options.omit);
       events.push(event);
       if (event.sequence > lastReturned) lastReturned = event.sequence;
       if (event.settled && (!settledCursor || compareCursor(event, settledCursor) > 0)) {
@@ -485,14 +497,17 @@ export class PostgresStore implements EventStore {
     return { events, byFilter, lastReturned, contextVersion, ctx: { query, version: contextVersion }, settledCursor };
   }
 
-  private toRecorded(row: Row): RecordedEvent {
+  private toRecorded(row: Row, omit?: readonly string[]): RecordedEvent {
     const type = row.event_type as string;
     const idKey = this.schema.idKeyOf(type);
+    if (omit) assertOmittable(omit, idKey, type);
     const raw = row.payload as Record<string, unknown>;
     // id and scopes come from the RAW payload — what es_scope() matched and locked on; only
     // `data` goes through `upcast` (an upcast may reshape data, never scope keys or the id)
     const { id, scopes } = fromPayload(raw, idKey);
-    const { data } = fromPayload(this.schema.upcast(type, raw), idKey);
+    const upcast = fromPayload(this.schema.upcast(type, raw), idKey);
+    // SQL already stripped the keys; trim again after `upcast` so a reshaped payload cannot bring one back
+    const data = omit ? trimData(upcast.data, omit) : upcast.data;
     const sequence = toSafeInt(row.seq as string);
     return {
       type,
@@ -505,6 +520,24 @@ export class PostgresStore implements EventStore {
       transactionId: String(row.xid),
       settled: row.settled === true,
     };
+  }
+
+  /** Count, stored bytes and last sequence per event type, over the rows a query matches — no payload is fetched. */
+  async statistics(query: Query = {}): Promise<readonly TypeStatistics[]> {
+    this.assertRlsSession();
+    await this.ensureInstalled();
+    return this.statisticsWith(this.pool, query, false);
+  }
+
+  private async statisticsWith(runner: Runner, query: Query, inTenantSession: boolean): Promise<readonly TypeStatistics[]> {
+    const compiled = compileStatistics(this.target, query);
+    let result: pg.QueryResult<StatisticsRow>;
+    try {
+      result = await runner.query<StatisticsRow>(compiled.sql, compiled.params);
+    } catch (err) {
+      throw this.translate(err, inTenantSession);
+    }
+    return result.rows.map((r) => ({ type: r.event_type, count: toSafeInt(r.cnt), bytes: toSafeInt(r.bytes), lastSequence: toSafeInt(r.last_seq) }));
   }
 
   async append(events: readonly NewEvent[]): Promise<AppendResult> {
@@ -626,11 +659,12 @@ FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb,
    * (`scopedToTenant`) for query narrowing and event stamping. Under `rls` this is also the
    * store to hand to `subscribe`/`on`: the root store refuses to be polled.
    */
-  withTenant(tenantId: string): EventStore {
+  withTenant(tenantId: string): EventStore & StatisticsStore {
     const inTenant = <T>(fn: (runner: Runner) => Promise<T>): Promise<T> =>
       this.ensureInstalled().then(() => withTenantSession(this.pool, tenantId, (client) => fn(client)));
     return {
       query: (query, options = {}) => inTenant((r) => this.queryWith(r, query, options, true)),
+      statistics: (query = {}) => inTenant((r) => this.statisticsWith(r, query, true)),
       append: async (events) => {
         const outcome = await inTenant((r) => this.writeWith(r, events, null, true));
         if (!outcome.ok) throw new EventStoreError("eventstore/postgres: unconditional append reported a conflict");

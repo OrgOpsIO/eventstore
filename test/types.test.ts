@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   MemoryStore,
   buildSchema,
+  createEventStore,
   defineEvents,
   type Fold,
   type NewEventOf,
@@ -102,6 +103,21 @@ describe("types", () => {
     void narrowing;
     type New = NewEventOf<Defs, "ArticleArchived">;
     expectTypeOf<New["scopes"]["articleDraftedId"]>().toEqualTypeOf<string>();
+  });
+
+  it("read with omit trims the data type per event; without omit the union is unchanged", async () => {
+    const api = createEventStore({ events: [articles], store: new MemoryStore({ schema: buildSchema([articles]) }) });
+    await api.append([articles.ArticleDrafted({ title: "t", slug: "s" }, { workspaceProvisionedId: "w" })]);
+    const trimmed = await api.read(articles, undefined, { omit: ["slug"] });
+    const e = trimmed.events[0]!;
+    if (e.type === "ArticleDrafted") {
+      expectTypeOf(e.data).toEqualTypeOf<{ title: string }>();
+      expectTypeOf(e.scopes.workspaceProvisionedId).toEqualTypeOf<string>();
+    }
+    if (e.type === "Pinged") expectTypeOf(e.data).toEqualTypeOf<{ n: number }>();
+    const full = await api.read(articles);
+    expectTypeOf(full.events[0]!).toEqualTypeOf<RecordedEventOf<Defs>>();
+    expectTypeOf(articles.$parse(full.events[0]!, ["title"])).toEqualTypeOf<RecordedEventOf<Defs, keyof Defs, "title">>();
   });
 
   it("query results carry a ctx handle that appendIf accepts; registries are RegistryLike", async () => {

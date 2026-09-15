@@ -104,6 +104,14 @@ export interface QueryOptions {
   readonly limit?: number;
   /** Ascending (default) or descending. */
   readonly order?: "asc" | "desc";
+  /**
+   * Top-level `data` keys to leave out of every returned record — a projection for reads that
+   * do not need a large field (an article body, a document). The Postgres store strips them in
+   * SQL, before the rows travel. Identity is never trimmed: `scopes` is rejected, and so is an
+   * event's own id key. `where` and `contextVersion` still see the full record. For reads only:
+   * a decision (`command()`, `context()`) needs complete facts and has no `omit`.
+   */
+  readonly omit?: readonly string[];
 }
 
 /**
@@ -157,6 +165,24 @@ export interface Conflict {
 export type AppendIfOutcome =
   | { readonly ok: true; readonly appended: AppendResult }
   | { readonly ok: false; readonly conflict: Conflict };
+
+/** Count and stored size of one event type (see `StatisticsStore`). */
+export interface TypeStatistics {
+  readonly type: string;
+  readonly count: number;
+  /**
+   * Bytes of the stored payloads. Postgres: the on-disk size (`pg_column_size`, compressed when
+   * TOASTed) — no payload is fetched. Memory store: the JSON text length. The two differ.
+   */
+  readonly bytes: number;
+  /** Highest sequence among the counted records. */
+  readonly lastSequence: number;
+}
+
+/** Optional store capability: per-type count and size without fetching a payload. Narrowed by a query when given. */
+export interface StatisticsStore {
+  statistics(query?: Query): Promise<readonly TypeStatistics[]>;
+}
 
 /** The store contract. Both the memory store and the Postgres store implement exactly this. */
 export interface EventStore {
