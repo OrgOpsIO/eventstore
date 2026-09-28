@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 (2026-09-28)
+
+Two things a non-owner role under row-level security paid for on every read.
+
+- **`LEAKPROOF` for the scope indexes under `rls`**: the installer marks `jsonb_typeof`, `jsonb_object_field` and `jsonb_object_field_text` `LEAKPROOF` when it runs as a superuser, otherwise it records a warning with the statements (`warnings()`). Without them Postgres may not use a scope index as an index condition for a non-owner role and filters every scope but the tenant over the whole tenant. New: `SCOPE_BUILTIN_FUNCTIONS`, `scopeLeakproofStatements()`, `SCOPE_LEAKPROOF_MISSING_SQL`; `printSchemaSql({ rls: true })` lists the statements.
+- **`scopeStatistics`** (installer) and `DdlOptions.scopeStatistics` (static DDL): statistics objects only for the keys that need them. Every object costs planning time in every statement on the table; `{ minIndexRows, exclude }` keeps them where the scope index holds at least that many rows (`DEFAULT_SCOPE_STATISTICS_MIN_ROWS` = 1 000, measured) and drops the others. New: `scopeStatisticsKeys()`, `scopeIndexRowsSql()`; `scopeRebuildStatements()` takes the chosen keys. Default unchanged (`"all"`).
+
 ## 0.2.1 (2026-09-28)
 
 - **`invalidate()` without a query released nothing from the process-wide budget.** It cleared the view's entries but left their bytes in `CacheBudget` as ghosts. Once a ghost was the oldest entry and the budget was exceeded, `CacheBudget.touch` evicted it again and again without freeing anything — a synchronous endless loop that blocked the event loop for every tenant. Affected: every `invalidate()` on a view or on the api, and the eviction of a tenant view from the `maxTenantViews` LRU. Now `invalidate()` releases each entry, and the budget drops a token itself when its cache no longer holds the entry.
