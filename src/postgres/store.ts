@@ -184,7 +184,7 @@ export interface LockPlan {
 }
 
 /**
- * The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v4`
+ * The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v5`
  * for atomic conditional appends. Every statement is schema-qualified.
  */
 export class PostgresStore implements EventStore, StatisticsStore {

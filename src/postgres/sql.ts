@@ -14,7 +14,7 @@
  *   known inputs. A body that differs is never applied silently: the installer throws the
  *   exact statements to run (`CREATE INDEX CONCURRENTLY`, statistics, comment) or rebuilds
  *   inline when `rebuildScopeIndexes: true` is passed.
- * - `es_append_if_v4(...)` — the conditional append (locks → fresh-snapshot version check →
+ * - `es_append_if_v5(...)` — the conditional append (locks → fresh-snapshot version check →
  *   insert) in one round trip. `SECURITY INVOKER`, `search_path` pinned, `EXECUTE` revoked
  *   from `PUBLIC` and granted to the installing role plus `grantExecuteTo`. Requires READ
  *   COMMITTED (`ES001` otherwise) and a well-formed lock plan (`ES002` otherwise). The version
@@ -71,12 +71,12 @@
  * in 50-event batches at c=4 on the bench machine — batch when you can.
  */
 import { createHash } from "node:crypto";
-import { filtersOf, uniquePathSegments } from "../query.js";
-import type { Filter, Query, QueryOptions, StoreSchema } from "../types.js";
+import { filtersOf, negationsOf, uniquePathSegments } from "../query.js";
+import type { Filter, NegatedFilter, Query, QueryOptions, StoreSchema } from "../types.js";
 
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-export const APPEND_FUNCTION_VERSION = 4;
+export const APPEND_FUNCTION_VERSION = 5;
 
 /** Argument types of the current append function, for GRANT/REVOKE/COMMENT statements. */
 export const APPEND_SIGNATURE = "(bigint[], boolean[], bigint, boolean, jsonb, bigint, text[], jsonb[], jsonb[])";
@@ -147,7 +147,7 @@ export function appendFunctionBaseName(table: string): string {
   return table === "events" ? "es_append_if" : indexName(table, "append", "if").replace(/^es_/, "es_fn_");
 }
 
-/** Versioned name of the append function: `es_append_if_v4` for `events`, `es_fn_<table>_append_if_v4` otherwise. */
+/** Versioned name of the append function: `es_append_if_v5` for `events`, `es_fn_<table>_append_if_v5` otherwise. */
 export function appendFunctionName(table: string, version: number = APPEND_FUNCTION_VERSION): string {
   return version === 1 ? appendFunctionBaseName(table) : `${appendFunctionBaseName(table)}_v${version}`;
 }
@@ -506,6 +506,8 @@ DECLARE
   v_where jsonb[];
   v_sql text;
   v_pair record;
+  v_neg jsonb;
+  v_parts text[];
   v_first bigint;
   v_last bigint;
   v_count integer;
@@ -567,6 +569,30 @@ BEGIN
         END IF;
         IF v_where IS NOT NULL THEN
           v_sql := v_sql || format(' AND payload @> ANY(%L::jsonb[])', v_where);
+        END IF;
+        -- the filter's negations: a record matching one is left out; a scope it lacks is NULL, which keeps it in
+        IF jsonb_typeof(v_branch -> 'not') = 'array' THEN
+          FOR v_neg IN SELECT value FROM jsonb_array_elements(v_branch -> 'not') LOOP
+            v_parts := ARRAY[]::text[];
+            IF jsonb_typeof(v_neg -> 'types') = 'array' THEN
+              v_parts := v_parts || format('event_type = ANY(%L::text[])', ARRAY(SELECT jsonb_array_elements_text(v_neg -> 'types')));
+            END IF;
+            IF jsonb_typeof(v_neg -> 'scopes') = 'object' THEN
+              FOR v_pair IN SELECT key AS k, ARRAY(SELECT jsonb_array_elements_text(value)) AS vals FROM jsonb_each(v_neg -> 'scopes') LOOP
+                IF v_pair.k !~ '^[A-Za-z_][A-Za-z0-9_]*$' THEN
+                  RAISE EXCEPTION USING ERRCODE = 'ES002', MESSAGE = 'es_append_if: malformed version spec (scope key)';
+                END IF;
+                v_parts := v_parts || format('${scope}(payload, %L) = ANY(%L::text[])', v_pair.k, v_pair.vals);
+              END LOOP;
+            END IF;
+            IF jsonb_typeof(v_neg -> 'where') = 'array' THEN
+              v_parts := v_parts || format('payload @> ANY(%L::jsonb[])', ARRAY(SELECT jsonb_array_elements(v_neg -> 'where')));
+            END IF;
+            IF coalesce(array_length(v_parts, 1), 0) = 0 THEN
+              RAISE EXCEPTION USING ERRCODE = 'ES002', MESSAGE = 'es_append_if: malformed version spec (empty negation)';
+            END IF;
+            v_sql := v_sql || ' AND NOT coalesce((' || array_to_string(v_parts, ' AND ') || '), false)';
+          END LOOP;
         END IF;
         EXECUTE v_sql INTO v_branch_max;
         v_actual := greatest(v_actual, coalesce(v_branch_max, 0));
@@ -655,6 +681,11 @@ function compileFilter(filter: Filter, text: (v: string) => string, json: (v: un
   if (filter.where && filter.where.length > 0) {
     parts.push(`(${filter.where.map((w) => `payload @> ${json(w)}::jsonb`).join(" OR ")})`);
   }
+  for (const negated of negationsOf(filter)) {
+    const inner = compileFilter(negated, text, json, scope);
+    // a scope the record lacks is NULL, not false: COALESCE keeps such a record in
+    if (inner !== "FALSE") parts.push(`NOT COALESCE((${inner}), false)`);
+  }
   return parts.length > 0 ? parts.join(" AND ") : "TRUE";
 }
 
@@ -685,6 +716,8 @@ export interface VersionBranch {
   readonly types: readonly string[] | null;
   readonly scopes: Readonly<Record<string, readonly string[]>> | null;
   readonly where: readonly Readonly<Record<string, unknown>>[] | null;
+  /** Records matching any of these are left out of the branch (the filter's `not`). */
+  readonly not: readonly NegatedFilter[] | null;
 }
 
 /** The version spec of a query. Filters that can match nothing (`types: []`) contribute no branch. */
@@ -694,9 +727,11 @@ export function versionSpec(query: Query, schema?: Pick<StoreSchema, "tenantScop
     if (filter.types && filter.types.length === 0) continue;
     const types = filter.types ? [...filter.types] : null;
     const where = filter.where && filter.where.length > 0 ? filter.where.map((w) => ({ ...w })) : null;
+    const negated = negationsOf(filter);
+    const not = negated.length > 0 ? negated.map((n) => ({ ...n })) : null;
     const leading = leadingScopeKey(filter, schema?.tenantScopeKey);
     if (leading === undefined) {
-      branches.push({ key: null, values: [], types, scopes: null, where });
+      branches.push({ key: null, values: [], types, scopes: null, where, not });
       continue;
     }
     assertIdentifier(leading, "scope key");
@@ -708,7 +743,7 @@ export function versionSpec(query: Query, schema?: Pick<StoreSchema, "tenantScop
       assertIdentifier(k, "scope key");
       rest[k] = typeof v === "string" ? [v] : [...v];
     }
-    branches.push({ key: leading, values, types, scopes: Object.keys(rest).length > 0 ? rest : null, where });
+    branches.push({ key: leading, values, types, scopes: Object.keys(rest).length > 0 ? rest : null, where, not });
   }
   return branches;
 }
@@ -723,6 +758,7 @@ export function compileVersionSql(
   query: Query,
   collector: ParamCollector = createParamCollector(),
   schema?: Pick<StoreSchema, "tenantScopeKey">,
+  until?: number,
 ): { sql: string; texts: string[]; jsons: string[] } {
   const target = targetOf(tableOrTarget);
   const t = tableRef(target);
@@ -736,14 +772,17 @@ export function compileVersionSql(
       ...(branch.types ? { types: branch.types } : {}),
       ...(branch.scopes ? { scopes: branch.scopes } : {}),
       ...(branch.where ? { where: branch.where } : {}),
+      ...(branch.not ? { not: branch.not } : {}),
     };
+    // `until` (a view of the past) caps the version; the backward index scan still applies
+    const cap = until !== undefined ? ` AND sequence_number <= ${text(String(until))}::bigint` : "";
     if (branch.key === null) {
-      branches.push(`SELECT MAX(sequence_number) FROM ${t} WHERE ${compileFilter(rest, text, json, scope)}`);
+      branches.push(`SELECT MAX(sequence_number) FROM ${t} WHERE ${compileFilter(rest, text, json, scope)}${cap}`);
       continue;
     }
     for (const value of branch.values) {
       const restSql = compileFilter(rest, text, json, scope);
-      branches.push(`SELECT MAX(sequence_number) FROM ${t} WHERE ${scope}(payload, ${quoteLiteral(branch.key)}) = ${text(value)}${restSql === "TRUE" ? "" : ` AND ${restSql}`}`);
+      branches.push(`SELECT MAX(sequence_number) FROM ${t} WHERE ${scope}(payload, ${quoteLiteral(branch.key)}) = ${text(value)}${restSql === "TRUE" ? "" : ` AND ${restSql}`}${cap}`);
     }
   }
   if (branches.length === 0) return { sql: "SELECT 0::bigint", texts, jsons };
@@ -799,7 +838,7 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   const t = tableRef(target);
   const collector = createParamCollector();
   const compiled = compileFilters(query, collector, target.schemaName);
-  const version = compileVersionSql(target, query, collector, schema); // same collector: one parameter space
+  const version = compileVersionSql(target, query, collector, schema, options.until); // same collector: one parameter space
   const params: unknown[] = [collector.texts, collector.jsons];
   const param = (v: unknown): string => {
     params.push(v);
@@ -807,6 +846,7 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   };
   const conds: string[] = [`(${compiled.sql})`];
   if (options.after !== undefined) conds.push(`sequence_number > ${param(String(options.after))}::bigint`);
+  if (options.until !== undefined) conds.push(`sequence_number <= ${param(String(options.until))}::bigint`);
   if (options.settledOnly) conds.push(SETTLED_SQL);
   if (options.cursor) {
     conds.push(

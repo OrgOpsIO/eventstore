@@ -87,6 +87,20 @@ export interface EventStoreApi extends EventStore {
   forTenant(tenantId: string): EventStoreApi;
   /** The platform tenant (accounts, registrations, …). */
   forPlatform(): EventStoreApi;
+  /**
+   * A read-only view of the store as it was at event `sequence` (inclusive): every read —
+   * `query`, `read`, `context` — sees only records with `sequence <= sequence`, and so does
+   * their context version. Every write — `append`, `appendIf`, `appendIfOrThrow`, `command` —
+   * throws `UsageError`. Nested views only narrow (`asOf(n).asOf(m)` is `asOf(min(n, m))`);
+   * `forTenant` on a past view stays in the past. A past view has no context cache: live state
+   * never answers a past read, and past state is never kept as live.
+   *
+   * The cutoff is on `sequence`, the order folds use. A record with a lower sequence may still
+   * commit after one with a higher sequence; pass `settledOnly: true` to a read that must give
+   * the same answer every time. `store()` stays the unrestricted escape hatch it is on every
+   * view: the live, writable store underneath.
+   */
+  asOf(sequence: number): EventStoreApi;
   /** The underlying store (memory or Postgres), initialised. Not narrowed to a tenant. */
   store(): Promise<EventStore>;
   /** Forget this view's cached contexts (all, or one query). */
@@ -138,6 +152,29 @@ interface ApiParts {
   readonly views: Map<string, EventStoreApi>;
   /** Process-wide byte budget shared by every view's context cache. */
   readonly budget: CacheBudget;
+  /** Set on a past view (`asOf`): the inclusive sequence cutoff of every read; writes refused. */
+  readonly until?: number;
+}
+
+/** The store as it was at `until`: reads capped (never widened), writes refused. */
+function pastView(inner: EventStore, until: number): EventStore {
+  const refuse = (): never => {
+    throw new UsageError(`eventstore: this view reads the store as of sequence ${until} and is read-only — write through a live view`);
+  };
+  return {
+    query: async (query, options = {}) => {
+      const cap = Math.min(options.until ?? until, until);
+      const result = await inner.query(query, { ...options, until: cap });
+      // a store written before `until` existed ignores it and would answer with the live state
+      if (result.contextVersion > cap || result.events.some((e) => e.sequence > cap)) {
+        throw new UsageError("eventstore: this store does not support `until`, so it cannot serve asOf()");
+      }
+      return result;
+    },
+    append: async () => refuse(),
+    appendIf: async () => refuse(),
+    close: async () => undefined,
+  };
 }
 
 function buildApi(parts: ApiParts): EventStoreApi {
@@ -146,10 +183,13 @@ function buildApi(parts: ApiParts): EventStoreApi {
   const view = (): Promise<EventStore> => {
     if (!viewPromise) {
       viewPromise = parts.store().then((inner) => {
-        if (tenantId === undefined || !config.tenant) return inner;
-        // A store with tenant sessions (RLS) binds the session; the wrapper narrows and stamps.
-        const bound = hasTenantSessions(inner) ? inner.withTenant(tenantId) : inner;
-        return scopedToTenant(bound, config.tenant, tenantId, schema.idKeyOf);
+        let narrowed = inner;
+        if (tenantId !== undefined && config.tenant) {
+          // A store with tenant sessions (RLS) binds the session; the wrapper narrows and stamps.
+          const bound = hasTenantSessions(inner) ? inner.withTenant(tenantId) : inner;
+          narrowed = scopedToTenant(bound, config.tenant, tenantId, schema.idKeyOf);
+        }
+        return parts.until === undefined ? narrowed : pastView(narrowed, parts.until);
       });
     }
     return viewPromise;
@@ -157,8 +197,17 @@ function buildApi(parts: ApiParts): EventStoreApi {
   // One cache per view, allocated once: tenant views never share entries. `false` → `max: 0` (no caching, same code path).
   let cache: ContextCache | undefined;
   const cacheFor = async (): Promise<ContextCache> => {
-    if (!cache) cache = new ContextCache(await view(), { ...(config.contextCache === false ? { max: 0 } : (config.contextCache ?? {})), budget: parts.budget });
+    if (!cache) {
+      cache =
+        parts.until !== undefined
+          ? new ContextCache(await view(), { ...(config.contextCache === false ? {} : (config.contextCache ?? {})), max: 0 }) // a past view keeps nothing
+          : new ContextCache(await view(), { ...(config.contextCache === false ? { max: 0 } : (config.contextCache ?? {})), budget: parts.budget });
+    }
     return cache;
+  };
+
+  const readOnly = (): never => {
+    throw new UsageError(`eventstore: this view reads the store as of sequence ${parts.until} and is read-only — write through a live view`);
   };
 
   const api: EventStoreApi = {
@@ -176,6 +225,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       };
     }) as EventStoreApi["read"],
     async statistics(query) {
+      if (parts.until !== undefined) throw new UsageError("eventstore: statistics() counts the live store; a past view (asOf) has none");
       const v = (await view()) as EventStore & Partial<StatisticsStore>;
       if (typeof v.statistics !== "function") throw new UsageError("eventstore: this store has no statistics() (the memory and Postgres stores do)");
       return v.statistics(query);
@@ -192,6 +242,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       return outcome.appended;
     },
     command: (async (spec: CommandSpec<unknown, unknown>) => {
+      if (parts.until !== undefined) readOnly();
       return runCommand({ store: await view(), cache: await cacheFor(), clock: config.clock }, spec);
     }) as EventStoreApi["command"],
     async context(spec) {
@@ -200,6 +251,8 @@ function buildApi(parts: ApiParts): EventStoreApi {
     forTenant(id: string): EventStoreApi {
       if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");
       if (id === tenantId) return api;
+      // a past view is cheap and must never land in the shared memo of live views
+      if (parts.until !== undefined) return buildApi({ ...parts, tenantId: id });
       let existing = parts.views.get(id);
       if (existing) {
         parts.views.delete(id); // move to the most-recently-used end
@@ -219,12 +272,16 @@ function buildApi(parts: ApiParts): EventStoreApi {
     forPlatform(): EventStoreApi {
       return api.forTenant(config.tenant?.platformId ?? PLATFORM_TENANT_ID);
     },
+    asOf(sequence: number): EventStoreApi {
+      if (!Number.isSafeInteger(sequence) || sequence < 0) throw new UsageError(`eventstore: asOf() needs a non-negative safe integer, got ${String(sequence)}`);
+      return buildApi({ ...parts, until: parts.until === undefined ? sequence : Math.min(parts.until, sequence) });
+    },
     store: () => parts.store(),
     invalidate(query?: Query): void {
       cache?.invalidate(query);
     },
     async close(): Promise<void> {
-      if (tenantId === undefined && parts.created()) await (await parts.store()).close();
+      if (tenantId === undefined && parts.until === undefined && parts.created()) await (await parts.store()).close();
     },
   };
   return api;
@@ -331,6 +388,7 @@ export const es: EventStoreApi = {
   context: (s) => current().context(s),
   forTenant: (id) => current().forTenant(id),
   forPlatform: () => current().forPlatform(),
+  asOf: (n) => current().asOf(n),
   store: () => current().store(),
   invalidate: (q) => current().invalidate(q),
   close: () => current().close(),

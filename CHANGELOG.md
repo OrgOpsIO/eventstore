@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.0 (2026-09-28)
+
+Two gaps a consumer migration ran into: a guard over a whole scope that leaves some facts out, and reading the store as it was.
+
+- **`not` in a filter**: a filter or a list of filters whose matching records are left out of the rows and of the context version; `appendIf` re-checks exactly that. Locks come from the positive part only, a negated scope key need not be declared, a record lacking a negated key stays in. Nested `not`, an empty negation, and a `where` predicate inside `not` that is empty or holds `undefined` (it would turn into `{}` on the way to JSON and leave out the whole context, so its version would never move) are `UsageError`. New type `NegatedFilter`.
+- **`es.asOf(sequence)`**: a read-only view of the store as it was at that event (inclusive). Reads, `read` and `context` see only records up to it, and their context version is computed within the cutoff; `append`, `appendIf`, `appendIfOrThrow` and `command` throw `UsageError`; nested views only narrow; no context cache; `statistics()` refused; a custom store that ignores `until` is refused instead of answering with the live state. `store()` stays the unrestricted escape hatch. Underneath: `QueryOptions.until`, which — unlike `after` and `cursor` — caps the context version too.
+- **Postgres: the append function is now `es_append_if_v5`** (the version spec carries the negations). The installer creates it and drops `_v4`, as it did for every earlier version: a process still on 0.3 cannot append once a 0.4 process has installed. Roll out all processes together, or install by hand with `printSchemaSql()` and `install: "none"` and drop `_v4` after the rollout.
+
 ## 0.3.1 (2026-09-28)
 
 - **A tenant view refused an event that names its tenant in `scopes` when the data carried another value under the tenant key.** The append check looked at the flat data field before `scopes`, while every read (`es_scope`, the memory store) lets `scopes` win. An event recorded in the platform tenant that announces a new tenant with its key as a top-level field (`scopes.tenantId = "system"`, `data.tenantId = "<new>"`) threw `TenantMismatchError`. Now `scopes` decides when it names the view's tenant; without it the flat field still decides, fail-closed. Reads were never affected.

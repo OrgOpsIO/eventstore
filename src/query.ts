@@ -1,11 +1,11 @@
 import { fnv1a64, lockKeyOf } from "./ids.js";
 import { UnindexableContextError, UsageError, ValidationError } from "./errors.js";
-import type { Filter, NewEvent, Query, QueryOptions, RecordedEvent, StoreSchema } from "./types.js";
+import type { Filter, NegatedFilter, NewEvent, Query, QueryOptions, RecordedEvent, StoreSchema } from "./types.js";
 
 export const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_CONTAINS_DEPTH = 64;
 /** Caps on query shapes: every scope value becomes an advisory lock and an index probe. */
-export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 256, wherePredicates: 64, omitKeys: 64 } as const;
+export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 256, wherePredicates: 64, omitKeys: 64, negations: 64 } as const;
 
 /** Normalise a query into a non-empty list of filters with canonical shapes. */
 export function filtersOf(query: Query): Filter[] {
@@ -16,7 +16,7 @@ export function filtersOf(query: Query): Filter[] {
 }
 
 export function normaliseFilter(filter: Filter): Filter {
-  const out: { types?: string[]; scopes?: Record<string, string[]>; where?: Record<string, unknown>[] } = {};
+  const out: { types?: string[]; scopes?: Record<string, string[]>; where?: Record<string, unknown>[]; not?: NegatedFilter[] } = {};
   if (filter.types !== undefined) {
     // an empty list is a legitimate dynamic result and matches nothing
     out.types = [...new Set(filter.types)].sort();
@@ -42,13 +42,51 @@ export function normaliseFilter(filter: Filter): Filter {
     // the wire format is JSON: `undefined` keys vanish, Dates become strings, NaN becomes null
     out.where = filter.where.map((w) => JSON.parse(JSON.stringify(w)) as Record<string, unknown>);
   }
+  if (filter.not !== undefined) {
+    const raw = negationsOf(filter);
+    if (raw.length > QUERY_LIMITS.negations) throw new UsageError(`eventstore: a filter may have at most ${QUERY_LIMITS.negations} negations`);
+    const negated = raw.map((n) => {
+      if (n === null || typeof n !== "object" || Array.isArray(n)) throw new UsageError("eventstore: `not` takes a filter or a list of filters");
+      if ((n as Filter).not !== undefined) throw new UsageError("eventstore: `not` cannot be nested");
+      // A predicate that loses a key on the way to JSON (`{ jobId: undefined }` → `{}`) matches
+      // MORE records; inside a negation that leaves out more — up to the whole context, whose
+      // version then never moves and every stale guard commits. Refuse it instead.
+      for (const w of n.where ?? []) {
+        if (hasUndefined(w) || (w !== null && typeof w === "object" && Object.keys(w).length === 0)) {
+          throw new UsageError("eventstore: a `where` predicate inside `not` must not be empty or hold `undefined` — it would leave out every record");
+        }
+      }
+      const normalised = normaliseFilter(n);
+      // an empty negation would leave out every record — never what a guard means
+      if (Object.keys(normalised).length === 0) throw new UsageError("eventstore: a `not` filter must name types, scopes or where");
+      return normalised as NegatedFilter;
+    });
+    // canonical order, so equal queries share one cache key
+    const unique = [...new Map(negated.map((n) => [JSON.stringify(n), n] as const)).entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    if (unique.length > 0) out.not = unique.map(([, n]) => n);
+  }
   return out;
+}
+
+function hasUndefined(value: unknown, depth = 0): boolean {
+  if (value === undefined) return true;
+  if (value === null || typeof value !== "object" || depth > MAX_CONTAINS_DEPTH) return false;
+  return Object.values(value as Record<string, unknown>).some((v) => hasUndefined(v, depth + 1));
+}
+
+/** The negations of a filter as a list (a normalised filter already holds one). */
+export function negationsOf(filter: Filter): readonly NegatedFilter[] {
+  if (filter.not === undefined) return [];
+  return Array.isArray(filter.not) ? (filter.not as readonly NegatedFilter[]) : [filter.not as NegatedFilter];
 }
 
 /** Validate query options so both stores reject the same inputs. */
 export function normaliseOptions(options: QueryOptions = {}): QueryOptions {
   if (options.after !== undefined && !(Number.isSafeInteger(options.after) && options.after >= 0)) {
     throw new Error(`eventstore: \`after\` must be a non-negative safe integer, got ${String(options.after)}`);
+  }
+  if (options.until !== undefined && !(Number.isSafeInteger(options.until) && options.until >= 0)) {
+    throw new Error(`eventstore: \`until\` must be a non-negative safe integer, got ${String(options.until)}`);
   }
   if (options.limit !== undefined && !(Number.isSafeInteger(options.limit) && options.limit >= 0)) {
     throw new Error(`eventstore: \`limit\` must be a non-negative safe integer, got ${String(options.limit)}`);
@@ -192,6 +230,7 @@ export function matchesFilter(event: RecordedEvent<string, unknown>, filter: Fil
     const payload = toPayload({ ...event, data: event.data as Record<string, unknown> }, schema.idKeyOf(event.type));
     if (!filter.where.some((w) => contains(payload, w))) return false;
   }
+  if (negationsOf(filter).some((n) => matchesFilter(event, n, schema))) return false;
   return true;
 }
 

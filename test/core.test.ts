@@ -247,6 +247,77 @@ describe("memory store + api", () => {
     await expect(salted.append([articles.ArticleDrafted({ title: "S", slug: "s2" }, { workspaceProvisionedId: WS })])).rejects.toThrow(/lockSalt/);
   });
 
+  describe("asOf: a read-only view of the past", () => {
+    const fold = (events: readonly import("../src/index.js").RecordedEvent[], n: number) => n + events.length;
+    const setup = async () => {
+      const api = newApi();
+      const es = api.forTenant(WS);
+      const drafted = articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS });
+      const one = await es.append([drafted]);
+      const two = await es.append([articles.ArticleContentEdited({ body: "v1" }, { articleDraftedId: drafted.id! })]);
+      const three = await es.append([articles.ArticleContentEdited({ body: "v2" }, { articleDraftedId: drafted.id! })]);
+      return { api, es, query: articles.$scope("articleDraftedId", drafted.id!), seq: [one.last, two.last, three.last] as const };
+    };
+
+    it("sees records up to and including n, and computes the context version within the cutoff", async () => {
+      const { es, query, seq } = await setup();
+      const past = es.asOf(seq[1]);
+      const read = await past.query(query);
+      expect(read.events.map((e) => e.sequence)).toEqual([seq[0], seq[1]]);
+      expect(read.contextVersion).toBe(seq[1]);
+      expect((await past.read(articles, query)).events.map((e) => e.type)).toEqual(["ArticleDrafted", "ArticleContentEdited"]);
+      expect((await past.context({ query, fold, initial: 0 })).state).toBe(2);
+    });
+
+    it("nested views narrow and never widen; forTenant on a past view stays in the past", async () => {
+      const { api, es, query, seq } = await setup();
+      expect((await es.asOf(seq[1]).asOf(seq[2]).query(query)).events).toHaveLength(2);
+      expect((await es.asOf(seq[2]).asOf(seq[0]).query(query)).events).toHaveLength(1);
+      expect((await api.asOf(seq[0]).forTenant(WS).query(query)).events).toHaveLength(1);
+      // the past tenant view did not replace the memoised live one
+      expect((await api.forTenant(WS).query(query)).events).toHaveLength(3);
+    });
+
+    it("refuses every write path", async () => {
+      const { es, query, seq } = await setup();
+      const past = es.asOf(seq[2]);
+      const event = articles.ArticleArchived({}, { articleDraftedId: "x" });
+      const ctx = (await past.query(query)).ctx;
+      await expect(past.append([event])).rejects.toThrow(/read-only/);
+      await expect(past.appendIf([event], ctx)).rejects.toThrow(/read-only/);
+      await expect(past.appendIfOrThrow([event], ctx)).rejects.toThrow(/read-only/);
+      await expect(past.command({ context: query, decide: () => ({ events: [event] }) })).rejects.toThrow(/read-only/);
+      await expect(past.statistics()).rejects.toThrow(/asOf/);
+      expect(() => es.asOf(-1)).toThrow(/non-negative/);
+      expect((await es.query(query)).events).toHaveLength(3); // nothing was written
+    });
+
+    it("refuses to serve the past from a store that ignores `until`", async () => {
+      const memory = new MemoryStore({ schema: buildSchema([articles], { strict: true }) });
+      const legacy: import("../src/index.js").EventStore = {
+        query: (q, { until: _ignored, ...o } = {}) => memory.query(q, o), // a store written before 0.4
+        append: (e) => memory.append(e),
+        appendIf: (e, c) => memory.appendIf(e, c),
+        close: () => memory.close(),
+      };
+      const api = createEventStore({ events: [articles], strict: true, store: legacy });
+      const one = await api.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
+      await api.append([articles.ArticleDrafted({ title: "B", slug: "b" }, { workspaceProvisionedId: WS })]);
+      await expect(api.asOf(one.last).query(articles.$filter())).rejects.toThrow(/does not support `until`/);
+    });
+
+    it("does not share the context cache with live reads of the same query", async () => {
+      const { es, query, seq } = await setup();
+      expect((await es.context({ query, fold, initial: 0 })).state).toBe(3); // live, now cached
+      const past = await es.asOf(seq[0]).context({ query, fold, initial: 0 });
+      expect(past.state).toBe(1);
+      expect(past.cacheHit).toBe(false);
+      const live = await es.context({ query, fold, initial: 0 });
+      expect(live.state).toBe(3);
+      expect(live.cacheHit).toBe(true);
+    });
+  });
+
   it("an event naming this tenant in scopes appends there even when its data carries another value under the tenant key", async () => {
     const platform = defineEvents({
       TenantFounded: { data: z.object({ workspaceProvisionedId: z.string(), name: z.string() }), scopes: ["workspaceProvisionedId"] },

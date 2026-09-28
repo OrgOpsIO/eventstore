@@ -68,12 +68,20 @@ export interface RecordedEvent<T extends string = string, D = Record<string, unk
  * - `where`: the wire payload contains at least one of these objects (JSONB `@>`, OR).
  *   Predicates are sent as JSON: `undefined` keys vanish, `Date`s become ISO strings,
  *   `null` matches only a JSON `null`.
+ * - `not`: records matching this filter (or ANY of these filters) are left out — of the rows
+ *   and of the context version, so `appendIf` re-checks exactly what was read. A record that
+ *   lacks a negated scope key is kept. Locks come from the positive part only: a negation
+ *   never widens or narrows them, and a negated scope key need not be declared.
  */
 export interface Filter {
   readonly types?: readonly string[];
   readonly scopes?: Readonly<Record<string, string | readonly string[]>>;
   readonly where?: readonly Readonly<Record<string, unknown>>[];
+  readonly not?: NegatedFilter | readonly NegatedFilter[];
 }
+
+/** The part of a filter a `not` may name: one level, no nested `not`. It must constrain something. */
+export type NegatedFilter = Omit<Filter, "not">;
 
 /** One filter, or several filters combined with OR. */
 export type Query = Filter | readonly Filter[];
@@ -92,6 +100,14 @@ export interface QueryOptions {
    * durable consumers use `cursor` instead. Never narrows the context version.
    */
   readonly after?: number;
+  /**
+   * Inclusive upper bound on `sequence`: only records with `sequence <= until`. Unlike `after`
+   * and `cursor` it narrows the context version too — it reads the store as it was at event
+   * `until`, and that version is for reading only (see `EventStoreApi.asOf`). Records with a
+   * lower sequence can still commit later until every transaction below `until` has ended;
+   * combine with `settledOnly` for a stable answer.
+   */
+  readonly until?: number;
   /** Return only settled records (see `RecordedEvent.settled`). Orders by `(transactionId, sequence)`. */
   readonly settledOnly?: boolean;
   /**

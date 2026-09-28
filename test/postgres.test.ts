@@ -47,7 +47,7 @@ describe.skipIf(!url)("PostgresStore", () => {
     expect(ddl).toContain("CREATE TABLE IF NOT EXISTS");
     expect(ddl).toContain(scopeIndexName(TABLE, "accountOpenedId"));
     expect(ddl).toContain("es_fn_");
-    expect(ddl).toContain("_v4");
+    expect(ddl).toContain("_v5");
     expect(ddl).toContain("REVOKE EXECUTE");
     expect(ddl).toContain("SET search_path");
     // functions are fingerprinted; a second install replaces nothing

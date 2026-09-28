@@ -119,6 +119,8 @@ export class MemoryStore implements EventStore, LiveStore, StatisticsStore {
     const visible: RecordedEvent[] = [];
     let contextVersion = 0;
     for (const index of this.candidates(filters)) {
+      // `until` is a view of the past: it narrows the version as well as the rows
+      if (options.until !== undefined && this.rows[index]!.sequence > options.until) continue;
       const record = this.toRecorded(this.rows[index]!);
       const matched = filters.map((f) => matchesFilter(record, f, this.schema));
       if (!matched.some(Boolean)) continue;

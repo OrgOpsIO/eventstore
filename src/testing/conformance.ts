@@ -6,6 +6,8 @@ import {
   ValidationError,
   compareCursor,
   type Cursor,
+  type AppendIfOutcome,
+  type ContextHandle,
   type EventStore,
   type Query,
   type StatisticsStore,
@@ -569,5 +571,95 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     );
     assert.deepEqual(await s.statistics({ types: [] }), []);
     assert.deepEqual((await s.statistics([{ types: ["AccountOpened"] }, { types: ["AccountOpened"] }])).map((x) => x.count), [2]);
+  });
+
+  // ── not: "everything in this scope except …" ────────────────────────────────
+
+  const note = (text: string, scopes: Record<string, string>) => ({ type: "NoteAdded", data: { text }, scopes });
+
+  withStore("not leaves an excluded type out of the rows and the context version, and appendIf re-checks exactly that", async (store) => {
+    await store.append([openAccount("mary", "acc-1"), ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" })]);
+    const query: Query = { scopes: { accountOpenedId: "acc-1" }, not: { types: ["NoteAdded"] } };
+    const read = await store.query(query);
+    assert.deepEqual(read.events.map((e) => e.type), ["AccountOpened", "MoneyDeposited"]);
+    const noise = await store.append([note("usage", { accountOpenedId: "acc-1" })]);
+    const after = await store.query(query);
+    assert.equal(after.contextVersion, read.contextVersion, "an excluded append does not move the version");
+    assert.ok(noise.last > after.contextVersion);
+    const ok = await store.appendIf([ev.MoneyWithdrawn({ amount: 1 }, { accountOpenedId: "acc-1" })], read.ctx);
+    assert.equal(ok.ok, true, "a guard taken before an excluded append still succeeds");
+    const stale = await store.appendIf([ev.MoneyWithdrawn({ amount: 1 }, { accountOpenedId: "acc-1" })], read.ctx);
+    assert.equal(stale.ok, false, "a non-excluded append in the scope makes the same guard fail");
+  });
+
+  withStore("not on a scope: the job's own events do not conflict, another job's do, and records without the key stay in", async (store) => {
+    await store.append([openAccount("mary", "acc-1")]);
+    const mine: Query = { scopes: { accountOpenedId: "acc-1" }, not: { scopes: { jobStartedId: "job-1" } } };
+    const ctx = (await store.query(mine)).ctx;
+    await store.append([note("progress", { accountOpenedId: "acc-1", jobStartedId: "job-1" })]);
+    const own = await store.query(mine);
+    assert.deepEqual(own.events.map((e) => e.type), ["AccountOpened"], "a record lacking jobStartedId is kept, the job's own is left out");
+    assert.equal((await store.appendIf([note("done", { accountOpenedId: "acc-1", jobStartedId: "job-1" })], ctx)).ok, true);
+    const ctx2 = (await store.query(mine)).ctx;
+    await store.append([note("other", { accountOpenedId: "acc-1", jobStartedId: "job-2" })]);
+    assert.equal((await store.appendIf([note("done", { accountOpenedId: "acc-1", jobStartedId: "job-1" })], ctx2)).ok, false);
+  });
+
+  withStore("not with several filters leaves out a record matching any of them; each filter of a query carries its own", async (store) => {
+    await store.append([
+      openAccount("mary", "acc-1"),
+      note("usage", { accountOpenedId: "acc-1" }),
+      note("step", { accountOpenedId: "acc-1", jobStartedId: "job-1" }),
+      ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" }),
+    ]);
+    const both = await store.query({ scopes: { accountOpenedId: "acc-1" }, not: [{ types: ["NoteAdded"], where: [{ text: "usage" }] }, { scopes: { jobStartedId: "job-1" } }] });
+    assert.deepEqual(both.events.map((e) => e.type), ["AccountOpened", "MoneyDeposited"]);
+    const grouped = await store.query([{ types: ["AccountOpened"] }, { scopes: { accountOpenedId: "acc-1" }, not: { types: ["AccountOpened", "MoneyDeposited"] } }]);
+    assert.deepEqual(grouped.byFilter.map((list) => list.map((e) => e.data.text ?? e.type)), [["AccountOpened"], ["usage", "step"]]);
+    // a negation that can match nothing (`types: []`) leaves everything in
+    assert.equal((await store.query({ scopes: { accountOpenedId: "acc-1" }, not: { types: [] } })).events.length, 4);
+  });
+
+  withStore("not: locks come from the positive part — an unlockable positive part stays unlockable, a negated undeclared key is fine", async (store) => {
+    await assert.rejects(() => store.appendIf([openAccount("x")], { query: { types: ["AccountOpened"], not: { scopes: { accountOpenedId: "a" } } }, version: 0 }), UnindexableContextError);
+    const ok = await store.appendIf([openAccount("y")], { query: { scopes: { accountOpenedId: "acc-9" }, not: { scopes: { undeclaredKey: "v" } } }, version: 0 });
+    assert.equal(ok.ok, true);
+  });
+
+  withStore("not: concurrent excluded appends never make a guard fail, and a guarded write is never lost", async (store) => {
+    await store.append([openAccount("mary", "acc-1")]);
+    const query: Query = { scopes: { accountOpenedId: "acc-1" }, not: { types: ["NoteAdded"] } };
+    for (let round = 0; round < 5; round++) {
+      const ctx: ContextHandle = (await store.query(query)).ctx;
+      const [guarded]: [AppendIfOutcome, ...unknown[]] = await Promise.all([
+        store.appendIf([ev.MoneyDeposited({ amount: 1 }, { accountOpenedId: "acc-1" })], ctx),
+        store.append([note(`noise-${round}`, { accountOpenedId: "acc-1" })]),
+        store.append([note(`noise-${round}b`, { accountOpenedId: "acc-1" })]),
+      ]);
+      assert.equal(guarded.ok, true, `round ${round}: no false conflict`);
+    }
+    assert.equal((await store.query({ types: ["MoneyDeposited"], scopes: { accountOpenedId: "acc-1" } })).events.length, 5);
+  });
+
+  withStore("not rejects a nested not, an empty negation, and a where predicate that would match everything", async (store) => {
+    await assert.rejects(() => store.query({ scopes: { accountOpenedId: "a" }, not: { types: ["X"], not: { types: ["Y"] } } as never }), UsageError);
+    await assert.rejects(() => store.query({ scopes: { accountOpenedId: "a" }, not: {} }), UsageError);
+    // a predicate that turns into `{}` on the way to JSON would leave out the whole context: its version would never move
+    await assert.rejects(() => store.query({ scopes: { accountOpenedId: "a" }, not: { where: [{ jobId: undefined }] } }), UsageError);
+    await assert.rejects(() => store.query({ scopes: { accountOpenedId: "a" }, not: { where: [{}] } }), UsageError);
+    await assert.rejects(() => store.query({ scopes: { accountOpenedId: "a" }, not: { where: [{ scopes: { jobStartedId: undefined } }] } }), UsageError);
+  });
+
+  // ── until: the store as it was at event n ───────────────────────────────────
+
+  withStore("until caps rows and the context version at sequence n, inclusive", async (store) => {
+    const opened = await store.append([openAccount("mary", "acc-1")]);
+    const first = await store.append([ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" })]);
+    await store.append([ev.MoneyDeposited({ amount: 7 }, { accountOpenedId: "acc-1" })]);
+    const past = await store.query({ scopes: { accountOpenedId: "acc-1" } }, { until: first.last });
+    assert.deepEqual(past.events.map((e) => e.sequence), [opened.first, first.last], "events at n are visible, events after n are not");
+    assert.equal(past.contextVersion, first.last);
+    assert.equal((await store.query({ scopes: { accountOpenedId: "acc-1" } }, { until: 0 })).contextVersion, 0);
+    await assert.rejects(() => store.query({}, { until: -1 }));
   });
 }

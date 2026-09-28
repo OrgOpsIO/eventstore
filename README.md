@@ -133,7 +133,7 @@ A `unique` path becomes a partial unique index on the events table, scoped to th
 ## The store contract
 
 ```ts
-const read = await es.query(query, { after?, cursor?, settledOnly?, limit?, order?, omit? });
+const read = await es.query(query, { after?, until?, cursor?, settledOnly?, limit?, order?, omit? });
 // read.events            matching records (sequence order; (transactionId, sequence) order with `cursor`/`settledOnly`)
 // read.byFilter          the same records grouped per filter, in the order of `events` (DCB-style multi-filter contexts)
 // read.contextVersion    highest sequence of ALL matching records — the guard. Never narrowed by `after`, `cursor`, `limit`.
@@ -159,11 +159,35 @@ list.events[0].data.body;   // compile error: omitted
 
 `omit` names top-level `data` keys that every returned record leaves out — a projection for lists and overviews that do not need the large field. The Postgres store strips the keys in SQL (`payload - '{body}'`), so the field never travels; `where` and `contextVersion` still see the whole record. Identity is never trimmed: `scopes` and the event's own id key are refused with `UsageError`. `es.read` re-validates against the schema without the omitted keys and types `data` accordingly. Decisions have no `omit`: `command()` and `context()` read complete facts.
 
+### Everything in a scope except …
+
+```ts
+// a reader that has no use for the large usage records
+await es.query({ scopes: { documentCreatedId: id }, not: { types: ["ModelUsageRecorded"] } });
+
+// a long-running job's guard: its own progress events must not conflict with its final append
+const ctx = (await es.query({ scopes: { documentCreatedId: id }, not: [{ types: ["ModelUsageRecorded"] }, { scopes: { jobStartedId: job } }] })).ctx;
+```
+
+`not` takes a filter or a list of filters; a record that matches any of them is left out — of the rows **and** of the context version, so `appendIf` re-checks exactly what was read. That is why it beats a positive type list for a guard: a type added later is inside the guard until someone excludes it, instead of silently outside. A record that lacks a negated scope key stays in. Locks come from the positive part only (a negation never widens or narrows them), so the guard is as lockable as it was without `not`, and a negated scope key does not have to be declared. `not` cannot be nested; an empty negation is refused, and so is a `where` predicate inside it that is empty or holds `undefined` — `{ jobId: undefined }` would become `{}`, match every record and leave the guard with a version that never moves.
+
+### The store as it was at event n
+
+```ts
+const past = es.forTenant(t).asOf(sequence);   // read-only
+await past.query(q);                           // only records with sequence <= n; contextVersion within the cutoff
+await past.context({ query, fold, initial });  // the same fold code as live, over the past
+await past.append(events);                     // UsageError — and so do appendIf, appendIfOrThrow, command
+past.asOf(m);                                  // min(n, m): a nested view only narrows
+```
+
+For questions like "since which event has this rule been broken?": fold the store as it was at a handful of candidate events with the same code that reads it live. Underneath is `QueryOptions.until` (inclusive), which — unlike `after` and `cursor` — caps the context version as well. A past view has no context cache, so live state never answers a past read and past state is never kept as live; `forTenant` on a past view stays in the past, and `statistics()` is refused there. The cutoff is on `sequence`: a record with a lower sequence can still commit after `n` became visible, so a read that must give the same answer every time adds `settledOnly: true`.
+
 ### Why `appendIf` is a PL/pgSQL function
 
 The well-known single-statement CTE guard (`WITH context AS (SELECT MAX(...)) INSERT ... WHERE max = $expected`) is **not atomic** under Postgres' default isolation: the statement's snapshot is taken before any lock, so two concurrent writers both see the old version and both commit. Measured: 16 clients, one allowed append — 11 went through.
 
-`@orgops/eventstore` takes sorted advisory locks on every `(scopeKey, value)` pair of the condition *and* of the events being appended, in a statement **before** the version check, inside one function call (`es_append_if_v4`). The function takes a structured description of the context, never SQL text, and builds the version check itself; a role with `EXECUTE` on it cannot run anything else through it. Every append also holds a shared global lock; a condition that cannot be expressed through declared scope keys takes it exclusively. Correct, one round trip, and — because the version check runs on a B-tree on the scope key instead of a GIN bitmap scan — about 16× faster than a correctly locked GIN variant in our benchmarks.
+`@orgops/eventstore` takes sorted advisory locks on every `(scopeKey, value)` pair of the condition *and* of the events being appended, in a statement **before** the version check, inside one function call (`es_append_if_v5`). The function takes a structured description of the context, never SQL text, and builds the version check itself; a role with `EXECUTE` on it cannot run anything else through it. Every append also holds a shared global lock; a condition that cannot be expressed through declared scope keys takes it exclusively. Correct, one round trip, and — because the version check runs on a B-tree on the scope key instead of a GIN bitmap scan — about 16× faster than a correctly locked GIN variant in our benchmarks.
 
 **Strict mode** (default) refuses a guard query that has no declared scope key: the query would be neither indexable nor lockable. Set `strict: false` to accept the global lock instead. The tenant key is treated specially: a guard that names only the tenant serialises that tenant (exclusive tenant lock), while every append holds the tenant lock shared — so scope-level guards never contend on it.
 
