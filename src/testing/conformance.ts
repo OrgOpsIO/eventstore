@@ -662,4 +662,44 @@ export function conformanceSuite(makeStore: MakeStore, hooks: ConformanceHooks):
     assert.equal((await store.query({ scopes: { accountOpenedId: "acc-1" } }, { until: 0 })).contextVersion, 0);
     await assert.rejects(() => store.query({}, { until: -1 }));
   });
+
+  // ── lean reads ──────────────────────────────────────────────────────────────
+
+  withStore("data: false returns ids and scopes without data; payload: false returns neither — filters still see everything", async (store) => {
+    await store.append([openAccount("mary", "acc-1"), ev.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" })]);
+    const lean = await store.query({ scopes: { accountOpenedId: "acc-1" }, where: [{ amount: 5 }] }, { data: false });
+    assert.equal(lean.events.length, 1);
+    assert.deepEqual(lean.events[0]!.data, {});
+    assert.deepEqual(lean.events[0]!.scopes, { accountOpenedId: "acc-1" });
+    assert.ok(!lean.events[0]!.id.startsWith("~"), "the own id stays");
+    const bare = await store.query({ scopes: { accountOpenedId: "acc-1" } }, { payload: false });
+    assert.deepEqual(bare.events.map((e) => [e.type, e.data, e.scopes, e.id]), [
+      ["AccountOpened", {}, {}, `~${bare.events[0]!.sequence}`],
+      ["MoneyDeposited", {}, {}, `~${bare.events[1]!.sequence}`],
+    ]);
+    assert.equal(bare.contextVersion, lean.contextVersion);
+    await assert.rejects(() => store.query({}, { data: true as never }), UsageError);
+  });
+
+  withStore("version: false skips the context version, and its ctx can never guard", async (store) => {
+    await store.append([openAccount("mary", "acc-1")]);
+    const read = await store.query({ scopes: { accountOpenedId: "acc-1" } }, { version: false });
+    assert.equal(read.events.length, 1);
+    assert.equal(read.contextVersion, -1);
+    const outcome = await store.appendIf([ev.MoneyDeposited({ amount: 1 }, { accountOpenedId: "acc-1" })], read.ctx);
+    assert.equal(outcome.ok, false);
+  });
+
+  withStore("many scope values: a read lists thousands; a guard's version agrees with the read's; a guard over 256 values is refused", async (store) => {
+    const ids = Array.from({ length: 300 }, (_, i) => `acc-${i}`);
+    await store.append(ids.slice(0, 40).map((id) => openAccount(`o-${id}`, id)));
+    const many = await store.query({ scopes: { accountOpenedId: [...ids, ...Array.from({ length: 2000 }, (_, i) => `none-${i}`)] } });
+    assert.equal(many.events.length, 40);
+    const twenty = ids.slice(0, 20);
+    const read = await store.query({ types: ["AccountOpened"], scopes: { accountOpenedId: twenty } });
+    assert.equal(read.contextVersion, Math.max(...read.events.map((e) => e.sequence)));
+    const ok = await store.appendIf([ev.MoneyDeposited({ amount: 1 }, { accountOpenedId: "acc-0" })], read.ctx);
+    assert.equal(ok.ok, true, "the append function computes the same version as the IN-list read");
+    await assert.rejects(() => store.appendIf([ev.MoneyDeposited({ amount: 1 }, { accountOpenedId: "acc-0" })], { query: { scopes: { accountOpenedId: ids } }, version: 0 }), UsageError);
+  });
 }

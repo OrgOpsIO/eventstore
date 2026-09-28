@@ -25,6 +25,10 @@ export interface WatchOptions {
    * closed SSE request always gives its place back.
    */
   readonly signal?: AbortSignal;
+  /** `false`: records without data — ids and scopes only; a large payload never leaves the database. */
+  readonly data?: false;
+  /** `false`: records without reading the payload at all — type, sequence, time; nothing is unpacked. */
+  readonly payload?: false;
 }
 
 /** A running watch: ephemeral, from about "now", no cursor that survives the process. */
@@ -87,7 +91,7 @@ export class WatchHub {
     if (this.closed) throw new UsageError("eventstore: the store is closed");
     const signal = options.signal;
     if (signal?.aborted) throw signal.reason;
-    const group = this.groups.get(key) ?? this.open(key, store, query);
+    const group = this.groups.get(key) ?? this.open(key, store, query, options);
     const member: Member = { handler, onError: options.onError, pending: 0, chain: Promise.resolve(), stopped: false, resolved: false };
     group.members.add(member);
     this.total++;
@@ -117,7 +121,7 @@ export class WatchHub {
     };
   }
 
-  private open(key: string, store: EventStore, query: Query): Group {
+  private open(key: string, store: EventStore, query: Query, options: WatchOptions): Group {
     let failure: unknown;
     const members = new Set<Member>();
     const sub = subscribe(
@@ -131,6 +135,8 @@ export class WatchHub {
         store,
         from: "now",
         cursors: memoryCursors(),
+        ...(options.data === false ? { data: false as const } : {}),
+        ...(options.payload === false ? { payload: false as const } : {}),
         ...(this.limits.pollIntervalMs !== undefined ? { pollIntervalMs: this.limits.pollIntervalMs } : {}),
         onError: (error) => {
           if (!isFatal(error)) return "retry"; // transient: the next doorbell or poll tries again

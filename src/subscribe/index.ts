@@ -27,6 +27,10 @@ export interface SubscribeOptions {
   readonly pollIntervalMs?: number;
   /** Doorbells within this window share one read (default 25 ms). */
   readonly wakeCoalesceMs?: number;
+  /** `false`: deliver records without data (ids and scopes stay) — see `QueryOptions.data`. */
+  readonly data?: false;
+  /** `false`: deliver records without reading the payload at all — see `QueryOptions.payload`. */
+  readonly payload?: false;
   /** Max events per handler call. Default 500. */
   readonly batchSize?: number;
   /**
@@ -87,6 +91,7 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
   let unsubscribeWake: (() => void) | undefined;
   let wakeTimer: ReturnType<typeof setTimeout> | undefined;
   let unsettledMs = 0;
+  const projection = { ...(options.data === false ? { data: false as const } : {}), ...(options.payload === false ? { payload: false as const } : {}) };
 
   const resolveCaughtUp = (): void => {
     const waiters = caughtUpWaiters;
@@ -100,7 +105,7 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
     const from = options.from ?? "beginning";
     if (from === "beginning" || from === null) return null;
     if (from === "now") {
-      const head = await store.query(query, { settledOnly: true, order: "desc", limit: 1 });
+      const head = await store.query(query, { settledOnly: true, order: "desc", limit: 1, payload: false, version: false });
       return head.settledCursor;
     }
     return from;
@@ -139,22 +144,25 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
         cursor = await initialCursor();
         cursorResolved = true;
       }
-      // Not `settledOnly`: the cursor read also returns the unsettled tail, and that tail says
-      // "look again soon". Events become settled when an OLDER transaction ends — possibly one on
-      // another table that rings no doorbell — so without this a woken reader would wait a full poll.
-      const result = await store.query(query, { cursor, limit: batchSize });
+      // Settled records only, each exactly once: an unsettled one is never fetched (with its payload)
+      // before it can be delivered. That one waits is told by the context version instead.
+      const result = await store.query(query, { settledOnly: true, cursor, limit: batchSize, version: false, ...projection });
       if (stopped) {
         for (const w of waitersBeforeRead) w(); // stopped = caught up by contract; never leave a waiter hanging
         return;
       }
-      // in (transactionId, sequence) order every settled record precedes every unsettled one
-      const firstUnsettled = result.events.findIndex((e) => !e.settled);
-      const settled = firstUnsettled === -1 ? result.events : result.events.slice(0, firstUnsettled);
+      const settled = result.events;
       if (settled.length === 0) {
         backoffMs = 0;
         for (const w of waitersBeforeRead) w();
         if (caughtUpWaiters.length > 0) wakeRequested = true;
-        if (firstUnsettled !== -1) {
+        // Is something beyond the cursor waiting for an older transaction to end? It becomes
+        // readable then — possibly on another table, which rings no doorbell — so look again soon
+        // rather than after a full poll. One row, from the (transaction_id, sequence) index, with
+        // no payload read: whatever it finds beyond the cursor is unsettled, or just settled.
+        const waiting = await store.query(query, { cursor, limit: 1, payload: false, version: false });
+        if (stopped) return;
+        if (waiting.events.length > 0) {
           unsettledMs = unsettledMs === 0 ? MIN_UNSETTLED_MS : Math.min(unsettledMs * 2, MAX_UNSETTLED_MS, pollIntervalMs);
           schedule(wakeRequested ? 0 : unsettledMs);
           return;

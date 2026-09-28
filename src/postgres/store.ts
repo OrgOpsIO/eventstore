@@ -253,6 +253,7 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
   private readonly rebuildScopeIndexes: boolean;
   private readonly scopeStatisticsPolicy: ScopeStatisticsPolicy;
   private readonly adopt: AdoptOptions | undefined;
+  private analyzeAfterInstall = false;
   private installed: Promise<void> | undefined;
   private readonly warningList: string[] = [];
   /** How often an append collapsed its lock plan to the global lock because it exceeded `maxLockKeys`. */
@@ -378,6 +379,20 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
       } catch (err) {
         await client.query("ROLLBACK").catch(() => undefined);
         throw err;
+      }
+      if (this.analyzeAfterInstall) {
+        // outside the install transaction: it holds neither the install lock nor a DDL lock, and
+        // with large payloads (every scope expression unpacks each sampled one) it can take seconds
+        this.analyzeAfterInstall = false;
+        try {
+          await client.query("BEGIN");
+          await client.query("SET LOCAL statement_timeout = 0");
+          await client.query(`ANALYZE ${tableRef(this.target)}`);
+          await client.query("COMMIT");
+        } catch (err) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          this.warningList.push(`could not ANALYZE ${this.schemaName}.${this.table} after creating statistics objects (${(err as Error).message}) — run it by hand`);
+        }
       }
     } finally {
       client.release();
@@ -662,10 +677,23 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
       chosen = scopeStatisticsKeys(keys, new Map(rows.rows.map((r) => [r.key, Number(r.rows)])), this.scopeStatisticsPolicy);
     }
     const keep = new Set(chosen);
+    const existing = new Set(
+      (
+        await client.query<{ name: string }>("SELECT s.stxname AS name FROM pg_catalog.pg_statistic_ext s JOIN pg_catalog.pg_namespace n ON n.oid = s.stxnamespace WHERE n.nspname = $1", [
+          this.schemaName,
+        ])
+      ).rows.map((r) => r.name),
+    );
+    let created = false;
     for (const key of keys) {
-      if (keep.has(key)) await client.query(scopeStatisticsDdl(this.target, key));
-      else await client.query(`DROP STATISTICS IF EXISTS ${qualified(this.schemaName, scopeStatisticsName(this.table, key))}`);
+      if (keep.has(key)) {
+        if (!existing.has(scopeStatisticsName(this.table, key))) created = true;
+        await client.query(scopeStatisticsDdl(this.target, key));
+      } else await client.query(`DROP STATISTICS IF EXISTS ${qualified(this.schemaName, scopeStatisticsName(this.table, key))}`);
     }
+    // a new statistics object is empty until the table is analysed; without it the planner keeps
+    // misjudging the scope indexes until autovacuum happens to come by — analysed after COMMIT
+    if (created) this.analyzeAfterInstall = true;
   }
 
   /**
@@ -746,7 +774,7 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     let settledCursor: Cursor | null = null;
     for (const row of result.rows) {
       if (row.seq === null || row.event_type === null || row.payload === null) continue;
-      const event = this.toRecorded(row, options.omit);
+      const event = this.toRecorded(row, options);
       events.push(event);
       if (event.sequence > lastReturned) lastReturned = event.sequence;
       if (event.settled && (!settledCursor || compareCursor(event, settledCursor) > 0)) {
@@ -758,7 +786,8 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     return { events, byFilter, lastReturned, contextVersion, ctx: { query, version: contextVersion }, settledCursor };
   }
 
-  private toRecorded(row: Row, omit?: readonly string[]): RecordedEvent {
+  private toRecorded(row: Row, options: QueryOptions = {}): RecordedEvent {
+    const omit = options.omit;
     const type = row.event_type as string;
     const idKey = this.schema.idKeyOf(type);
     if (omit) assertOmittable(omit, idKey, type);
@@ -766,9 +795,16 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     // id and scopes come from the RAW payload — what es_scope() matched and locked on; only
     // `data` goes through `upcast` (an upcast may reshape data, never scope keys or the id)
     const { id, scopes } = fromPayload(raw, idKey);
-    const upcast = fromPayload(this.schema.upcast(type, raw), idKey);
-    // SQL already stripped the keys; trim again after `upcast` so a reshaped payload cannot bring one back
-    const data = omit ? trimData(upcast.data, omit) : upcast.data;
+    let data: Record<string, unknown>;
+    if (options.data === false || options.payload === false) {
+      // SQL shipped ids and scopes (or nothing); data keeps only the declared scope keys carried
+      // flat, so every back-link a query matched on stays readable
+      data = options.payload === false ? {} : flatScopeKeys(raw, this.schema.scopeKeys, idKey);
+    } else {
+      const upcast = fromPayload(this.schema.upcast(type, raw), idKey);
+      // SQL already stripped the keys; trim again after `upcast` so a reshaped payload cannot bring one back
+      data = omit ? trimData(upcast.data, omit) : upcast.data;
+    }
     const sequence = toSafeInt(row.seq as string);
     return {
       type,
@@ -1071,4 +1107,15 @@ function toSafeInt(value: string | number): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isSafeInteger(n)) throw new EventStoreError(`eventstore/postgres: sequence ${value} is not a safe integer`);
   return n;
+}
+
+/** The declared scope keys a payload carries flat (string values), without the own id — what a lean record keeps of its data. */
+function flatScopeKeys(payload: Record<string, unknown>, scopeKeys: readonly string[], idKey: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of scopeKeys) {
+    if (key === idKey || key === "scopes") continue;
+    const value = payload && typeof payload === "object" ? payload[key] : undefined;
+    if (typeof value === "string") out[key] = value;
+  }
+  return out;
 }

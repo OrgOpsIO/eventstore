@@ -800,6 +800,12 @@ export function versionSpec(query: Query, schema?: Pick<StoreSchema, "tenantScop
   return branches;
 }
 
+/** `data: false` ships top-level strings up to this size (ids, flat scope keys) and nothing larger. */
+export const LEAN_STRING_BYTES = 1024;
+
+/** Up to this many values of the leading scope key, the version check is one indexed MAX per value; beyond it one MAX over `IN (…)`. */
+export const VERSION_BRANCHES_PER_KEY = 8;
+
 /**
  * The CCC context version as one statement returning a single bigint, using the collector's
  * `$1::text[]` / `$2::jsonb[]` arrays — for the READ path. The append function computes the
@@ -830,6 +836,15 @@ export function compileVersionSql(
     const cap = until !== undefined ? ` AND sequence_number <= ${text(String(until))}::bigint` : "";
     if (branch.key === null) {
       branches.push(`SELECT MAX(sequence_number) FROM ${t} WHERE ${compileFilter(rest, text, json, scope)}${cap}`);
+      continue;
+    }
+    if (branch.values.length > VERSION_BRANCHES_PER_KEY) {
+      // many values: one MAX over an IN list — planning a branch per value costs more than the
+      // backward index walk per value saves (the append function computes the same number)
+      const restSql = compileFilter(rest, text, json, scope);
+      branches.push(
+        `SELECT MAX(sequence_number) FROM ${t} WHERE ${scope}(payload, ${quoteLiteral(branch.key)}) IN (${branch.values.map((v) => text(v)).join(", ")})${restSql === "TRUE" ? "" : ` AND ${restSql}`}${cap}`,
+      );
       continue;
     }
     for (const value of branch.values) {
@@ -890,7 +905,7 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   const t = tableRef(target);
   const collector = createParamCollector();
   const compiled = compileFilters(query, collector, target.schemaName);
-  const version = compileVersionSql(target, query, collector, schema, options.until); // same collector: one parameter space
+  const version = options.version === false ? null : compileVersionSql(target, query, collector, schema, options.until); // same collector: one parameter space
   const params: unknown[] = [collector.texts, collector.jsons];
   const param = (v: unknown): string => {
     params.push(v);
@@ -901,12 +916,23 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   if (options.until !== undefined) conds.push(`sequence_number <= ${param(String(options.until))}::bigint`);
   if (options.settledOnly) conds.push(SETTLED_SQL);
   if (options.cursor) {
-    conds.push(
-      `NOT (${SETTLED_SQL} AND (transaction_id, sequence_number) <= (${param(options.cursor.transactionId)}::xid8, ${param(String(options.cursor.sequence))}::bigint))`,
-    );
+    // "not (settled and at or before the cursor)", written as two ranges of the
+    // (transaction_id, sequence_number) index — a NOT over an AND can use no index at all
+    const after = `(transaction_id, sequence_number) > (${param(options.cursor.transactionId)}::xid8, ${param(String(options.cursor.sequence))}::bigint)`;
+    conds.push(options.settledOnly ? after : `(${after} OR transaction_id >= ctx.xmin)`);
   }
   // the projection: keys stripped in SQL, so a trimmed field never travels
-  const payload = options.omit && options.omit.length > 0 ? `payload - ${param(options.omit)}::text[]` : "payload";
+  const payload =
+    options.payload === false
+      ? "'{}'::jsonb" // the column is not read: nothing is unpacked
+      : options.data === false
+        ? // what identifies the record — `scopes` and the short string fields (the own id, whatever its
+          // key, and scope keys carried flat are among them) — and never a large field; a legacy
+          // payload that is not an object has none of it
+          `(CASE WHEN jsonb_typeof(payload) = 'object' THEN coalesce((SELECT jsonb_object_agg(f.k, f.v) FROM jsonb_each(payload) AS f(k, v) WHERE f.k = 'scopes' OR (jsonb_typeof(f.v) = 'string' AND octet_length(f.v #>> '{}') <= ${LEAN_STRING_BYTES})), '{}'::jsonb) ELSE '{}'::jsonb END)`
+        : options.omit && options.omit.length > 0
+          ? `payload - ${param(options.omit)}::text[]`
+          : "payload";
   const dir = options.order === "desc" ? "DESC" : "ASC";
   const tupleOrder = options.cursor !== undefined || options.settledOnly === true;
   const orderBy = tupleOrder ? `transaction_id ${dir}, sequence_number ${dir}` : `sequence_number ${dir}`;
@@ -915,7 +941,7 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   const hits = filterCount > 1 ? `ARRAY[${compiled.perFilter.map((c) => `(${c})`).join(", ")}]::boolean[]` : "NULL::boolean[]";
   // A parameter array nobody references would make the bind fail ("supplies 2 parameters …"):
   // anchor only those in the ctx CTE.
-  const body = `${version.sql} ${compiled.sql} ${hits}`;
+  const body = `${version?.sql ?? ""} ${compiled.sql} ${hits}`;
   const anchors = [
     body.includes("$1::text[]") ? null : "coalesce(array_length($1::text[], 1), 0) >= 0",
     body.includes("$2::jsonb[]") ? null : "coalesce(array_length($2::jsonb[], 1), 0) >= 0",
@@ -923,7 +949,7 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   const anchor = anchors.length > 0 ? ` WHERE ${anchors.join(" AND ")}` : "";
   // The single-row ctx CTE joined laterally to the ordered rows: a nested loop over one outer
   // row preserves the inner ORDER BY, so no outer sort is needed. int8/xid8 arrive as strings.
-  const sql = `WITH ctx AS (SELECT (${version.sql})::text AS v, pg_snapshot_xmin(pg_current_snapshot()) AS xmin${anchor})
+  const sql = `WITH ctx AS (SELECT ${version ? `(${version.sql})::text` : "'-1'::text"} AS v, pg_snapshot_xmin(pg_current_snapshot()) AS xmin${anchor})
 SELECT ctx.v AS context_version,
        e.sequence_number AS seq, e.event_type, e.payload, e.metadata, e.recorded_at, e.xid, e.settled, e.hits
 FROM ctx

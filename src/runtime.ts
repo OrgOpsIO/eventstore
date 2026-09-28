@@ -243,6 +243,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       return (await view()).query(query, options);
     },
     read: (async (registry: EventRegistry<Definitions>, query?: Query, options?: QueryOptions) => {
+      if (options?.data === false || options?.payload === false) throw new UsageError("eventstore: read() validates data against the registry — use query() for a read without data");
       const result = await (await view()).query(query ?? registry.$filter(), options);
       const parsed = new Map(result.events.map((e) => [e, registry.$parse(e, options?.omit)] as const));
       return {
@@ -282,7 +283,9 @@ function buildApi(parts: ApiParts): EventStoreApi {
     },
     async watch(query, handler, options) {
       if (parts.until !== undefined) throw new UsageError("eventstore: a past view (asOf) cannot watch — watch a live view");
-      return parts.hub.watch(JSON.stringify([tenantId ?? null, queryKey(query)]), await view(), query, handler, options);
+      // one reader per view, query AND projection: a lean watcher must not share a full reader
+      const projection = options?.payload === false ? "bare" : options?.data === false ? "lean" : "full";
+      return parts.hub.watch(JSON.stringify([tenantId ?? null, queryKey(query), projection]), await view(), query, handler, options);
     },
     forTenant(id: string): EventStoreApi {
       if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");

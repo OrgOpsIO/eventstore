@@ -133,7 +133,7 @@ A `unique` path becomes a partial unique index on the events table, scoped to th
 ## The store contract
 
 ```ts
-const read = await es.query(query, { after?, until?, cursor?, settledOnly?, limit?, order?, omit? });
+const read = await es.query(query, { after?, until?, cursor?, settledOnly?, limit?, order?, omit?, data?: false, payload?: false, version?: false });
 // read.events            matching records (sequence order; (transactionId, sequence) order with `cursor`/`settledOnly`)
 // read.byFilter          the same records grouped per filter, in the order of `events` (DCB-style multi-filter contexts)
 // read.contextVersion    highest sequence of ALL matching records — the guard. Never narrowed by `after`, `cursor`, `limit`.
@@ -158,6 +158,16 @@ list.events[0].data.body;   // compile error: omitted
 ```
 
 `omit` names top-level `data` keys that every returned record leaves out — a projection for lists and overviews that do not need the large field. The Postgres store strips the keys in SQL (`payload - '{body}'`), so the field never travels; `where` and `contextVersion` still see the whole record. Identity is never trimmed: `scopes` and the event's own id key are refused with `UsageError`. `es.read` re-validates against the schema without the omitted keys and types `data` accordingly. Decisions have no `omit`: `command()` and `context()` read complete facts.
+
+### Lean reads
+
+`omit` leaves named fields out; three switches go further, for reads that route, count or decide nothing:
+
+- `data: false` — records come back without their data: id and `scopes` stay, and so do declared scope keys carried flat in data (every back-link a query matched on). The Postgres store ships `scopes` and top-level strings up to 1 kB, so a large field (a whole HTML page) never leaves the database — it still unpacks the payload to find them.
+- `payload: false` — the payload column is not read at all: type, sequence, time and metadata only; `scopes` is `{}` and the id reads `~<sequence>`. Nothing is unpacked.
+- `version: false` — no context version is computed (one index lookup per scope value); `contextVersion` is `-1` and the `ctx` can never guard.
+
+A read may list up to 10 000 values of a scope key (beyond eight they become one `IN (…)`); a guard is held to 256, because every value of a guard is an advisory lock. `es.read` refuses `data: false` and `payload: false` — it validates data against the registry.
 
 ### Everything in a scope except …
 
@@ -248,13 +258,14 @@ await sub.stop();
 
 // ephemeral: from about now, at-most-once — an SSE stream to one browser tab
 const watch = await es.forTenant(t).watch(articles.$filter(), (events) => sse.push(events), {
+  data: false,                                   // a relay forwards type, id, scopes: the payload never leaves the database
   signal: request.signal,                        // a closed request gives its place back, even before the watch started
   onError: () => sse.close(),                    // it ended on its own: handler threw, fell behind, or the read was refused
 });
 watch.stop();
 ```
 
-Both read through the view they are called on: a tenant view delivers that tenant's events only, under its session when `rls` is on (the root view under `rls` cannot watch — the read is refused). `subscribe` reads settled events beyond a `(transactionId, sequence)` cursor, advances it only after your handler resolved, retries with back-off, and on a tenant view keeps its cursor as `name@tenantId`. `watch` shares **one reader per view and query** in the process: a hundred tabs on the same tenant cost one read per commit, not a hundred. Every watcher has its own queue; one that falls `watch.maxPendingBatches` behind (default 64) is dropped with `WatchOverflowError` instead of holding the others back or filling memory, and at most `watch.maxWatchers` (default 10 000) live at once: `configure({ watch: { maxWatchers, maxPendingBatches } })`. A store error that no retry will fix (a refused read, missing permissions) ends the watch; a dropped connection is retried. `es.close()` ends every watch.
+Both read through the view they are called on: a tenant view delivers that tenant's events only, under its session when `rls` is on (the root view under `rls` cannot watch — the read is refused). `subscribe` reads settled events beyond a `(transactionId, sequence)` cursor, advances it only after your handler resolved, retries with back-off, and on a tenant view keeps its cursor as `name@tenantId`. `watch` shares **one reader per view and query** in the process: a hundred tabs on the same tenant cost one read per commit, not a hundred. Both read settled records only, each exactly once: a record still waiting on an older transaction is not fetched until it can be delivered (a one-row read without payload tells the reader it exists, and it looks again within 25–500 ms). Pass `data: false` or `payload: false` to either for a relay that forwards only type, ids and scopes — the rule for any live stream of large events. Every watcher has its own queue; one that falls `watch.maxPendingBatches` behind (default 64) is dropped with `WatchOverflowError` instead of holding the others back or filling memory, and at most `watch.maxWatchers` (default 10 000) live at once: `configure({ watch: { maxWatchers, maxPendingBatches } })`. A store error that no retry will fix (a refused read, missing permissions) ends the watch; a dropped connection is retried. `es.close()` ends every watch.
 
 Subscriptions are not owned by `es`: stop them before `es.close()`. The low-level `subscribe(name, query, handler, { store })` from `@orgops/eventstore/subscribe` is what `es.subscribe` is built on and stays available; `on()` there is superseded by `es.watch` (it only ever worked with the memory store).
 

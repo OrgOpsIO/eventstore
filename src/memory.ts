@@ -129,7 +129,7 @@ export class MemoryStore implements EventStore, LiveStore, WakeStore, Statistics
       if (record.sequence > contextVersion) contextVersion = record.sequence;
       if (this.visible(record, options)) {
         // matching and the version saw the full record; only what is returned is trimmed
-        const shown = options.omit ? this.trimmed(record, options.omit) : record;
+        const shown = this.projected(record, options);
         visible.push(shown);
         hits.set(shown, matched);
       }
@@ -143,8 +143,8 @@ export class MemoryStore implements EventStore, LiveStore, WakeStore, Statistics
       events,
       byFilter: filters.map((_, i) => events.filter((e) => hits.get(e)![i])),
       lastReturned,
-      contextVersion,
-      ctx: { query, version: contextVersion },
+      contextVersion: options.version === false ? -1 : contextVersion,
+      ctx: { query, version: options.version === false ? -1 : contextVersion },
       settledCursor: cursorOf(events),
     };
   }
@@ -164,6 +164,20 @@ export class MemoryStore implements EventStore, LiveStore, WakeStore, Statistics
       byType.set(row.type, entry);
     }
     return [...byType.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([type, s]) => ({ type, ...s }));
+  }
+
+  /** The record as the read asked for it: whole, without some data keys, without data, or without the payload. */
+  private projected(record: RecordedEvent, options: QueryOptions): RecordedEvent {
+    if (options.omit) assertOmittable(options.omit, this.idKeyOf(record.type), record.type);
+    if (options.payload === false) return Object.freeze({ ...record, data: Object.freeze({}), scopes: Object.freeze({}), id: `~${record.sequence}` });
+    if (options.data === false) {
+      // the declared scope keys carried flat stay, like on Postgres: every back-link a query matched on remains readable
+      const data: Record<string, unknown> = {};
+      const source = record.data as Record<string, unknown>;
+      for (const key of this.schema.scopeKeys) if (typeof source?.[key] === "string") data[key] = source[key];
+      return Object.freeze({ ...record, data: Object.freeze(data) });
+    }
+    return options.omit ? this.trimmed(record, options.omit) : record;
   }
 
   /** The record without the omitted data keys; the own id key is refused. */

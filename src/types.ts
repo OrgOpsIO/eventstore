@@ -128,6 +128,23 @@ export interface QueryOptions {
    * a decision (`command()`, `context()`) needs complete facts and has no `omit`.
    */
   readonly omit?: readonly string[];
+  /**
+   * `false`: every record comes back with `data: {}` — its id and scopes stay. For readers that
+   * only route or count (a live relay): the Postgres store ships only the payload's ids and
+   * `scopes`, so a large payload never travels; it still unpacks it to find them.
+   */
+  readonly data?: false;
+  /**
+   * `false`: the payload column is not read at all — `data: {}`, `scopes: {}`, and the id reads as
+   * `~<sequence>`. Type, sequence, time, metadata and transaction stay. The cheapest read there is:
+   * nothing is unpacked. Filters still see the whole record.
+   */
+  readonly payload?: false;
+  /**
+   * `false`: skip computing the context version (one index lookup per scope value). The result's
+   * `contextVersion` is `-1` and its `ctx` can never guard an `appendIf` — for reads that decide nothing.
+   */
+  readonly version?: false;
 }
 
 /**

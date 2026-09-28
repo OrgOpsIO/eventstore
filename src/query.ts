@@ -5,7 +5,12 @@ import type { Filter, NegatedFilter, NewEvent, Query, QueryOptions, RecordedEven
 export const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_CONTAINS_DEPTH = 64;
 /** Caps on query shapes: every scope value becomes an advisory lock and an index probe. */
-export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 256, wherePredicates: 64, omitKeys: 64, negations: 64 } as const;
+/**
+ * Caps on query shapes. A read may list many scope values (it becomes one `IN (…)`); a guard is
+ * held to `guardValuesPerKey`, because every value of a guard is an advisory lock and one index
+ * probe inside the append.
+ */
+export const QUERY_LIMITS = { filters: 64, scopeValuesPerKey: 10_000, guardValuesPerKey: 256, wherePredicates: 64, omitKeys: 64, negations: 64 } as const;
 
 /** Normalise a query into a non-empty list of filters with canonical shapes. */
 export function filtersOf(query: Query): Filter[] {
@@ -99,6 +104,9 @@ export function normaliseOptions(options: QueryOptions = {}): QueryOptions {
   }
   if (options.order !== undefined && options.order !== "asc" && options.order !== "desc") {
     throw new Error(`eventstore: \`order\` must be "asc" or "desc"`);
+  }
+  for (const flag of ["data", "payload", "version"] as const) {
+    if (options[flag] !== undefined && options[flag] !== false) throw new UsageError(`eventstore: \`${flag}\` takes only \`false\``);
   }
   if (options.omit !== undefined) {
     if (!Array.isArray(options.omit)) throw new UsageError("eventstore: `omit` must be an array of data keys");
@@ -257,6 +265,11 @@ export function conditionLockKeys(
   let exclusiveGlobal = false;
   const tenantKey = schema.tenantScopeKey;
   for (const filter of filtersOf(query)) {
+    for (const [key, values] of Object.entries(filter.scopes ?? {})) {
+      if ((values as readonly string[]).length > QUERY_LIMITS.guardValuesPerKey) {
+        throw new UsageError(`eventstore: a guard may name at most ${QUERY_LIMITS.guardValuesPerKey} values of scope "${key}" (each is a lock) — narrow the context, or read without guarding`);
+      }
+    }
     const declared = Object.entries(filter.scopes ?? {}).filter(([k]) => schema.scopeKeys.includes(k));
     const nonTenant = declared.filter(([k]) => k !== tenantKey);
     if (nonTenant.length > 0) {

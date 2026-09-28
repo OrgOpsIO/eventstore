@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.2 (2026-09-29)
+
+Live streams of large events were expensive: measured, one 424 kB event waiting on an older transaction travelled to the app about six times a second, per watch group.
+
+- **Fix: `subscribe` and `watch` fetch every record once.** Since 0.5.0 a woken reader also fetched the unsettled tail — full payloads, up to a batch — and fetched it again every 25–500 ms until an older transaction ended. It now reads settled records only; when that page is empty, one row beyond the cursor without its payload (`payload: false, limit: 1`, from the transaction index) tells whether something waits. Measured on the same case, 2.5 MB/s became under 0.1 MB for the whole wait, and a waiting event after a sequence/transaction inversion still arrives within half a second.
+- **The cursor read uses the `(transaction_id, sequence_number)` index.** Its condition was a `NOT` over an `AND`, which no index serves, so every read beyond a cursor walked every row of the query (the whole tenant, for a relay); it is now the equivalent two index ranges.
+- **Lean reads:** `QueryOptions.data: false` (`scopes`, the own id whatever its key, and declared scope keys carried flat stay; no top-level string over 1 kB and nothing else of the payload leaves the database; a payload that is not an object reads as empty), `payload: false` (the payload column is not read at all), `version: false` (no context version; `-1`, never guards). `subscribe` and `watch` take `data: false` and `payload: false`; a lean and a full watcher never share a reader. `es.read` refuses both.
+- **Many scope values:** the read-path version check turns more than eight values of the leading key into one `MAX … IN (…)` instead of a `UNION ALL` branch per value (planning time grew with every value); a read may list up to 10 000 values per key, a guard stays at 256 (each is a lock) and gets a clear `UsageError` beyond.
+- **`ANALYZE` after an install that created statistics objects**, after its COMMIT — so it holds neither the install lock nor a DDL lock (with large payloads it takes seconds) — best-effort, a warning when it fails. A new object is empty until the table is analysed (after an adoption, say), and the planner misjudged the scope indexes until autovacuum came by.
+
 ## 0.6.1 (2026-09-29)
 
 - **A view stayed broken after its store failed once at first use.** The root api reset its store promise on a failed creation, but every view — the root api's own and every tenant view — kept the first rejected promise, so one transient database error on first use (the database not up yet, a failed install) failed that view's reads and writes until the process restarted. A view now tries again on its next call.
