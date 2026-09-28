@@ -1,4 +1,4 @@
-import { isLiveStore, type LiveStore } from "../memory.js";
+import { cursorOf, isLiveStore, isWakeStore, type LiveStore } from "../memory.js";
 import { filtersOf, matchesFilter } from "../query.js";
 import { emptySchema } from "../registry.js";
 import type { Cursor, EventStore, Query, RecordedEvent, StoreSchema } from "../types.js";
@@ -20,8 +20,13 @@ export interface SubscribeOptions {
   readonly cursors?: CursorStore;
   /** Start position when the cursor store has nothing for this name. Default `"beginning"`. */
   readonly from?: Cursor | null | "beginning" | "now";
-  /** Polling interval. A `LiveStore` push wakes the poller immediately. Default 500 ms. */
+  /**
+   * Polling interval. A `LiveStore` push or a `WakeStore` doorbell wakes the poller at once, so
+   * polling is only the safety net: default 5 000 ms with a doorbell, 500 ms without.
+   */
   readonly pollIntervalMs?: number;
+  /** Doorbells within this window share one read (default 25 ms). */
+  readonly wakeCoalesceMs?: number;
   /** Max events per handler call. Default 500. */
   readonly batchSize?: number;
   /**
@@ -49,6 +54,9 @@ export interface Subscription {
 
 const MIN_BACKOFF_MS = 100;
 const MAX_BACKOFF_MS = 5_000;
+/** Re-read delay while visible events wait for older transactions to end (nothing rings when they do). */
+const MIN_UNSETTLED_MS = 25;
+const MAX_UNSETTLED_MS = 500;
 
 /**
  * A durable, gap-free, query-filtered subscription with a named cursor.
@@ -61,11 +69,14 @@ const MAX_BACKOFF_MS = 5_000;
 export function subscribe(name: string, query: Query, handler: SubscriptionHandler, options: SubscribeOptions): Subscription {
   const store = options.store;
   const cursors = options.cursors ?? memoryCursors();
-  const pollIntervalMs = options.pollIntervalMs ?? 500;
+  const pollIntervalMs = options.pollIntervalMs ?? (isWakeStore(store) ? 5_000 : 500);
+  const wakeCoalesceMs = options.wakeCoalesceMs ?? 25;
   const batchSize = options.batchSize ?? 500;
   const onError = options.onError ?? (() => "retry" as const);
 
   let cursor: Cursor | null = null;
+  /** The start position is resolved inside the first successful poll: a failure there retries, it never falls back to replaying everything. */
+  let cursorResolved = false;
   let stopped = false;
   let backoffMs = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -73,6 +84,9 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
   let wakeRequested = false;
   let caughtUpWaiters: Array<() => void> = [];
   let unsubscribeLive: (() => void) | undefined;
+  let unsubscribeWake: (() => void) | undefined;
+  let wakeTimer: ReturnType<typeof setTimeout> | undefined;
+  let unsettledMs = 0;
 
   const resolveCaughtUp = (): void => {
     const waiters = caughtUpWaiters;
@@ -121,21 +135,38 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
     const waitersBeforeRead = caughtUpWaiters;
     caughtUpWaiters = [];
     try {
-      const result = await store.query(query, { settledOnly: true, cursor, limit: batchSize });
+      if (!cursorResolved) {
+        cursor = await initialCursor();
+        cursorResolved = true;
+      }
+      // Not `settledOnly`: the cursor read also returns the unsettled tail, and that tail says
+      // "look again soon". Events become settled when an OLDER transaction ends — possibly one on
+      // another table that rings no doorbell — so without this a woken reader would wait a full poll.
+      const result = await store.query(query, { cursor, limit: batchSize });
       if (stopped) {
         for (const w of waitersBeforeRead) w(); // stopped = caught up by contract; never leave a waiter hanging
         return;
       }
-      if (result.events.length === 0) {
+      // in (transactionId, sequence) order every settled record precedes every unsettled one
+      const firstUnsettled = result.events.findIndex((e) => !e.settled);
+      const settled = firstUnsettled === -1 ? result.events : result.events.slice(0, firstUnsettled);
+      if (settled.length === 0) {
         backoffMs = 0;
         for (const w of waitersBeforeRead) w();
         if (caughtUpWaiters.length > 0) wakeRequested = true;
+        if (firstUnsettled !== -1) {
+          unsettledMs = unsettledMs === 0 ? MIN_UNSETTLED_MS : Math.min(unsettledMs * 2, MAX_UNSETTLED_MS, pollIntervalMs);
+          schedule(wakeRequested ? 0 : unsettledMs);
+          return;
+        }
+        unsettledMs = 0;
         // a push that arrived while this poll was in flight must not wait a full interval
         schedule(wakeRequested ? 0 : pollIntervalMs);
         return;
       }
+      unsettledMs = 0;
       caughtUpWaiters = [...waitersBeforeRead, ...caughtUpWaiters];
-      const decision = await deliver(result.events);
+      const decision = await deliver(settled);
       if (decision === "stop") {
         shutdown(); // not `stop()`: that would await this very poll
         return;
@@ -146,7 +177,7 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
         return;
       }
       // "ok" or "skip": advance past this batch
-      const next = result.settledCursor;
+      const next = cursorOf(settled);
       if (next) {
         await cursors.save(name, next);
         cursor = next;
@@ -197,6 +228,12 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
     }
     unsubscribeLive?.();
     unsubscribeLive = undefined;
+    unsubscribeWake?.();
+    unsubscribeWake = undefined;
+    if (wakeTimer) {
+      clearTimeout(wakeTimer);
+      wakeTimer = undefined;
+    }
     resolveCaughtUp();
   };
 
@@ -212,18 +249,30 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
   };
 
   // start
+  /** A wake: read now — unless a back-off is running, which a commit elsewhere must not cut short. */
+  const wake = (): void => {
+    if (stopped) return;
+    wakeRequested = true;
+    if (backoffMs > 0 || inFlight) return; // the back-off timer, or the running poll, picks it up
+    schedule(0);
+  };
+
   inFlight = (async () => {
     try {
-      cursor = await initialCursor();
+      if (isLiveStore(store)) {
+        unsubscribeLive = store.onAppended(wake);
+      } else if (isWakeStore(store)) {
+        // a doorbell carries nothing: it only says "read now"; a burst of them shares one read
+        unsubscribeWake = store.onCommitted(() => {
+          if (stopped || wakeTimer) return;
+          wakeTimer = setTimeout(() => {
+            wakeTimer = undefined;
+            wake();
+          }, wakeCoalesceMs);
+        });
+      }
     } catch {
-      cursor = null;
-    }
-    if (isLiveStore(store)) {
-      unsubscribeLive = store.onAppended(() => {
-        if (stopped) return;
-        wakeRequested = true;
-        schedule(0);
-      });
+      // no doorbell (e.g. the store is closing): polling alone still delivers everything
     }
   })().finally(() => {
     inFlight = undefined;

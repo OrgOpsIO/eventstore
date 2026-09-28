@@ -1,6 +1,7 @@
 import { TenantMismatchError } from "./errors.js";
+import { isWakeStore } from "./memory.js";
 import { filtersOf } from "./query.js";
-import type { AppendIfOutcome, AppendResult, ContextHandle, EventStore, Filter, NewEvent, Query, QueryOptions, QueryResult, StatisticsStore } from "./types.js";
+import type { AppendIfOutcome, AppendResult, ContextHandle, EventStore, Filter, NewEvent, Query, QueryOptions, QueryResult, StatisticsStore, WakeStore } from "./types.js";
 
 /** How the tenant is represented: as a scope key in every event's payload. */
 export interface TenantConfig {
@@ -81,5 +82,7 @@ export function scopedToTenant(
   };
   // statistics narrow like any read
   if (typeof inner.statistics === "function") view.statistics = (query: Query = {}) => inner.statistics!(narrow(query));
+  // the doorbell carries no data, so it passes through unchanged; what a woken reader sees is narrowed
+  if (isWakeStore(inner)) (view as EventStore & Partial<WakeStore>).onCommitted = (listener) => inner.onCommitted(listener);
   return view;
 }

@@ -29,6 +29,7 @@ import type {
   StatisticsStore,
   StoreSchema,
   TypeStatistics,
+  WakeStore,
 } from "./types.js";
 
 /** Called with the records of one append batch. */
@@ -81,7 +82,7 @@ interface Row {
  * not O(store). Every candidate is still verified with the full filter predicate, so the
  * index can only speed things up, never change an answer.
  */
-export class MemoryStore implements EventStore, LiveStore, StatisticsStore {
+export class MemoryStore implements EventStore, LiveStore, WakeStore, StatisticsStore {
   readonly schema: StoreSchema;
   private readonly clock: () => Date;
   private readonly rows: Row[] = [];
@@ -90,6 +91,7 @@ export class MemoryStore implements EventStore, LiveStore, StatisticsStore {
   /** row indices per scope key → value, ascending */
   private readonly byScope = new Map<string, Map<string, number[]>>();
   private readonly listeners = new Set<AppendedListener>();
+  private readonly doorbells = new Set<(hint: number | null) => void>();
   private readonly uniqueSeen = new Map<string, Set<string>>();
   private readonly idempotencyKeys = new Set<string>();
   private readonly idKeys = new Map<string, string>();
@@ -331,6 +333,13 @@ export class MemoryStore implements EventStore, LiveStore, StatisticsStore {
         }
       }
     }
+    for (const ring of this.doorbells) {
+      try {
+        ring(result.last);
+      } catch {
+        // a doorbell must never fail an append
+      }
+    }
     return result;
   }
 
@@ -364,8 +373,14 @@ export class MemoryStore implements EventStore, LiveStore, StatisticsStore {
     return () => this.listeners.delete(listener);
   }
 
+  onCommitted(listener: (hint: number | null) => void): () => void {
+    this.doorbells.add(listener);
+    return () => this.doorbells.delete(listener);
+  }
+
   async close(): Promise<void> {
     this.listeners.clear();
+    this.doorbells.clear();
   }
 }
 
@@ -413,6 +428,11 @@ function splitUniqueKey(key: string): [string, string, string] {
   const first = key.indexOf("|");
   const second = key.indexOf("|", first + 1);
   return [key.slice(0, first), key.slice(first + 1, second), key.slice(second + 1)];
+}
+
+/** Whether a store rings a doorbell after a commit (`onCommitted`). */
+export function isWakeStore(store: EventStore): store is EventStore & WakeStore {
+  return typeof (store as Partial<WakeStore>).onCommitted === "function";
 }
 
 /** Whether a store can push appended events in-process (`onAppended`). */

@@ -28,7 +28,9 @@ import type {
   StatisticsStore,
   StoreSchema,
   TypeStatistics,
+  WakeStore,
 } from "../types.js";
+import { CommitListener, type OpenedConnection } from "./live.js";
 import {
   APPEND_SIGNATURE,
   DEFAULT_SCHEMA,
@@ -46,6 +48,12 @@ import {
   grantStatements,
   idempotencyIndexDdl,
   idempotencyIndexName,
+  notifyChannel,
+  notifyFunctionDdl,
+  notifyFunctionFingerprint,
+  notifyFunctionName,
+  notifyTriggerDdl,
+  notifyTriggerName,
   indexName,
   policyExpression,
   policyName,
@@ -135,6 +143,20 @@ export interface CreatePostgresStoreOptions {
    * next install; run `ANALYZE` after that, a new object is empty.
    */
   readonly scopeStatistics?: ScopeStatisticsPolicy;
+  /**
+   * The commit doorbell. `true` (or an object) installs a statement trigger that NOTIFYs the
+   * highest sequence of every insert on commit — no type, scope, tenant or payload — and gives
+   * the store `onCommitted`, served by ONE extra connection per store that LISTENs outside the
+   * pool. Subscriptions and `es.watch` then wake at once instead of polling.
+   *
+   * `connection`: where to LISTEN — needed behind PgBouncer in transaction mode (LISTEN does not
+   * survive it) and when `connection` above is a pool you own (otherwise one of its connections
+   * is taken for good). Default: off. The cost: Postgres serialises the commits of notifying
+   * transactions on one lock, which matters only at very high write rates; and a listener that
+   * stays connected but stops reading fills the notification queue until notifying commits
+   * fail — monitor `pg_notification_queue_usage()`.
+   */
+  readonly live?: boolean | { readonly connection?: string };
 }
 
 const DEFAULT_TIMEOUTS: Required<PoolTimeouts> = { statementMs: 30_000, lockMs: 10_000, idleInTransactionMs: 30_000 };
@@ -187,7 +209,7 @@ export interface LockPlan {
  * The PostgreSQL store: one `events` table, `es_scope()` expression indexes, `es_append_if_v5`
  * for atomic conditional appends. Every statement is schema-qualified.
  */
-export class PostgresStore implements EventStore, StatisticsStore {
+export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeStore> {
   readonly schema: StoreSchema;
   readonly table: string;
   /** Postgres namespace of the table and functions. */
@@ -196,7 +218,7 @@ export class PostgresStore implements EventStore, StatisticsStore {
   private readonly pool: Pool;
   private readonly ownsPool: boolean;
   private readonly installMode: "auto" | "none";
-  private readonly ddlOptions: { adhocQueries?: boolean; rls?: boolean; tenantScopeKey?: string; grantExecuteTo?: readonly string[]; typeIndex?: boolean };
+  private readonly ddlOptions: { adhocQueries?: boolean; rls?: boolean; tenantScopeKey?: string; grantExecuteTo?: readonly string[]; typeIndex?: boolean; live?: boolean };
   private readonly uniqueByIndex: Map<string, { type: string; path: string }>;
   private readonly idempotencyIndex: string;
   private readonly fn: string;
@@ -209,6 +231,9 @@ export class PostgresStore implements EventStore, StatisticsStore {
   private readonly warningList: string[] = [];
   /** How often an append collapsed its lock plan to the global lock because it exceeded `maxLockKeys`. */
   lockPlanCollapses = 0;
+  private readonly listener: CommitListener | undefined;
+  /** The commit doorbell; present only with `live` (see `WakeStore`). */
+  readonly onCommitted?: (listener: (hint: number | null) => void) => () => void;
 
   constructor(options: CreatePostgresStoreOptions) {
     this.schema = options.schema;
@@ -246,7 +271,39 @@ export class PostgresStore implements EventStore, StatisticsStore {
       tenantScopeKey: options.tenantScopeKey ?? this.schema.tenantScopeKey,
       grantExecuteTo: options.grantExecuteTo,
       typeIndex: options.typeIndex,
+      live: options.live !== undefined && options.live !== false,
     };
+    if (this.ddlOptions.live) {
+      const liveConnection = typeof options.live === "object" ? options.live.connection : undefined;
+      const direct = liveConnection ?? (typeof options.connection === "string" ? options.connection : undefined);
+      const pool = this.pool;
+      const open = async (): Promise<OpenedConnection> => {
+        if (direct === undefined) {
+          const client = await pool.connect();
+          return { connection: client, release: () => client.release(true) }; // LISTEN state never goes back into the pool
+        }
+        const client = new pg.Client({ connectionString: direct, keepAlive: true });
+        client.on("error", () => undefined); // the listener's own "error" handler decides; never crash the process
+        await client.connect();
+        return { connection: client, release: () => void client.end().catch(() => undefined) };
+      };
+      if (direct === undefined) this.warningList.push("live: no live.connection given with an external pool — the doorbell holds one connection of that pool");
+      const listener = new CommitListener(open, notifyChannel(this.target), {
+        verify: async () => {
+          const found = await this.pool.query("SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = to_regclass($1) AND tgname = $2 AND NOT tgisinternal", [
+            `${quoteIdent(this.schemaName)}.${quoteIdent(this.table)}`,
+            notifyTriggerName(this.table),
+          ]);
+          return found.rows.length > 0;
+        },
+        onMissing: () =>
+          this.warningList.push(
+            `live: the doorbell trigger ${notifyTriggerName(this.table)} is not installed, so nothing rings — falling back to waking every 500 ms; install with install: "auto" or printSchemaSql(schema, { live: true })`,
+          ),
+      });
+      this.listener = listener;
+      this.onCommitted = (l) => listener.add(l);
+    }
     if (options.rls && !this.ddlOptions.tenantScopeKey) throw new Error("eventstore/postgres: rls: true needs tenantScopeKey");
     this.uniqueByIndex = new Map(uniqueIndexes(this.schema, this.table).map((u) => [u.name, { type: u.type, path: u.path }]));
     this.idempotencyIndex = idempotencyIndexName(this.table);
@@ -412,6 +469,21 @@ export class PostgresStore implements EventStore, StatisticsStore {
       [this.schemaName, appendFunctionBaseName(this.table), ourSig],
     );
     for (const row of others.rows) await client.query(`DROP FUNCTION IF EXISTS ${row.sig}`);
+
+    // ── the commit doorbell (live): the trigger function by fingerprint, the trigger once
+    if (this.ddlOptions.live) {
+      const notifySig = `${qualified(this.schemaName, notifyFunctionName(this.table))}()`;
+      const notifyFp = notifyFunctionFingerprint(target);
+      if ((await functionComment(client, notifySig)) !== notifyFp) {
+        await client.query(notifyFunctionDdl(target));
+        await this.comment(client, `FUNCTION ${notifySig}`, notifyFp, true);
+      }
+      const trigger = await client.query("SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid = to_regclass($1) AND tgname = $2 AND NOT tgisinternal", [
+        `${quoteIdent(this.schemaName)}.${quoteIdent(this.table)}`,
+        notifyTriggerName(this.table),
+      ]);
+      if (trigger.rows.length === 0) await client.query(notifyTriggerDdl(target));
+    }
 
     // ── row-level security: ALTER only when needed, policy recreated when USING or WITH CHECK drifted
     if (this.ddlOptions.rls) {
@@ -717,10 +789,12 @@ FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb,
    * (`scopedToTenant`) for query narrowing and event stamping. Under `rls` this is also the
    * store to hand to `subscribe`/`on`: the root store refuses to be polled.
    */
-  withTenant(tenantId: string): EventStore & StatisticsStore {
+  withTenant(tenantId: string): EventStore & StatisticsStore & Partial<WakeStore> {
     const inTenant = <T>(fn: (runner: Runner) => Promise<T>): Promise<T> =>
       this.ensureInstalled().then(() => withTenantSession(this.pool, tenantId, (client) => fn(client)));
     return {
+      // the doorbell is the store's: it carries no tenant, the tenant session decides what a read sees
+      ...(this.onCommitted ? { onCommitted: this.onCommitted } : {}),
       query: (query, options = {}) => inTenant((r) => this.queryWith(r, query, options, true)),
       statistics: (query = {}) => inTenant((r) => this.statisticsWith(r, query, true)),
       append: async (events) => {
@@ -744,7 +818,17 @@ FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb,
     }
   }
 
+  /**
+   * Fill level of this database's notification queue, 0…1 (`pg_notification_queue_usage()`).
+   * Near 0 when every listener reads; at 1 every commit that notifies fails — alert well before.
+   */
+  async notificationQueueUsage(): Promise<number> {
+    const result = await this.pool.query<{ usage: number }>("SELECT pg_catalog.pg_notification_queue_usage() AS usage");
+    return Number(result.rows[0]?.usage ?? 0);
+  }
+
   async close(): Promise<void> {
+    await this.listener?.close();
     if (this.ownsPool) await this.pool.end();
   }
 }
@@ -764,9 +848,10 @@ export function printSchemaSql(
   const header =
     "-- @orgops/eventstore schema. Idempotent, but NOT gated: CREATE OR REPLACE FUNCTION es_scope over existing scope\n" +
     "-- indexes needs those indexes rebuilt (see scopeRebuildStatements). Run as the table owner.";
-  const { scopeStatistics, ...ddlOptions } = options;
+  const { scopeStatistics, live, ...ddlOptions } = options;
   const statements = ddlStatements(schema, {
     ...ddlOptions,
+    live: live !== undefined && live !== false,
     ...(scopeStatistics === undefined || scopeStatistics === "all" ? {} : { scopeStatistics: scopeStatisticsKeys(schema.scopeKeys, new Map(), scopeStatistics) }),
     table: options.table ?? "events",
     tenantScopeKey: options.tenantScopeKey ?? schema.tenantScopeKey,

@@ -7,6 +7,7 @@ export type {
   EventStore,
   Filter,
   Metadata,
+  NegatedFilter,
   NewEvent,
   Query,
   QueryOptions,
@@ -16,6 +17,7 @@ export type {
   StatisticsStore,
   StoreSchema,
   TypeStatistics,
+  WakeStore,
 } from "./types.js";
 export {
   ConflictError,
@@ -29,6 +31,7 @@ export {
   UniqueViolationError,
   UsageError,
   ValidationError,
+  WatchOverflowError,
 } from "./errors.js";
 export type { ValidationIssue } from "./errors.js";
 export { defineEvents, buildSchema, emptySchema } from "./registry.js";
@@ -51,7 +54,7 @@ export type {
   SchemaOptions,
   TrimmedDataOf,
 } from "./registry.js";
-export { MemoryStore, cursorOf, isLiveStore } from "./memory.js";
+export { MemoryStore, cursorOf, isLiveStore, isWakeStore } from "./memory.js";
 export type { AppendedListener, LiveStore, MemoryStoreOptions } from "./memory.js";
 export { CacheBudget, ContextCache, estimateSize } from "./context.js";
 export type { ContextCacheOptions, ContextSpec, Fold, LoadedContext } from "./context.js";
@@ -61,5 +64,7 @@ export { PLATFORM_TENANT_ID, scopedToTenant } from "./tenant.js";
 export type { TenantConfig } from "./tenant.js";
 export { configure, createEventStore, es, isConfigured, reset } from "./runtime.js";
 export type { EventStoreApi, EventStoreConfig, PostgresOptions } from "./runtime.js";
+export { WatchHub } from "./watch.js";
+export type { Watch, WatchLimits, WatchOptions } from "./watch.js";
 export { uuidv7, defaultIdKey } from "./ids.js";
 export { compareCursor, scope } from "./query.js";

@@ -200,6 +200,18 @@ export interface StatisticsStore {
   statistics(query?: Query): Promise<readonly TypeStatistics[]>;
 }
 
+/**
+ * Optional store capability: a doorbell that rings after a commit. It carries no event, no type,
+ * no scope and no tenant — at most a hint (the memory store passes the highest sequence; Postgres
+ * passes `null`) — and it may ring too often,
+ * late, or not at all. A listener answers it by reading through its own view (cursor, tenant
+ * session); that read is the truth, the doorbell only saves the wait for the next poll.
+ */
+export interface WakeStore {
+  /** `hint`: the highest sequence of the commit when the store knows it, else `null` ("read anyway"). */
+  onCommitted(listener: (hint: number | null) => void): () => void;
+}
+
 /** The store contract. Both the memory store and the Postgres store implement exactly this. */
 export interface EventStore {
   query(query: Query, options?: QueryOptions): Promise<QueryResult>;

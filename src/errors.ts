@@ -111,6 +111,12 @@ export class ContextTooLargeError extends EventStoreError {
   }
 }
 
+/** A watcher fell further behind than `watch.maxPendingBatches` (a slow SSE client, say) and was dropped. */
+export class WatchOverflowError extends EventStoreError {
+  override readonly name = "WatchOverflowError";
+  override readonly httpStatus = 503;
+}
+
 /** Base for programming errors surfaced at request time: invalid query shapes, undeclared types. */
 export class UsageError extends EventStoreError {
   override readonly name = "UsageError";

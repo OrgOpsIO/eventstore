@@ -4,7 +4,10 @@ import { ConflictError, NotConfiguredError, UsageError } from "./errors.js";
 import { MemoryStore } from "./memory.js";
 import { buildSchema, type Definitions, type EventRegistry, type RecordedEventOf, type RegistryLike } from "./registry.js";
 import type { CreatePostgresStoreOptions } from "./postgres/store.js";
+import { queryKey } from "./query.js";
+import { subscribe, type SubscribeOptions, type Subscription, type SubscriptionHandler } from "./subscribe/index.js";
 import { PLATFORM_TENANT_ID, scopedToTenant, type TenantConfig } from "./tenant.js";
+import { WatchHub, type Watch, type WatchLimits, type WatchOptions } from "./watch.js";
 import type {
   AppendIfOutcome,
   AppendResult,
@@ -14,6 +17,7 @@ import type {
   Query,
   QueryOptions,
   QueryResult,
+  RecordedEvent,
   StatisticsStore,
   StoreSchema,
   TypeStatistics,
@@ -54,6 +58,8 @@ export interface EventStoreConfig {
    */
   readonly maxTenantViews?: number;
   readonly clock?: () => Date;
+  /** Hard limits of `es.watch` in this process: watchers alive, queued batches per watcher. */
+  readonly watch?: WatchLimits;
 }
 
 /** The thing you use. `es` is one of these; `createEventStore()` gives you your own. */
@@ -76,6 +82,22 @@ export interface EventStoreApi extends EventStore {
   /** Run a CCC command: read → decide → `appendIf`, retrying on conflict. */
   command<R = void>(spec: RawCommandSpec<R>): Promise<CommandOutcome<R>>;
   command<S, R = void>(spec: CommandSpec<S, R>): Promise<CommandOutcome<R>>;
+  /**
+   * A durable, gap-free subscription with a named cursor, read through this view (a tenant
+   * view reads that tenant only, under its session). At-least-once: the cursor advances after
+   * the handler resolved. On a tenant view the cursor is stored as `name@tenantId`. With a
+   * doorbell (`postgres: { live: true }`, or the memory store) it wakes at once; otherwise it
+   * polls. Resolves once it has started (`whenCaughtUp()` waits for the replay).
+   */
+  subscribe(name: string, query: Query, handler: SubscriptionHandler, options?: Omit<SubscribeOptions, "store">): Promise<Subscription>;
+  /**
+   * An ephemeral watch for live pushes (SSE): from about now, cursor in memory, at-most-once.
+   * Every watcher of the same view and query in this process shares one read per doorbell; a
+   * watcher that falls `watch.maxPendingBatches` behind is dropped with `WatchOverflowError`.
+   * Delivery is always a cursor read through this view, never the notification itself.
+   * Resolves once the watch is live: an append after that is delivered.
+   */
+  watch(query: Query, handler: (events: readonly RecordedEvent[]) => void | Promise<void>, options?: WatchOptions): Promise<Watch>;
   /** Load a context incrementally (cached per query in this view). */
   context<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>>;
   /** Like `appendIf`, but throws `ConflictError` instead of returning the conflict. */
@@ -138,7 +160,7 @@ export function createEventStore(config: EventStoreConfig): EventStoreApi {
   };
   const cacheOptions = config.contextCache === false ? { max: 0 } : (config.contextCache ?? {});
   const budget = new CacheBudget(cacheOptions.totalMaxBytes ?? 256 * 1024 * 1024);
-  return buildApi({ schema, store, created: () => storePromise !== undefined, config, tenantId: undefined, views: new Map(), budget });
+  return buildApi({ schema, store, created: () => storePromise !== undefined, config, tenantId: undefined, views: new Map(), budget, hub: new WatchHub(config.watch) });
 }
 
 interface ApiParts {
@@ -154,6 +176,8 @@ interface ApiParts {
   readonly budget: CacheBudget;
   /** Set on a past view (`asOf`): the inclusive sequence cutoff of every read; writes refused. */
   readonly until?: number;
+  /** One watch hub per root api: readers shared per (view, query), limits per process. */
+  readonly hub: WatchHub;
 }
 
 /** The store as it was at `until`: reads capped (never widened), writes refused. */
@@ -248,6 +272,15 @@ function buildApi(parts: ApiParts): EventStoreApi {
     async context(spec) {
       return (await cacheFor()).load(spec);
     },
+    async subscribe(name, query, handler, options = {}) {
+      if (parts.until !== undefined) throw new UsageError("eventstore: a past view (asOf) cannot subscribe — subscribe on a live view");
+      const sub = subscribe(tenantId === undefined ? name : `${name}@${tenantId}`, query, handler, { ...options, store: await view() });
+      return sub;
+    },
+    async watch(query, handler, options) {
+      if (parts.until !== undefined) throw new UsageError("eventstore: a past view (asOf) cannot watch — watch a live view");
+      return parts.hub.watch(JSON.stringify([tenantId ?? null, queryKey(query)]), await view(), query, handler, options);
+    },
     forTenant(id: string): EventStoreApi {
       if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");
       if (id === tenantId) return api;
@@ -281,6 +314,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       cache?.invalidate(query);
     },
     async close(): Promise<void> {
+      if (tenantId === undefined && parts.until === undefined) await parts.hub.close(); // watch readers are the api's; subscriptions are yours
       if (tenantId === undefined && parts.until === undefined && parts.created()) await (await parts.store()).close();
     },
   };
@@ -386,6 +420,8 @@ export const es: EventStoreApi = {
   appendIfOrThrow: (e, c) => current().appendIfOrThrow(e, c),
   command: ((s: CommandSpec<unknown, unknown>) => current().command(s)) as EventStoreApi["command"],
   context: (s) => current().context(s),
+  subscribe: (n, q, h, o) => current().subscribe(n, q, h, o),
+  watch: (q, h, o) => current().watch(q, h, o),
   forTenant: (id) => current().forTenant(id),
   forPlatform: () => current().forPlatform(),
   asOf: (n) => current().asOf(n),

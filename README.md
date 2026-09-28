@@ -235,24 +235,41 @@ await es.statistics(articles.$filter({ types: ["ArticleContentEdited"] }));
 
 Count, stored bytes and last sequence per event type, narrowed by a query like any read and by the tenant on a tenant view. Postgres sums `pg_column_size(payload)` — the on-disk size, compressed where TOASTed — without fetching a payload; the memory store reports JSON text length. `statistics()` is an optional store capability (`StatisticsStore`); a custom store may lack it, and the api then throws `UsageError`. Deliberately not in the package: a cross-tenant directory ("whose account, token or key is this?") — under RLS that is a `SECURITY DEFINER` function of the application, owned and audited there.
 
-## Subscriptions (`@orgops/eventstore/subscribe`)
+## Subscriptions and live pushes
 
 ```ts
-import { subscribe, fileCursors, resetCursor, on } from "@orgops/eventstore/subscribe";
-
-const cursors = fileCursors("./data/cursors.json");   // default: memoryCursors() (replays from `from` after a restart)
-const sub = subscribe("search-index", articles.$filter(), async (events) => { … }, {
-  store: await es.store(),
-  cursors,
+// durable: named cursor, gap-free, at-least-once — a projection, a search index, an outbox
+const sub = await es.forTenant(t).subscribe("search-index", articles.$filter(), async (events) => { … }, {
+  cursors: fileCursors("./data/cursors.json"),   // default: memoryCursors() (replays from `from` after a restart)
   onError: (error, batch) => "retry",            // or "skip" | "stop"; batch is empty for store errors
 });
 await sub.whenCaughtUp();                        // resolves on the next empty page
-await resetCursor("search-index", cursors);      // forget the cursor → replay from `from`
+await sub.stop();
 
-on(articles.$filter(), (events) => sse.push(events), { store: memoryStore });   // in-process, fire-and-forget; the store must be a LiveStore (MemoryStore)
+// ephemeral: from about now, at-most-once — an SSE stream to one browser tab
+const watch = await es.forTenant(t).watch(articles.$filter(), (events) => sse.push(events), {
+  signal: request.signal,                        // a closed request gives its place back, even before the watch started
+  onError: () => sse.close(),                    // it ended on its own: handler threw, fell behind, or the read was refused
+});
+watch.stop();
 ```
 
-Durable, gap-free, at-least-once: reads settled events beyond a `(transactionId, sequence)` cursor, advances only after your handler resolved, retries with back-off. `events` stays the only table — the cursor store is pluggable. Subscriptions are not owned by `es`: stop them (`await sub.stop()`) before `es.close()`, or their next poll fails against a closed pool and is retried until you stop it.
+Both read through the view they are called on: a tenant view delivers that tenant's events only, under its session when `rls` is on (the root view under `rls` cannot watch — the read is refused). `subscribe` reads settled events beyond a `(transactionId, sequence)` cursor, advances it only after your handler resolved, retries with back-off, and on a tenant view keeps its cursor as `name@tenantId`. `watch` shares **one reader per view and query** in the process: a hundred tabs on the same tenant cost one read per commit, not a hundred. Every watcher has its own queue; one that falls `watch.maxPendingBatches` behind (default 64) is dropped with `WatchOverflowError` instead of holding the others back or filling memory, and at most `watch.maxWatchers` (default 10 000) live at once: `configure({ watch: { maxWatchers, maxPendingBatches } })`. A store error that no retry will fix (a refused read, missing permissions) ends the watch; a dropped connection is retried. `es.close()` ends every watch.
+
+Subscriptions are not owned by `es`: stop them before `es.close()`. The low-level `subscribe(name, query, handler, { store })` from `@orgops/eventstore/subscribe` is what `es.subscribe` is built on and stays available; `on()` there is superseded by `es.watch` (it only ever worked with the memory store).
+
+### The commit doorbell (`postgres: { live: true }`)
+
+Without it, subscriptions on Postgres poll (500 ms). With it, the installer adds a statement trigger that runs `pg_notify` after every insert statement, and the store keeps **one extra connection** that `LISTEN`s — so every subscription and watch in every process wakes as soon as anything commits, and polls only as a safety net (5 s). The limits are built in, not options:
+
+- **The notification is a doorbell, never the data.** Its payload is empty — no sequence, tenant, type, scope or payload. Whoever can `LISTEN` on the database learns *that* and *when* something was written to the table, not by whom or what. Delivery is always a cursor read through the subscriber's own view, so tenant narrowing and row-level security decide what anyone sees.
+- **Only on commit.** `NOTIFY` is transactional: a rolled-back batch rings nothing. One notification per append batch.
+- **Losing one costs latency, never events.** Notifications sent while the listener is disconnected are gone; the cursor read is gap-free regardless. The listener reconnects with back-off (100 ms → 5 s) and, every time `LISTEN` is up again, wakes everyone once to read what committed meanwhile.
+- **Doorbells within 25 ms share one read** per reader (`wakeCoalesceMs`), and they never cut a retry back-off short: a failing handler is not retried on every commit elsewhere.
+- **Events waiting on an older transaction are re-read soon** (25 ms, doubling to 500 ms), not after the safety-net poll: they become readable when that transaction ends, and its end rings nothing when it wrote to another table.
+- **Without the trigger** (`live` with `install: "none"` and the DDL not run) nothing would ring: the store records a warning and wakes its subscribers every 500 ms — polling's pace, not the safety net's.
+
+Operations: `LISTEN` does not survive PgBouncer in transaction mode — give it a direct connection with `postgres: { live: { connection } }`, which you also want when `connection` is a pool of your own (otherwise the doorbell takes one of its connections for good). Postgres serialises the commits of notifying transactions on one lock; that matters only at very high write rates (our raw ceiling was ~200 000 events/s without it) — leave `live` off for a bulk-loading process, the trigger rings for everyone's inserts anyway. The one real risk: Postgres keeps undelivered notifications in a queue (8 GB by default), and when a listener stays connected but stops reading, the queue fills and **commits that notify fail** — every append, not just the listener's process. The SDK's listener reads on Node's event loop and never opens a transaction, so this takes a process that is alive but stuck; watch `store.notificationQueueUsage()` (`pg_notification_queue_usage()`; it should stay near 0) and alert well below 1. With `install: "none"`, `printSchemaSql(schema, { live: true })` lists the trigger. The trigger needs Postgres 14 or later.
 
 ## Testing (`@orgops/eventstore/testing`)
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0 (2026-09-28)
+
+Live pushes across processes, with hard limits instead of options.
+
+- **`es.subscribe(name, query, handler, options?)`** and **`es.watch(query, handler, options?)`** on the api, next to `append`: both read through the view they are called on (a tenant view: that tenant only, under its session). `subscribe` is durable (named cursor, `name@tenantId` on a tenant view, at-least-once); `watch` is ephemeral (from about now, at-most-once) and shares one reader per view and query in the process. A watcher that falls `watch.maxPendingBatches` (64) behind is dropped with the new `WatchOverflowError`; `watch.maxWatchers` (10 000) caps them per process. Past views (`asOf`) refuse both.
+- **The commit doorbell on Postgres: `postgres: { live: true }`** installs a statement trigger that `pg_notify`s after every insert statement on commit with an **empty payload** — no sequence, tenant, type, scope or data — and one `LISTEN` connection per store (`live: { connection }` for a direct one behind PgBouncer). New optional store capability `WakeStore` (`onCommitted`), implemented by both stores and passed through tenant views; `subscribe` wakes on it (doorbells within 25 ms share one read, and never cut a retry back-off short), re-reads soon while events wait on an older transaction, and polls only as a safety net (5 s). The listener reconnects with back-off and wakes everyone once after every (re)connect; without the trigger it warns and wakes every 500 ms. `watch` takes an `AbortSignal`, ends on store errors no retry will fix, and `es.close()` ends every watch. New: `notifyChannel`, `notifyFunctionDdl`, `notifyTriggerDdl`, `isWakeStore`, and `PostgresStore.notificationQueueUsage()` for health checks — a listener that stays connected but stops reading fills the notification queue until notifying commits fail.
+- **Fix: a subscription whose start position could not be loaded replayed everything.** When the cursor store (or the store, for `from: "now"`) failed at start, `subscribe` fell back to the beginning. It now retries resolving the start position like any failed poll.
+- `NegatedFilter` (0.4.0) is now exported, as the 0.4.0 notes said.
+
 ## 0.4.0 (2026-09-28)
 
 Two gaps a consumer migration ran into: a guard over a whole scope that leaves some facts out, and reading the store as it was.

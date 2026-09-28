@@ -142,6 +142,50 @@ export function indexName(table: string, kind: string, detail: string): string {
   return `${base.slice(0, 54)}_${short(base)}`;
 }
 
+// ── the commit doorbell ───────────────────────────────────────────────────────
+
+/**
+ * The NOTIFY channel of a target: derived from schema and table, so two stores in one
+ * database never ring each other's bell. Its payload is empty: a notification says "something
+ * committed on this table" and nothing else — no sequence, type, scope, tenant or payload.
+ */
+export function notifyChannel(target: Target): string {
+  return `es_commit_${short(`${target.schemaName}.${target.table}`)}${short(`${target.table}.${target.schemaName}`)}`;
+}
+
+export function notifyFunctionName(table: string): string {
+  return indexName(table, "notify", "fn");
+}
+
+export function notifyTriggerName(table: string): string {
+  return indexName(table, "notify", "trg");
+}
+
+/** The trigger function behind the doorbell (fingerprinted by the installer like every SDK function). */
+export function notifyFunctionDdl(target: Target): string {
+  return `CREATE OR REPLACE FUNCTION ${qualified(target.schemaName, notifyFunctionName(target.table))}() RETURNS trigger
+  LANGUAGE plpgsql SECURITY INVOKER
+  SET search_path = ${searchPath(target.schemaName)}
+  AS $fn$
+BEGIN
+  -- one notification per insert STATEMENT (an append batch), delivered only on commit, with an
+  -- empty payload: a listener reads through its own view. No transition table — nothing here
+  -- needs the inserted rows, and keeping a copy of a 10 000-event batch would cost memory or temp files.
+  PERFORM pg_notify(${quoteLiteral(notifyChannel(target))}, '');
+  RETURN NULL;
+END
+$fn$`;
+}
+
+export function notifyFunctionFingerprint(target: Target): string {
+  return `es:${createHash("sha256").update(notifyFunctionDdl(target)).digest("hex")}`;
+}
+
+/** The statement trigger (Postgres 14+ for `OR REPLACE`). */
+export function notifyTriggerDdl(target: Target): string {
+  return `CREATE OR REPLACE TRIGGER ${quoteIdent(notifyTriggerName(target.table))} AFTER INSERT ON ${tableRef(target)} FOR EACH STATEMENT EXECUTE FUNCTION ${qualified(target.schemaName, notifyFunctionName(target.table))}()`;
+}
+
 /** Base name of the append function for a table (all versions share it as a prefix). */
 export function appendFunctionBaseName(table: string): string {
   return table === "events" ? "es_append_if" : indexName(table, "append", "if").replace(/^es_/, "es_fn_");
@@ -171,6 +215,8 @@ export interface DdlOptions {
    * index size is the caller's (the installer makes it itself with `scopeStatistics`).
    */
   readonly scopeStatistics?: "all" | readonly string[];
+  /** The commit doorbell: a statement trigger that NOTIFYs (with an empty payload) after each insert. */
+  readonly live?: boolean;
 }
 
 export interface UniqueIndex {
@@ -439,6 +485,12 @@ export function ddlStatements(schema: StoreSchema, options: DdlOptions): string[
     `COMMENT ON FUNCTION ${qualified(target.schemaName, appendFunctionName(target.table))}${APPEND_SIGNATURE} IS ${quoteLiteral(appendFunctionFingerprint(target))}`,
   );
   statements.push(...grantStatements(target, options));
+
+  if (options.live) {
+    statements.push(notifyFunctionDdl(target));
+    statements.push(`COMMENT ON FUNCTION ${qualified(target.schemaName, notifyFunctionName(target.table))}() IS ${quoteLiteral(notifyFunctionFingerprint(target))}`);
+    statements.push(notifyTriggerDdl(target));
+  }
 
   if (options.rls) {
     if (!tenantKey) throw new Error("eventstore/postgres: rls: true needs tenantScopeKey");
