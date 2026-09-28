@@ -1,6 +1,6 @@
 {
   "name": "@orgops/eventstore",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A PostgreSQL realisation of the event-orientation and Command Context Consistency work of Ralf Westphal and Rico Fritzsche: one events table, scopes instead of aggregates, an atomic conditional append, indexes and locks derived from typed event declarations. Configure once, import `es` anywhere.",
   "type": "module",
   "license": "MIT",

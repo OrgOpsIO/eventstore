@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 (2026-09-28)
+
+- **`invalidate()` without a query released nothing from the process-wide budget.** It cleared the view's entries but left their bytes in `CacheBudget` as ghosts. Once a ghost was the oldest entry and the budget was exceeded, `CacheBudget.touch` evicted it again and again without freeing anything — a synchronous endless loop that blocked the event loop for every tenant. Affected: every `invalidate()` on a view or on the api, and the eviction of a tenant view from the `maxTenantViews` LRU. Now `invalidate()` releases each entry, and the budget drops a token itself when its cache no longer holds the entry.
+
 ## 0.2.0 (2026-09-15)
 
 Two things applications had to do with raw SQL beside the package, now inside it. Both are reads; the store stays append-only. Deliberately still outside: cross-tenant directory functions and tenant erasure.

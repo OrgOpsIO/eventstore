@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
+  CacheBudget,
   ConflictError,
   ContextCache,
   MemoryStore,
@@ -324,6 +325,40 @@ describe("memory store + api", () => {
     const d = await api.forTenant("d").context({ query: articles.$filter(), fold, initial: 0 });
     expect(a.cacheHit).toBe(false);
     expect(d.cacheHit).toBe(true);
+  });
+
+  it("invalidate() releases every entry from the shared budget", async () => {
+    const store = new MemoryStore({ schema: buildSchema([articles], { strict: false }) });
+    await store.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
+    const budget = new CacheBudget(100);
+    const fold = (events: readonly import("../src/index.js").RecordedEvent[], state: number) => state + events.length;
+    const erased = new ContextCache(store, { budget, sizeOf: () => 60 });
+    await erased.load({ query: articles.$filter(), fold, initial: 0 });
+    erased.invalidate();
+    expect(erased.byteSize).toBe(0);
+    expect(budget.bytes).toBe(0);
+    expect(budget.entries).toBe(0);
+    // Before 0.2.1 the entry stayed in the budget as a ghost, and this load never returned:
+    // eviction picked the ghost as the oldest entry again and again without freeing anything.
+    const other = new ContextCache(store, { budget, sizeOf: () => 60 });
+    await other.load({ query: articles.$filter(), fold, initial: 0 });
+    expect(budget.bytes).toBe(60);
+    expect(budget.entries).toBe(1);
+  });
+
+  it("the budget drops an entry its cache no longer holds instead of stalling", async () => {
+    const store = new MemoryStore({ schema: buildSchema([articles], { strict: false }) });
+    await store.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
+    const budget = new CacheBudget(100);
+    // A cache that forgot its entry without telling the budget (as invalidate() did before 0.2.1).
+    const forgetful = new ContextCache(store, { budget });
+    budget.touch(forgetful, budget.idFor(forgetful), "gone", 60);
+    const fold = (events: readonly import("../src/index.js").RecordedEvent[], state: number) => state + events.length;
+    const cache = new ContextCache(store, { budget, sizeOf: () => 60 });
+    const loaded = await cache.load({ query: articles.$filter(), fold, initial: 0 });
+    expect(loaded.state).toBe(1);
+    expect(budget.bytes).toBe(60);
+    expect(budget.entries).toBe(1);
   });
 
   it("tenant views are a bounded LRU", async () => {

@@ -155,6 +155,12 @@ export class CacheBudget {
       const [oldToken, entry] = oldest;
       if (oldToken === token) break; // never evict the entry just written; the next touch will
       entry.cache.dropFromBudget(entry.key);
+      // The cache no longer held the entry (nothing was released): drop the token here, or the
+      // loop would pick the same oldest token forever and block the event loop.
+      if (this.lru.get(oldToken) === entry) {
+        this.total -= entry.bytes;
+        this.lru.delete(oldToken);
+      }
     }
   }
 
@@ -230,11 +236,10 @@ export class ContextCache {
     return { state, ctx: result.ctx, delta: result.events, cacheHit: cached !== undefined };
   }
 
-  /** Forget one query (or everything). */
+  /** Forget one query (or everything). Either way the entries leave the shared budget too. */
   invalidate(query?: Query): void {
     if (query === undefined) {
-      this.entries.clear();
-      this.bytes = 0;
+      for (const key of [...this.entries.keys()]) this.evict(key);
     } else this.evict(queryKey(query));
   }
 
