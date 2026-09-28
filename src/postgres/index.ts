@@ -1,4 +1,6 @@
-export { PostgresStore, createPostgresStore, printSchemaSql, withTenantSession } from "./store.js";
+export { PostgresStore, createPostgresStore, printAdoptSql, printSchemaSql, withTenantSession } from "./store.js";
+export { adoptStatements, planAdoption } from "./adopt.js";
+export type { AdoptColumns, AdoptOptions, AdoptionPlan, CatalogColumn, CatalogTable } from "./adopt.js";
 export type { CreatePostgresStoreOptions, LockPlan, PoolTimeouts } from "./store.js";
 export {
   APPEND_FUNCTION_VERSION,

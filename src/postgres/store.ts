@@ -30,6 +30,21 @@ import type {
   TypeStatistics,
   WakeStore,
 } from "../types.js";
+import {
+  ADOPT_COLUMNS_SQL,
+  ADOPT_INDEXES_SQL,
+  ADOPT_POLICIES_SQL,
+  ADOPT_TRIGGERS_SQL,
+  ADOPT_WRITE_GRANTS_SQL,
+  ADOPT_UNIQUE_SQL,
+  adoptStatements,
+  legacyXid,
+  planAdoption,
+  type AdoptionPlan,
+  type AdoptOptions,
+  type CatalogColumn,
+  type CatalogTable,
+} from "./adopt.js";
 import { CommitListener, type OpenedConnection } from "./live.js";
 import {
   APPEND_SIGNATURE,
@@ -157,6 +172,16 @@ export interface CreatePostgresStoreOptions {
    * fail — monitor `pg_notification_queue_usage()`.
    */
   readonly live?: boolean | { readonly connection?: string };
+  /**
+   * Take an existing events table over at install, in place: legacy columns renamed
+   * (`columns: { sequence: "id", type: "eventtype" }`), `metadata` and `transaction_id` added,
+   * all metadata-only — `payload` is never touched, nothing is dropped. Runs inside the install
+   * transaction under the install lock (all or nothing, one process at a time), checks row count
+   * and highest sequence before and after, and does nothing on a table already adopted. A table
+   * that does not fit (half adopted, `json` instead of `jsonb`, a NOT NULL column the store
+   * cannot fill) stops the install before anything changes. See `AdoptOptions`.
+   */
+  readonly adopt?: AdoptOptions;
 }
 
 const DEFAULT_TIMEOUTS: Required<PoolTimeouts> = { statementMs: 30_000, lockMs: 10_000, idleInTransactionMs: 30_000 };
@@ -227,6 +252,7 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
   private readonly installLockTimeoutMs: number;
   private readonly rebuildScopeIndexes: boolean;
   private readonly scopeStatisticsPolicy: ScopeStatisticsPolicy;
+  private readonly adopt: AdoptOptions | undefined;
   private installed: Promise<void> | undefined;
   private readonly warningList: string[] = [];
   /** How often an append collapsed its lock plan to the global lock because it exceeded `maxLockKeys`. */
@@ -246,6 +272,7 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     this.installLockTimeoutMs = options.installLockTimeoutMs ?? 60_000;
     this.rebuildScopeIndexes = options.rebuildScopeIndexes ?? false;
     this.scopeStatisticsPolicy = options.scopeStatistics ?? "all";
+    this.adopt = options.adopt;
     if (typeof options.connection === "string") {
       const timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
       // session defaults travel in the libpq `options` parameter: no extra round trip, no
@@ -357,6 +384,109 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     }
   }
 
+  /**
+   * What `adopt` would do to the table right now — read-only, for tooling and DBAs. Uses the
+   * store's `adopt` options unless others are given.
+   */
+  async adoptionPlan(options: AdoptOptions = this.adopt ?? {}): Promise<AdoptionPlan> {
+    const client = await this.pool.connect();
+    try {
+      // read-only, and rolled back: the NULL scans of a large table must not hit statement_timeout
+      await client.query("BEGIN");
+      try {
+        await client.query("SET LOCAL statement_timeout = 0");
+        await client.query("SET LOCAL row_security = off");
+        const catalog = await this.readCatalog(client, options);
+        return planAdoption(catalog?.table ?? null, tableRef(this.target), options, this.adoptContext());
+      } finally {
+        await client.query("ROLLBACK").catch(() => undefined);
+      }
+    } finally {
+      client.release();
+    }
+  }
+
+  private adoptContext(): { rls?: boolean; ownPolicy: string } {
+    return { rls: this.ddlOptions.rls, ownPolicy: policyName(this.table) };
+  }
+
+  private async readCatalog(client: PoolClient, options: AdoptOptions): Promise<{ table: CatalogTable; sequenceColumn: string | undefined } | null> {
+    const ref = `${quoteIdent(this.schemaName)}.${quoteIdent(this.table)}`;
+    const exists = await client.query<{ present: boolean }>("SELECT to_regclass($1) IS NOT NULL AS present", [ref]);
+    if (!exists.rows[0]?.present) return null;
+    const columns = (await client.query<{ name: string; type: string; base_type: string; not_null: boolean; filled: boolean; sequenced: boolean }>(ADOPT_COLUMNS_SQL, [ref])).rows.map(
+      (r): CatalogColumn => ({ name: r.name, type: r.type, baseType: r.base_type, notNull: r.not_null, filled: r.filled, sequenced: r.sequenced }),
+    );
+    const policies = (await client.query<{ name: string; permissive: boolean }>(ADOPT_POLICIES_SQL, [ref])).rows;
+    const writeGrants = (await client.query<{ grant: string }>(ADOPT_WRITE_GRANTS_SQL, [ref, this.schemaName, this.table])).rows.map((r) => r.grant);
+    const unique = (await client.query<{ name: string }>(ADOPT_UNIQUE_SQL, [ref])).rows.map((r) => r.name);
+    const indexes = (await client.query<{ name: string }>(ADOPT_INDEXES_SQL, [ref])).rows.map((r) => r.name);
+    const triggers = (await client.query<{ name: string }>(ADOPT_TRIGGERS_SQL, [ref])).rows.map((r) => r.name);
+    // NULLs matter only in the columns the store will require a value in
+    const required = new Set(["sequence_number", "event_type", "payload", "recorded_at", "metadata", "transaction_id", options.columns?.sequence, options.columns?.type, options.columns?.payload, options.columns?.recordedAt, options.columns?.metadata, options.columns?.transactionId]);
+    const withNulls: string[] = [];
+    for (const column of columns) {
+      if (column.notNull || !required.has(column.name)) continue;
+      const found = await client.query(`SELECT 1 FROM ${tableRef(this.target)} WHERE ${quoteIdent(column.name)} IS NULL LIMIT 1`);
+      if (found.rows.length > 0) withNulls.push(column.name);
+    }
+    const names = new Set(columns.map((c) => c.name));
+    const sequenceColumn = names.has("sequence_number") ? "sequence_number" : options.columns?.sequence && names.has(options.columns.sequence) ? options.columns.sequence : undefined;
+    return { table: { columns, uniqueColumns: unique, columnsWithNulls: withNulls, indexes, triggers, policies, writeGrants }, sequenceColumn };
+  }
+
+  /** The adoption step of the install: plan, refuse on problems, execute with a before/after check. */
+  private async adoptUnderLock(client: PoolClient, options: AdoptOptions): Promise<void> {
+    // every read of the adoption sees every row, or fails: under FORCE ROW LEVEL SECURITY a
+    // filtered NULL scan or count would silently pass a table the store cannot use
+    await client.query("SET LOCAL row_security = off");
+    const catalog = await this.readCatalog(client, options);
+    const plan = planAdoption(catalog?.table ?? null, tableRef(this.target), options, this.adoptContext());
+    await client.query("SET LOCAL row_security = on");
+    if (plan.state === "absent") {
+      const where = `${this.schemaName}.${this.table}`;
+      if (options.mode === "check" || options.requireExisting) {
+        throw new EventStoreError(`eventstore/postgres: adopt: there is no table ${where} to adopt — nothing was changed (check table and schemaName)`);
+      }
+      this.warningList.push(`adopt: there was no table ${where} to adopt; a new, empty one was created — check table and schemaName if one was expected`);
+      return;
+    }
+    if (plan.problems.length > 0) {
+      throw new EventStoreError(`eventstore/postgres: cannot adopt ${this.schemaName}.${this.table} — nothing was changed:\n- ${plan.problems.join("\n- ")}`);
+    }
+    if (plan.state !== "legacy" || !catalog) return;
+    if (options.mode === "check") {
+      throw new EventStoreError(
+        `eventstore/postgres: adopt (mode "check"): ${this.schemaName}.${this.table} needs adopting — nothing was changed. The install would run:\n${plan.statements.map((st) => `  ${st};`).join("\n")}` +
+          (plan.notes.length > 0 ? `\nNotes:\n- ${plan.notes.join("\n- ")}` : ""),
+      );
+    }
+    // legacy rows must sort before every transaction that can still commit, or they stay unsettled —
+    // invisible to every durable reader — until the xid counter passes them
+    const xid = legacyXid(options);
+    const below = await client.query<{ ok: boolean }>("SELECT $1::xid8 < pg_snapshot_xmin(pg_current_snapshot()) AS ok", [xid]);
+    if (!below.rows[0]?.ok) {
+      throw new EventStoreError(`eventstore/postgres: adopt.legacyTransactionId ${xid} is not below the oldest running transaction — legacy rows would sort after new ones; nothing was changed`);
+    }
+    const t = tableRef(this.target);
+    await client.query("SET LOCAL row_security = off");
+    const legacySequence = quoteIdent(catalog.sequenceColumn ?? "sequence_number");
+    const before = await client.query<{ n: string; last: string | null }>(`SELECT count(*)::text AS n, max(${legacySequence})::text AS last FROM ${t}`);
+    for (const statement of plan.statements) await client.query(statement);
+    const after = await client.query<{ n: string; last: string | null }>(`SELECT count(*)::text AS n, max(sequence_number)::text AS last FROM ${t}`);
+    await client.query("SET LOCAL row_security = on");
+    if (before.rows[0]?.n !== after.rows[0]?.n || before.rows[0]?.last !== after.rows[0]?.last) {
+      // throwing rolls the whole install transaction back: the table is as it was
+      throw new EventStoreError(
+        `eventstore/postgres: adopting ${this.schemaName}.${this.table} changed its rows (count ${before.rows[0]?.n} → ${after.rows[0]?.n}, last ${before.rows[0]?.last} → ${after.rows[0]?.last}) — rolled back`,
+      );
+    }
+    this.warningList.push(
+      `adopt: took over ${this.schemaName}.${this.table} (${after.rows[0]?.n} rows, last sequence ${after.rows[0]?.last ?? 0}) with ${plan.statements.length} statements`,
+      ...plan.notes.map((n) => `adopt: ${n}`),
+    );
+  }
+
   /** The scope indexes of this table plus, when tenant-keyed, the idempotency index: everything built on `es_scope`. */
   private scopeDependentIndexes(): string[] {
     const names = this.schema.scopeKeys.map((key) => scopeIndexName(this.table, key));
@@ -380,6 +510,7 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     const scopeSig = `${scopeFn(this.schemaName)}(jsonb, text)`;
 
     if (this.schemaName !== DEFAULT_SCHEMA) await client.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(this.schemaName)}`);
+    if (this.adopt) await this.adoptUnderLock(client, this.adopt);
     await client.query(tableDdl(target));
 
     // ── es_scope: missing → create; commented ours → ok; uncommented → probe; else stale
@@ -840,10 +971,26 @@ export async function createPostgresStore(options: CreatePostgresStoreOptions): 
   return store;
 }
 
+/**
+ * The adoption statements as text, for a table in exactly the declared legacy shape (it cannot
+ * look at the table; `store.adoptionPlan()` does). Run them before `printSchemaSql()`.
+ */
+export function printAdoptSql(options: { readonly adopt: AdoptOptions; readonly table?: string; readonly schemaName?: string } | { readonly plan: AdoptionPlan }): string {
+  let statements: readonly string[];
+  if ("plan" in options) {
+    if (options.plan.problems.length > 0) throw new UsageError(`eventstore/postgres: the plan has problems:\n- ${options.plan.problems.join("\n- ")}`);
+    statements = options.plan.statements; // from store.adoptionPlan(): it looked at the table
+  } else {
+    const target = { schemaName: options.schemaName ?? DEFAULT_SCHEMA, table: options.table ?? "events" };
+    statements = adoptStatements(tableRef(target), options.adopt);
+  }
+  return ["-- @orgops/eventstore: adopt an existing table (metadata-only; payload untouched). Check row count and max sequence before and after.", ...statements.map((st) => `${st};`)].join("\n");
+}
+
 /** The DDL as text, for DBAs and `install: "none"` deployments (the unconditional form: no drift gate). */
 export function printSchemaSql(
   schema: StoreSchema,
-  options: Omit<CreatePostgresStoreOptions, "connection" | "schema" | "install" | "poolSize" | "timeouts" | "maxBatchSize" | "maxLockKeys" | "installLockTimeoutMs" | "rebuildScopeIndexes"> = {},
+  options: Omit<CreatePostgresStoreOptions, "connection" | "schema" | "install" | "poolSize" | "timeouts" | "maxBatchSize" | "maxLockKeys" | "installLockTimeoutMs" | "rebuildScopeIndexes" | "adopt"> = {},
 ): string {
   const header =
     "-- @orgops/eventstore schema. Idempotent, but NOT gated: CREATE OR REPLACE FUNCTION es_scope over existing scope\n" +
