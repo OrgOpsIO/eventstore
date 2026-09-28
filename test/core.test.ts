@@ -247,6 +247,21 @@ describe("memory store + api", () => {
     await expect(salted.append([articles.ArticleDrafted({ title: "S", slug: "s2" }, { workspaceProvisionedId: WS })])).rejects.toThrow(/lockSalt/);
   });
 
+  it("an event naming this tenant in scopes appends there even when its data carries another value under the tenant key", async () => {
+    const platform = defineEvents({
+      TenantFounded: { data: z.object({ workspaceProvisionedId: z.string(), name: z.string() }), scopes: ["workspaceProvisionedId"] },
+    });
+    const api = createEventStore({ events: [platform], tenant: { scopeKey: "workspaceProvisionedId" }, strict: true });
+    const system = api.forTenant("system");
+    await system.append([platform.TenantFounded({ workspaceProvisionedId: "ws-new", name: "New" }, { workspaceProvisionedId: "system" })]);
+    const read = await system.query(platform.$filter());
+    expect(read.events.map((e) => [e.scopes.workspaceProvisionedId, e.data.workspaceProvisionedId])).toEqual([["system", "ws-new"]]);
+    // read by scopes, the founded tenant does not see the row: scopes wins over the flat field
+    expect((await api.forTenant("ws-new").query(platform.$filter())).events).toEqual([]);
+    // without the tenant in scopes the flat field still decides, fail-closed
+    await expect(system.append([{ type: "TenantFounded", data: { workspaceProvisionedId: "ws-other", name: "X" } }])).rejects.toThrow(/in its data/);
+  });
+
   it("a tenant root event with a foreign id is refused instead of being shadowed by the stamp", async () => {
     const ws = defineEvents({ WorkspaceProvisioned: { data: z.object({ name: z.string() }) } });
     const api = createEventStore({ events: [ws], tenant: { scopeKey: "workspaceProvisionedId" }, strict: false });

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 (2026-09-28)
+
+- **A tenant view refused an event that names its tenant in `scopes` when the data carried another value under the tenant key.** The append check looked at the flat data field before `scopes`, while every read (`es_scope`, the memory store) lets `scopes` win. An event recorded in the platform tenant that announces a new tenant with its key as a top-level field (`scopes.tenantId = "system"`, `data.tenantId = "<new>"`) threw `TenantMismatchError`. Now `scopes` decides when it names the view's tenant; without it the flat field still decides, fail-closed. Reads were never affected.
+
 ## 0.3.0 (2026-09-28)
 
 Two things a non-owner role under row-level security paid for on every read.

@@ -45,16 +45,18 @@ export function scopedToTenant(
    */
   const stamp = (events: readonly NewEvent[]): NewEvent[] =>
     events.map((e) => {
+      const claimed = e.scopes?.[key];
+      if (claimed !== undefined && claimed !== tenantId) {
+        throw new TenantMismatchError(`eventstore: "${e.type}" names tenant ${claimed} but is appended to ${tenantId}`);
+      }
+      // `scopes` wins over a flat data field on every read (es_scope, scopeValueOf), so an event
+      // that names this tenant in `scopes` belongs to it whatever its data carries under that key
+      if (claimed === tenantId) return e;
       const data = (e.data ?? {}) as Record<string, unknown>;
       const flat = Object.prototype.hasOwnProperty.call(data, key) ? data[key] : undefined;
       if (flat !== undefined && flat !== tenantId) {
         throw new TenantMismatchError(`eventstore: "${e.type}" carries ${key}=${String(flat)} in its data but is appended to ${tenantId}`);
       }
-      const claimed = e.scopes?.[key];
-      if (claimed !== undefined && claimed !== tenantId) {
-        throw new TenantMismatchError(`eventstore: "${e.type}" names tenant ${claimed} but is appended to ${tenantId}`);
-      }
-      if (claimed === tenantId) return e;
       if (idKeyOf && idKeyOf(e.type) === key) {
         // the tenant's own root event (its id IS the tenant id) carries no back-link to itself;
         // a root-keyed event with ANOTHER id would be shadowed by the stamp — refuse instead
