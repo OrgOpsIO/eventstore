@@ -214,6 +214,9 @@ function buildApi(parts: ApiParts): EventStoreApi {
           narrowed = scopedToTenant(bound, config.tenant, tenantId, schema.idKeyOf);
         }
         return parts.until === undefined ? narrowed : pastView(narrowed, parts.until);
+      }).catch((err) => {
+        viewPromise = undefined;
+        throw err;
       });
     }
     return viewPromise;
