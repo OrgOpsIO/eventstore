@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1 (2026-09-29)
+
+- **A view stayed broken after its store failed once at first use.** The root api reset its store promise on a failed creation, but every view — the root api's own and every tenant view — kept the first rejected promise, so one transient database error on first use (the database not up yet, a failed install) failed that view's reads and writes until the process restarted. A view now tries again on its next call.
+
 ## 0.6.0 (2026-09-28)
 
 - **`postgres: { adopt }` takes an existing events table over at install**, in place: `adopt: { columns: { sequence: "id", type: "eventtype" } }` renames the legacy columns, adds `metadata` and `transaction_id` (legacy rows get `adopt.legacyTransactionId`, default `3`, so they sort before every new row), makes `sequence_number` unique when it is not, then installs as always. Metadata-only — no row rewritten, `payload` never touched — inside the install transaction under the install lock, with row count and highest sequence compared before and after; idempotent on every later boot. A table that does not fit (half adopted, `json` payload, `integer` sequence, NULLs — also in the sequence column —, a `NOT NULL` column without a default, one column named for two roles, a `legacyTransactionId` not below every running transaction, under `rls` a foreign permissive policy) stops the install before anything changes; the adoption's reads run with `row_security = off`, so they never count a filtered table. Legacy indexes, columns, triggers, restrictive policies and write grants are kept and listed in `warnings()`. `mode: "check"` fails the install with the plan instead (also when the table is missing); `requireExisting` refuses to create a missing table; `store.adoptionPlan()` reads the plan, `printAdoptSql({ plan })` prints it. New: `planAdoption`, `adoptStatements` and their types.
