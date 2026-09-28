@@ -27,12 +27,25 @@
  *   UNIQUE index on the idempotency key (per tenant when a tenant scope key is configured),
  *   optional GIN `jsonb_path_ops` for ad-hoc `where`, and `CREATE STATISTICS` per scope key
  *   (partial expression indexes hide their statistics from the planner; this is what makes it
- *   pick the scope index in sequence order without a Sort node).
+ *   pick the scope index in sequence order without a Sort node). Every statistics object costs
+ *   planning time in EVERY statement on the table, whether it names that key or not (the planner
+ *   loads and preprocesses all of them per table reference): measured on Postgres 18, 43 of them
+ *   were about two thirds of the planning time of a four-key read. `scopeStatistics` limits them to the keys
+ *   whose index is large enough for a wrong estimate to matter (`scopeStatisticsKeys`).
  * - optional row-level security on the tenant scope (`rls: true` + `tenantScopeKey`): the
  *   policy compares `es_scope(payload,'<tenantKey>')` with `current_setting('app.current_tenant')`
  *   in USING and WITH CHECK; the installer recreates it when either expression drifted.
  *   Use `store.withTenant(id)` so every statement runs with that setting; the root store
  *   refuses reads and writes under `rls`.
+ * - under `rls`, a condition of the query may become an index condition only when every
+ *   function in it is `LEAKPROOF` (otherwise it could leak a foreign row through an error before
+ *   the policy has filtered it). `es_scope` inlines to `jsonb_typeof`, `->` and `->>`, which
+ *   Postgres does not ship as `LEAKPROOF` — so a non-owner role reads every scope other than the
+ *   tenant through the policy's index plus a filter over the whole tenant. No jsonb function or
+ *   operator is leakproof (`@>` included), so no other expression avoids this.
+ *   `scopeLeakproofStatements()` marks the three; only a superuser may, once per database, and
+ *   neither `pg_dump` nor `pg_upgrade` carries the mark. The installer does it when it runs as a
+ *   superuser and records a warning otherwise.
  *
  * Roles: install as the table owner (`install: "auto"`, the default; concurrent boots are
  * serialised by a transaction-scoped advisory lock inside one DDL transaction with
@@ -152,6 +165,12 @@ export interface DdlOptions {
   readonly grantExecuteTo?: readonly string[];
   /** Opt-in `(event_type, sequence_number)` index for type-only reads. No SDK code path needs it. */
   readonly typeIndex?: boolean;
+  /**
+   * The scope keys that get a statistics object: `"all"` (default) or an explicit list, e.g.
+   * from `scopeStatisticsKeys()`. A static DDL listing cannot see the data, so the choice by
+   * index size is the caller's (the installer makes it itself with `scopeStatistics`).
+   */
+  readonly scopeStatistics?: "all" | readonly string[];
 }
 
 export interface UniqueIndex {
@@ -248,13 +267,86 @@ export function scopeIndexDdl(target: Target, key: string): string {
 }
 
 /**
+ * The built-in functions the inlined `es_scope` body calls besides `texteq` (which Postgres
+ * already ships as `LEAKPROOF`). Under row-level security the planner uses a condition as an
+ * index condition only when all of them are `LEAKPROOF`.
+ *
+ * Why marking them does not weaken the policy: none of the three ever raises an error, whatever
+ * row it reads — `jsonb_typeof` names every value, `->` and `->>` yield NULL on a non-object or a
+ * missing key — so they reveal nothing but their result, which is what `LEAKPROOF` promises. The
+ * policy still decides which rows anyone sees; the index only finds candidates faster.
+ */
+export const SCOPE_BUILTIN_FUNCTIONS: readonly string[] = [
+  "pg_catalog.jsonb_typeof(jsonb)",
+  "pg_catalog.jsonb_object_field(jsonb, text)",
+  "pg_catalog.jsonb_object_field_text(jsonb, text)",
+];
+
+/** The statements that mark `SCOPE_BUILTIN_FUNCTIONS` `LEAKPROOF`. Superuser only; per database. */
+export function scopeLeakproofStatements(): string[] {
+  return SCOPE_BUILTIN_FUNCTIONS.map((signature) => `ALTER FUNCTION ${signature} LEAKPROOF`);
+}
+
+/** Returns one row `{ signature }` per function of `SCOPE_BUILTIN_FUNCTIONS` that is not `LEAKPROOF`; `$1` = that list. */
+export const SCOPE_LEAKPROOF_MISSING_SQL =
+  "SELECT p.oid::regprocedure::text AS signature FROM pg_catalog.pg_proc p WHERE p.oid = ANY($1::regprocedure[]) AND NOT p.proleakproof ORDER BY 1";
+
+/**
+ * Below this many rows in a key's scope index a statistics object cannot pay for itself.
+ *
+ * Without one, the planner estimates `es_scope(payload, key) = $v` at 0.5 % of the table, but it
+ * never costs an index scan above the rows the partial index holds. A key with a small index is
+ * therefore read through its index anyway, and the worst a wrong choice can cost is reading that
+ * index — here at most 1 000 rows, about a millisecond. The object itself costs planning time in
+ * every statement on the table. Measured (Postgres 18, 27 000 and 272 000 events, 43 scope keys,
+ * every read shape per key with and without the key's object): below 1 000 rows no read got more
+ * than 0.15 ms slower; above it, keys with many small groups (an account, a document) read 1–2 ms
+ * slower without their object at the larger size — they keep it.
+ */
+export const DEFAULT_SCOPE_STATISTICS_MIN_ROWS = 1000;
+
+/** Which scope keys get a statistics object: all, or those whose index holds enough rows. */
+export type ScopeStatisticsPolicy = "all" | { readonly minIndexRows: number; readonly exclude?: readonly string[] };
+
+/**
+ * The keys that get a statistics object under `policy`, given the rows per scope index (what
+ * `scopeIndexRowsSql` reads from `pg_class.reltuples`). A key without a known row count keeps its
+ * object: unknown is not small. `exclude` names keys whose expression already has statistics from
+ * elsewhere — a non-partial expression index on the same `es_scope` call carries its own, and the
+ * planner prefers those.
+ */
+export function scopeStatisticsKeys(
+  scopeKeys: readonly string[],
+  indexRows: ReadonlyMap<string, number>,
+  policy: ScopeStatisticsPolicy = "all",
+): string[] {
+  if (policy === "all") return [...scopeKeys];
+  const exclude = new Set(policy.exclude ?? []);
+  return scopeKeys.filter((key) => {
+    if (exclude.has(key)) return false;
+    const rows = indexRows.get(key);
+    return rows === undefined || rows < 0 || rows >= policy.minIndexRows;
+  });
+}
+
+/** Rows per scope index of a target, as the planner knows them (`pg_class.reltuples`; −1 = never counted). */
+export function scopeIndexRowsSql(target: Target, scopeKeys: readonly string[]): { sql: string; params: unknown[] } {
+  const names = scopeKeys.map((key) => `${quoteIdent(target.schemaName)}.${quoteIdent(scopeIndexName(target.table, key))}`);
+  return {
+    sql: "SELECT k.key, c.reltuples::float8 AS rows FROM unnest($1::text[], $2::text[]) AS k(key, name) JOIN pg_catalog.pg_class c ON c.oid = to_regclass(k.name)",
+    params: [[...scopeKeys], names],
+  };
+}
+
+/**
  * The statements that bring the scope indexes and statistics in line with a changed
  * `es_scope` body, in an order that keeps reads working: concurrent index builds first.
  * Run them by hand in a quiet window — each statement outside a transaction (`CONCURRENTLY`
  * cannot run inside one) — or pass `rebuildScopeIndexes: true` to the store.
  */
-export function scopeRebuildStatements(schema: StoreSchema, target: Target): string[] {
+export function scopeRebuildStatements(schema: StoreSchema, target: Target, statisticsKeys: readonly string[] = schema.scopeKeys): string[] {
   const statements: string[] = ["-- run each statement outside a transaction (CREATE/DROP INDEX CONCURRENTLY cannot run inside one)", scopeFunctionDdl(target.schemaName)];
+  const withStatistics = new Set(statisticsKeys);
   for (const key of schema.scopeKeys) {
     const expr = `${scopeFn(target.schemaName)}(payload, ${quoteLiteral(key)})`;
     statements.push(`DROP STATISTICS IF EXISTS ${qualified(target.schemaName, scopeStatisticsName(target.table, key))}`);
@@ -262,7 +354,7 @@ export function scopeRebuildStatements(schema: StoreSchema, target: Target): str
     statements.push(
       `CREATE INDEX CONCURRENTLY IF NOT EXISTS ${quoteIdent(scopeIndexName(target.table, key))} ON ${tableRef(target)} ((${expr}), sequence_number) WHERE ${expr} IS NOT NULL`,
     );
-    statements.push(scopeStatisticsDdl(target, key));
+    if (withStatistics.has(key)) statements.push(scopeStatisticsDdl(target, key));
   }
   statements.push(`COMMENT ON FUNCTION ${scopeFn(target.schemaName)}(jsonb, text) IS ${quoteLiteral(scopeFunctionFingerprint(target.schemaName))}`);
   return statements;
@@ -322,9 +414,10 @@ export function ddlStatements(schema: StoreSchema, options: DdlOptions): string[
   // cursor reads order by (transaction_id, sequence_number)
   statements.push(`CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(target.table, "xid", "seq"))} ON ${t} (transaction_id, sequence_number)`);
 
+  const withStatistics = new Set(options.scopeStatistics === undefined || options.scopeStatistics === "all" ? schema.scopeKeys : options.scopeStatistics);
   for (const key of schema.scopeKeys) {
     statements.push(scopeIndexDdl(target, key));
-    statements.push(scopeStatisticsDdl(target, key));
+    if (withStatistics.has(key)) statements.push(scopeStatisticsDdl(target, key));
   }
 
   for (const u of uniqueIndexes(schema, target.table)) {

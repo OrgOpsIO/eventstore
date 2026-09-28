@@ -32,7 +32,9 @@ import type {
 import {
   APPEND_SIGNATURE,
   DEFAULT_SCHEMA,
+  SCOPE_BUILTIN_FUNCTIONS,
   SCOPE_FUNCTION_NAME,
+  SCOPE_LEAKPROOF_MISSING_SQL,
   SCOPE_PROBES,
   appendFunctionBaseName,
   appendFunctionDdl,
@@ -55,7 +57,10 @@ import {
   scopeFunctionFingerprint,
   scopeIndexDdl,
   scopeIndexName,
+  scopeIndexRowsSql,
+  scopeLeakproofStatements,
   scopeRebuildStatements,
+  scopeStatisticsKeys,
   scopeStatisticsDdl,
   scopeStatisticsName,
   tableDdl,
@@ -64,6 +69,7 @@ import {
   uniqueIndexes,
   uniquePathSegmentsSql,
   versionSpec,
+  type ScopeStatisticsPolicy,
   type Target,
 } from "./sql.js";
 
@@ -119,6 +125,16 @@ export interface CreatePostgresStoreOptions {
    * installer throws the statements to run by hand instead.
    */
   readonly rebuildScopeIndexes?: boolean;
+  /**
+   * Which scope keys get a statistics object. `"all"` (default) keeps one per key. With
+   * `{ minIndexRows }` the installer reads the rows per scope index and keeps objects only where
+   * the index holds at least that many (`DEFAULT_SCOPE_STATISTICS_MIN_ROWS` is the measured
+   * choice), dropping the others; `exclude` names keys whose expression has statistics from a
+   * non-partial index of your own. Every object costs planning time in every statement on the
+   * table — see `scopeStatisticsKeys`. A key that grows past the limit gets its object at the
+   * next install; run `ANALYZE` after that, a new object is empty.
+   */
+  readonly scopeStatistics?: ScopeStatisticsPolicy;
 }
 
 const DEFAULT_TIMEOUTS: Required<PoolTimeouts> = { statementMs: 30_000, lockMs: 10_000, idleInTransactionMs: 30_000 };
@@ -188,6 +204,7 @@ export class PostgresStore implements EventStore, StatisticsStore {
   private readonly maxLockKeys: number;
   private readonly installLockTimeoutMs: number;
   private readonly rebuildScopeIndexes: boolean;
+  private readonly scopeStatisticsPolicy: ScopeStatisticsPolicy;
   private installed: Promise<void> | undefined;
   private readonly warningList: string[] = [];
   /** How often an append collapsed its lock plan to the global lock because it exceeded `maxLockKeys`. */
@@ -203,6 +220,7 @@ export class PostgresStore implements EventStore, StatisticsStore {
     this.maxLockKeys = options.maxLockKeys ?? 512;
     this.installLockTimeoutMs = options.installLockTimeoutMs ?? 60_000;
     this.rebuildScopeIndexes = options.rebuildScopeIndexes ?? false;
+    this.scopeStatisticsPolicy = options.scopeStatistics ?? "all";
     if (typeof options.connection === "string") {
       const timeouts = { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) };
       // session defaults travel in the libpq `options` parameter: no extra round trip, no
@@ -362,10 +380,8 @@ export class PostgresStore implements EventStore, StatisticsStore {
       await client.query(`CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(this.table, "type", "seq"))} ON ${t} (event_type, sequence_number)`);
     }
     await client.query(`CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(this.table, "xid", "seq"))} ON ${t} (transaction_id, sequence_number)`);
-    for (const key of this.schema.scopeKeys) {
-      await client.query(scopeIndexDdl(target, key));
-      await client.query(scopeStatisticsDdl(target, key));
-    }
+    for (const key of this.schema.scopeKeys) await client.query(scopeIndexDdl(target, key));
+    await this.installScopeStatistics(client);
     for (const u of uniqueIndexes(this.schema, this.table)) {
       const expr = `(payload #>> ${uniquePathSegmentsSql(u.path)})`;
       await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS ${quoteIdent(u.name)} ON ${t} (${expr}) WHERE event_type = ${quoteLiteral(u.type)} AND ${expr} IS NOT NULL`);
@@ -424,7 +440,49 @@ export class PostgresStore implements EventStore, StatisticsStore {
         if (row !== undefined) await client.query(`DROP POLICY IF EXISTS ${quoteIdent(policy)} ON ${t}`);
         await client.query(`CREATE POLICY ${quoteIdent(policy)} ON ${t} USING (${expr}) WITH CHECK (${expr})`);
       }
+      await this.markScopeFunctionsLeakproof(client);
     }
+  }
+
+  /**
+   * The statistics objects of the scope keys, per `scopeStatistics`. With a size policy the rows
+   * per index decide, read after the indexes exist (a freshly built index knows its exact count).
+   * Objects of keys that fell out of the policy are dropped — events are append-only, so that
+   * only happens after an erasure.
+   */
+  private async installScopeStatistics(client: PoolClient): Promise<void> {
+    const keys = this.schema.scopeKeys;
+    let chosen: readonly string[] = keys;
+    if (this.scopeStatisticsPolicy !== "all") {
+      const { sql, params } = scopeIndexRowsSql(this.target, keys);
+      const rows = await client.query<{ key: string; rows: number }>(sql, params);
+      chosen = scopeStatisticsKeys(keys, new Map(rows.rows.map((r) => [r.key, Number(r.rows)])), this.scopeStatisticsPolicy);
+    }
+    const keep = new Set(chosen);
+    for (const key of keys) {
+      if (keep.has(key)) await client.query(scopeStatisticsDdl(this.target, key));
+      else await client.query(`DROP STATISTICS IF EXISTS ${qualified(this.schemaName, scopeStatisticsName(this.table, key))}`);
+    }
+  }
+
+  /**
+   * Under `rls` the scope indexes serve a non-owner role only when the functions `es_scope`
+   * inlines to are `LEAKPROOF` (see `SCOPE_BUILTIN_FUNCTIONS`). Checked at every install because
+   * the mark lives in the database's catalogue and a restore or `pg_upgrade` loses it silently;
+   * written only by a superuser. Anyone else gets a warning — reads stay correct, only slower.
+   */
+  private async markScopeFunctionsLeakproof(client: PoolClient): Promise<void> {
+    const missing = await client.query<{ signature: string }>(SCOPE_LEAKPROOF_MISSING_SQL, [SCOPE_BUILTIN_FUNCTIONS]);
+    if (missing.rows.length === 0) return;
+    const role = await client.query<{ superuser: boolean }>("SELECT rolsuper AS superuser FROM pg_catalog.pg_roles WHERE rolname = current_user");
+    if (role.rows[0]?.superuser !== true) {
+      this.warningList.push(
+        `rls: ${missing.rows.map((r) => r.signature).join(", ")} are not LEAKPROOF, so a non-owner role cannot use the scope indexes (only the tenant's) — ` +
+          `run as a superuser, once per database and again after a restore or pg_upgrade: ${scopeLeakproofStatements().join("; ")}`,
+      );
+      return;
+    }
+    for (const statement of scopeLeakproofStatements()) await client.query(statement);
   }
 
   private async scopeProbesPass(client: PoolClient): Promise<boolean> {
@@ -706,10 +764,24 @@ export function printSchemaSql(
   const header =
     "-- @orgops/eventstore schema. Idempotent, but NOT gated: CREATE OR REPLACE FUNCTION es_scope over existing scope\n" +
     "-- indexes needs those indexes rebuilt (see scopeRebuildStatements). Run as the table owner.";
-  return [
-    header,
-    ...ddlStatements(schema, { ...options, table: options.table ?? "events", tenantScopeKey: options.tenantScopeKey ?? schema.tenantScopeKey }).map((s) => `${s};`),
-  ].join("\n\n");
+  const { scopeStatistics, ...ddlOptions } = options;
+  const statements = ddlStatements(schema, {
+    ...ddlOptions,
+    ...(scopeStatistics === undefined || scopeStatistics === "all" ? {} : { scopeStatistics: scopeStatisticsKeys(schema.scopeKeys, new Map(), scopeStatistics) }),
+    table: options.table ?? "events",
+    tenantScopeKey: options.tenantScopeKey ?? schema.tenantScopeKey,
+  }).map((s) => `${s};`);
+  // under rls the scope indexes need three LEAKPROOF marks that only a superuser may set
+  const leakproof = options.rls
+    ? [
+        "-- As a superuser, once per database and again after a restore or pg_upgrade (neither carries it): without it a\n" +
+          "-- non-owner role uses no scope index but the tenant's under row-level security.\n" +
+          scopeLeakproofStatements()
+            .map((s) => `${s};`)
+            .join("\n"),
+      ]
+    : [];
+  return [header, ...statements, ...leakproof].join("\n\n");
 }
 
 /** Run `fn` in a transaction with `app.current_tenant` set (for `rls: true`). */
