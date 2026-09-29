@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.3 (2026-09-30)
+
+- **Fix: two folds over one query shared one cached state.** The context cache keyed only by the query, so `es.context()` / `es.command()` with the same query but a different `fold` (or a different `initial`) got the other fold's state — a command could decide on it, and `appendIf` let it through because the context version matched. The key is now query + fold + initial state: folds and non-plain values by reference, plain values by content (bigint, NaN, -0, undefined, cycles and very deep values handled; beyond 64 levels or 10 000 nodes by reference). A plain `initial` is copied on a cold load, so a fold that updates its state in place never changes the caller's object. `invalidate(query)` forgets the query under every fold. Define folds once (module level): a fold created per call is correct, but never hits the cache.
+- **Fix: `estimateSize` overflowed the call stack on a deeply nested state** — it now walks with an explicit stack.
+- `ContextTooLargeError` names the query again, not an internal cache key.
+- Example: the in-memory search index kept a durable file cursor, so after a restart it skipped everything the lost index had held; a cursor now lives where its projection lives.
+
 ## 0.6.2 (2026-09-29)
 
 Live streams of large events were expensive: measured, one 424 kB event waiting on an older transaction travelled to the app about six times a second, per watch group.

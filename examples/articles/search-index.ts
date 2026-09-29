@@ -1,5 +1,5 @@
 import type { EventStore } from "@orgops/eventstore";
-import { fileCursors, subscribe, type Subscription } from "@orgops/eventstore/subscribe";
+import { memoryCursors, subscribe, type Subscription } from "@orgops/eventstore/subscribe";
 import { articles } from "./events.js";
 
 export interface SearchIndex {
@@ -7,8 +7,13 @@ export interface SearchIndex {
   readonly subscription: Subscription;
 }
 
-/** A durable projection: the cursor survives restarts in a file, `events` stays the only table. */
-export function startSearchIndex(store: EventStore, cursorFile: string): SearchIndex {
+/**
+ * A projection held in memory — so its cursor is in memory too: after a restart it replays from
+ * the beginning and rebuilds the index. A cursor must live where its projection lives; a durable
+ * cursor (`fileCursors`) next to an in-memory index would skip, after a restart, everything the
+ * lost index had held. A durable projection writes its data and its cursor in one transaction.
+ */
+export function startSearchIndex(store: EventStore): SearchIndex {
   const entries = new Map<string, { workspaceId: string; title: string; published: boolean }>();
   const subscription = subscribe(
     "search-index",
@@ -36,7 +41,7 @@ export function startSearchIndex(store: EventStore, cursorFile: string): SearchI
         }
       }
     },
-    { store, cursors: fileCursors(cursorFile), pollIntervalMs: 25 },
+    { store, cursors: memoryCursors(), pollIntervalMs: 25 },
   );
   return { entries, subscription };
 }

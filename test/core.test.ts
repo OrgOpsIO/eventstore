@@ -247,6 +247,74 @@ describe("memory store + api", () => {
     await expect(salted.append([articles.ArticleDrafted({ title: "S", slug: "s2" }, { workspaceProvisionedId: WS })])).rejects.toThrow(/lockSalt/);
   });
 
+  describe("the context cache keys by query, fold and initial state", () => {
+    const acc = defineEvents({ Deposited: { data: z.object({ amount: z.number() }), scopes: ["accountOpenedId"] } });
+    const sum = (events: readonly import("../src/index.js").RecordedEvent[], s: number) => events.reduce((n, e) => n + (e.data as { amount: number }).amount, s);
+    const list = (events: readonly import("../src/index.js").RecordedEvent[], s: readonly number[]) => [...s, ...events.map((e) => (e.data as { amount: number }).amount)];
+    const setup = async () => {
+      const api = createEventStore({ events: [acc] });
+      await api.append([acc.Deposited({ amount: 1 }, { accountOpenedId: "a" }), acc.Deposited({ amount: 2 }, { accountOpenedId: "a" })]);
+      return { api, query: acc.$scope("accountOpenedId", "a") };
+    };
+
+    it("two folds over one query are two states — a command never decides on another fold's state", async () => {
+      const { api, query } = await setup();
+      expect((await api.context({ query, fold: sum, initial: 0 })).state).toBe(3);
+      const second = await api.context({ query, fold: list, initial: [] as readonly number[] });
+      expect(second.state).toEqual([1, 2]);
+      expect(second.cacheHit).toBe(false);
+      const decided = await api.command({ context: query, fold: list, initial: [] as readonly number[], decide: (state) => ({ events: [], result: state }) });
+      expect(decided.ok && decided.result).toEqual([1, 2]);
+    });
+
+    it("the same fold and an equal plain initial share one entry; a different initial does not", async () => {
+      const { api, query } = await setup();
+      await api.context({ query, fold: sum, initial: 0 });
+      expect((await api.context({ query, fold: sum, initial: 0 })).cacheHit).toBe(true);
+      const offset = await api.context({ query, fold: sum, initial: 100 });
+      expect([offset.state, offset.cacheHit]).toEqual([103, false]);
+      await api.context({ query, fold: list, initial: [] as readonly number[] });
+      expect((await api.context({ query, fold: list, initial: [] as readonly number[] })).cacheHit).toBe(true); // a fresh [] literal each call
+    });
+
+    it("never breaks on an initial state the old key never looked at: bigint, cycles, depth — and a fold updating it in place counts once", async () => {
+      const { api, query } = await setup();
+      const bigSum = (events: readonly import("../src/index.js").RecordedEvent[], s: bigint) => events.reduce((n, e) => n + BigInt((e.data as { amount: number }).amount), s);
+      expect((await api.context({ query, fold: bigSum, initial: 0n })).state).toBe(3n);
+      expect((await api.context({ query, fold: bigSum, initial: 0n })).cacheHit).toBe(true);
+      const cyclic: Record<string, unknown> = { total: 0 };
+      cyclic.self = cyclic;
+      const count = (events: readonly import("../src/index.js").RecordedEvent[], s: Record<string, unknown>) => ({ ...s, total: (s.total as number) + events.length });
+      expect((await api.context({ query, fold: count, initial: cyclic })).state.total).toBe(2);
+      let deep: Record<string, unknown> = {};
+      for (let i = 0; i < 20_000; i++) deep = { d: deep };
+      expect((await api.context({ query, fold: count, initial: { total: 0, deep } })).state.total).toBe(2);
+      // an impure fold that mutates its state: the caller's initial object is never the one mutated
+      const initial = { total: 0 };
+      const inPlace = (events: readonly import("../src/index.js").RecordedEvent[], s: { total: number }) => {
+        for (const e of events) s.total += (e.data as { amount: number }).amount;
+        return s;
+      };
+      expect((await api.context({ query, fold: inPlace, initial })).state.total).toBe(3);
+      expect(initial.total).toBe(0);
+      const again = await api.context({ query, fold: inPlace, initial });
+      expect([again.state.total, again.cacheHit]).toEqual([3, true]);
+      // NaN and null are different initial states
+      const id = (events: readonly import("../src/index.js").RecordedEvent[], s: unknown) => s;
+      await api.context({ query, fold: id, initial: Number.NaN });
+      expect((await api.context({ query, fold: id, initial: null })).state).toBeNull();
+    });
+
+    it("invalidate(query) forgets the query under every fold", async () => {
+      const { api, query } = await setup();
+      await api.context({ query, fold: sum, initial: 0 });
+      await api.context({ query, fold: list, initial: [] as readonly number[] });
+      api.invalidate(query);
+      expect((await api.context({ query, fold: sum, initial: 0 })).cacheHit).toBe(false);
+      expect((await api.context({ query, fold: list, initial: [] as readonly number[] })).cacheHit).toBe(false);
+    });
+  });
+
   describe("asOf: a read-only view of the past", () => {
     const fold = (events: readonly import("../src/index.js").RecordedEvent[], n: number) => n + events.length;
     const setup = async () => {

@@ -15,7 +15,12 @@ export interface ContextSpec<S> {
   /** Pure: folds a batch of events into the state. Called with the delta only. */
   readonly fold: Fold<S>;
   readonly initial: S | (() => S);
-  /** Cache key; defaults to the normalised query. */
+  /**
+   * Cache key; defaults to the normalised query plus the identity of `fold` and `initial` — two
+   * folds over one query are two states, never one. Define folds once (module level, a registry's
+   * `$fold` result kept in a const) so repeated loads share their entry; a fold created per call is
+   * correct but never cached.
+   */
   readonly key?: string;
 }
 
@@ -64,6 +69,81 @@ export interface ContextCacheOptions {
 
 const MAX_ESTIMATE_NODES = 200_000;
 
+const identities = new WeakMap<object, number>();
+let nextIdentity = 1;
+const MAX_KEY_NODES = 10_000;
+const MAX_KEY_DEPTH = 64;
+
+function referenceOf(value: object): string {
+  let id = identities.get(value);
+  if (id === undefined) identities.set(value, (id = nextIdentity++));
+  return `#${id}`;
+}
+
+/**
+ * A plain value's content as a key, or `null` when it is not plain (a function, a Map, a Date, a
+ * class instance, a symbol), cyclic, deeper than 64 or larger than the node budget — then it is keyed by
+ * reference. Never throws: bigint, NaN, ±Infinity, -0, undefined and holes each get their own tag.
+ */
+function encodePlain(value: unknown): string | null {
+  const seen = new Set<object>();
+  let nodes = 0;
+  const walk = (v: unknown, depth = 0): string | null => {
+    if (++nodes > MAX_KEY_NODES || depth > MAX_KEY_DEPTH) return null;
+    switch (typeof v) {
+      case "undefined":
+        return "u";
+      case "boolean":
+        return v ? "t" : "f";
+      case "bigint":
+        return `b${v.toString()}`;
+      case "string":
+        return JSON.stringify(v);
+      case "number":
+        return Object.is(v, -0) ? "n-0" : `n${String(v)}`; // String() keeps NaN and ±Infinity apart from null
+      case "object": {
+        if (v === null) return "z";
+        if (seen.has(v)) return null;
+        seen.add(v);
+        const parts: string[] = [];
+        if (Array.isArray(v)) {
+          for (let i = 0; i < v.length; i++) {
+            const part = i in v ? walk(v[i], depth + 1) : "h";
+            if (part === null) return null;
+            parts.push(part);
+          }
+          return `[${parts.join(",")}]`;
+        }
+        const proto = Object.getPrototypeOf(v);
+        if (proto !== Object.prototype && proto !== null) return null;
+        for (const key of Object.keys(v)) {
+          const part = walk((v as Record<string, unknown>)[key], depth + 1);
+          if (part === null) return null;
+          parts.push(`${JSON.stringify(key)}:${part}`);
+        }
+        return `{${parts.join(",")}}`;
+      }
+      default:
+        return null; // function, symbol
+    }
+  };
+  return walk(value);
+}
+
+/** A stable token for a fold or an initial state: plain values by content, everything else by reference. */
+function identityOf(value: unknown): string {
+  if (typeof value === "function" || (typeof value === "object" && value !== null)) {
+    const plain = typeof value === "function" ? null : encodePlain(value);
+    return plain === null ? referenceOf(value as object) : `=${plain}`;
+  }
+  return `=${encodePlain(value)}`;
+}
+
+/** The cache key of a context: query, fold and initial state — the three that decide what the state is. */
+export function contextKey(spec: Pick<ContextSpec<unknown>, "query" | "fold" | "initial" | "key">): string {
+  return spec.key ?? `${queryKey(spec.query)}\u0000${identityOf(spec.fold)}\u0000${identityOf(spec.initial)}`;
+}
+
 /**
  * Rough in-memory size of a fold state: strings by length, 8 bytes per number, ~32 bytes per
  * object/array/Map/Set shell plus keys. Stops after 200 000 nodes and extrapolates nothing —
@@ -73,52 +153,51 @@ export function estimateSize(value: unknown): number {
   let bytes = 0;
   let nodes = 0;
   const seen = new Set<object>();
-  const walk = (v: unknown): void => {
-    if (nodes++ > MAX_ESTIMATE_NODES) return;
+  // an explicit stack, not recursion: a deeply nested state must not overflow the call stack
+  const stack: unknown[] = [value];
+  while (stack.length > 0) {
+    if (nodes++ > MAX_ESTIMATE_NODES) break;
+    const v = stack.pop();
     switch (typeof v) {
       case "string":
         bytes += 16 + v.length * 2;
-        return;
+        continue;
       case "number":
       case "bigint":
         bytes += 8;
-        return;
+        continue;
       case "boolean":
       case "undefined":
         bytes += 4;
-        return;
+        continue;
       case "object":
         break;
       default:
-        return;
+        continue;
     }
     if (v === null) {
       bytes += 4;
-      return;
+      continue;
     }
-    if (seen.has(v)) return;
+    if (seen.has(v)) continue;
     seen.add(v);
     bytes += 32;
     if (v instanceof Map) {
-      for (const [k, x] of v) {
-        walk(k);
-        walk(x);
-      }
+      for (const [k, x] of v) stack.push(k, x);
     } else if (v instanceof Set) {
-      for (const x of v) walk(x);
+      for (const x of v) stack.push(x);
     } else if (Array.isArray(v)) {
       bytes += v.length * 8;
-      for (const x of v) walk(x);
+      for (const x of v) stack.push(x);
     } else if (v instanceof Date) {
       bytes += 8;
     } else {
       for (const k of Object.keys(v as Record<string, unknown>)) {
         bytes += 16 + k.length * 2;
-        walk((v as Record<string, unknown>)[k]);
+        stack.push((v as Record<string, unknown>)[k]);
       }
     }
-  };
-  walk(value);
+  }
   return bytes;
 }
 
@@ -215,14 +294,14 @@ export class ContextCache {
   }
 
   async load<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>> {
-    const key = spec.key ?? queryKey(spec.query);
+    const key = contextKey(spec as ContextSpec<unknown>);
     const cached = this.max > 0 ? (this.entries.get(key) as Entry<S> | undefined) : undefined;
-    const base: Entry<S> = cached ?? { state: typeof spec.initial === "function" ? (spec.initial as () => S)() : spec.initial, cursor: null, bytes: 0 };
+    const base: Entry<S> = cached ?? { state: freshInitial(spec.initial), cursor: null, bytes: 0 };
 
     // `cursor: null` still selects (transactionId, sequence) order, so the settled prefix is exact.
     const result = await this.store.query(spec.query, { cursor: base.cursor ?? null, limit: this.maxEvents + 1 });
     if (result.events.length > this.maxEvents) {
-      throw new ContextTooLargeError(key, this.maxEvents);
+      throw new ContextTooLargeError(spec.key ?? queryKey(spec.query), this.maxEvents);
     }
     const settled: RecordedEvent[] = [];
     const unsettled: RecordedEvent[] = [];
@@ -236,11 +315,14 @@ export class ContextCache {
     return { state, ctx: result.ctx, delta: result.events, cacheHit: cached !== undefined };
   }
 
-  /** Forget one query (or everything). Either way the entries leave the shared budget too. */
+  /** Forget one query — under every fold — or everything. Either way the entries leave the shared budget too. */
   invalidate(query?: Query): void {
     if (query === undefined) {
       for (const key of [...this.entries.keys()]) this.evict(key);
-    } else this.evict(queryKey(query));
+      return;
+    }
+    const prefix = `${queryKey(query)}\u0000`;
+    for (const key of [...this.entries.keys()]) if (key.startsWith(prefix)) this.evict(key);
   }
 
   get size(): number {
@@ -277,4 +359,14 @@ export class ContextCache {
     }
     this.budget?.touch(this, this.budgetId, key, entry.bytes);
   }
+}
+
+/**
+ * The state a cold load starts from. A plain initial value is copied, so a fold that updates its
+ * state in place never changes the caller's object — whose content is part of the cache key.
+ */
+function freshInitial<S>(initial: S | (() => S)): S {
+  if (typeof initial === "function") return (initial as () => S)();
+  if (typeof initial === "object" && initial !== null && encodePlain(initial) !== null) return structuredClone(initial);
+  return initial;
 }

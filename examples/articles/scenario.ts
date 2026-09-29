@@ -1,6 +1,3 @@
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { configure, es, httpStatusOf, UniqueViolationError, type EventStoreConfig } from "@orgops/eventstore";
 import { accounts, articles, workspace, TENANT_KEY } from "./events.js";
 import { provisionWorkspace } from "./commands/provision-workspace.js";
@@ -25,7 +22,7 @@ export interface ScenarioReport {
 export async function runScenario(base: Pick<EventStoreConfig, "store" | "connection" | "postgres">): Promise<ScenarioReport> {
   configure({ ...base, events: [workspace, accounts, articles], tenant: { scopeKey: TENANT_KEY }, contextCache: { max: 100 } });
   const store = await es.store();
-  const index = startSearchIndex(store, join(mkdtempSync(join(tmpdir(), "es-example-")), "cursors.json"));
+  const index = startSearchIndex(store);
 
   // workspaces (each its own tenant) and platform-level accounts
   const wsA = unwrap(await provisionWorkspace({ slug: "acme", name: "Acme" }));
