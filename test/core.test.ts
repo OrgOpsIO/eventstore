@@ -305,6 +305,14 @@ describe("memory store + api", () => {
       expect((await api.context({ query, fold: id, initial: null })).state).toBeNull();
     });
 
+    it("an initial factory written inline shares one entry; a different factory does not", async () => {
+      const { api, query } = await setup();
+      await api.context({ query, fold: sum, initial: () => 0 });
+      expect((await api.context({ query, fold: sum, initial: () => 0 })).cacheHit).toBe(true);
+      const other = await api.context({ query, fold: sum, initial: () => 10 });
+      expect([other.state, other.cacheHit]).toEqual([13, false]);
+    });
+
     it("invalidate(query) forgets the query under every fold", async () => {
       const { api, query } = await setup();
       await api.context({ query, fold: sum, initial: 0 });

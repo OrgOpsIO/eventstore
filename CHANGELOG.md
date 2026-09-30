@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.4 (2026-09-30)
+
+- **An initial factory written inline missed the cache on every call.** 0.6.3 keyed `initial: () => …` by reference, and an inline arrow is a new function each time, so stable folds with an inline factory never hit. A factory is now keyed by its source text: the same factory starts the same state, a different one does not. Folds stay keyed by reference — two folds must never share a state; define a fold once (module level) to keep it cached.
+
 ## 0.6.3 (2026-09-30)
 
 - **Fix: two folds over one query shared one cached state.** The context cache keyed only by the query, so `es.context()` / `es.command()` with the same query but a different `fold` (or a different `initial`) got the other fold's state — a command could decide on it, and `appendIf` let it through because the context version matched. The key is now query + fold + initial state: folds and non-plain values by reference, plain values by content (bigint, NaN, -0, undefined, cycles and very deep values handled; beyond 64 levels or 10 000 nodes by reference). A plain `initial` is copied on a cold load, so a fold that updates its state in place never changes the caller's object. `invalidate(query)` forgets the query under every fold. Define folds once (module level): a fold created per call is correct, but never hits the cache.

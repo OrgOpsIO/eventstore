@@ -130,6 +130,15 @@ function encodePlain(value: unknown): string | null {
   return walk(value);
 }
 
+/**
+ * The token of an initial state. A factory (`initial: () => ({})`, often written inline and so a
+ * new function on every call) is keyed by its source: the same factory text starts the same
+ * state. Everything else as `identityOf`.
+ */
+function initialIdentityOf(value: unknown): string {
+  return typeof value === "function" ? `fn:${Function.prototype.toString.call(value)}` : identityOf(value);
+}
+
 /** A stable token for a fold or an initial state: plain values by content, everything else by reference. */
 function identityOf(value: unknown): string {
   if (typeof value === "function" || (typeof value === "object" && value !== null)) {
@@ -141,7 +150,7 @@ function identityOf(value: unknown): string {
 
 /** The cache key of a context: query, fold and initial state — the three that decide what the state is. */
 export function contextKey(spec: Pick<ContextSpec<unknown>, "query" | "fold" | "initial" | "key">): string {
-  return spec.key ?? `${queryKey(spec.query)}\u0000${identityOf(spec.fold)}\u0000${identityOf(spec.initial)}`;
+  return spec.key ?? `${queryKey(spec.query)}\u0000${identityOf(spec.fold)}\u0000${initialIdentityOf(spec.initial)}`;
 }
 
 /**
