@@ -100,12 +100,19 @@ describe.skipIf(!url)("the commit doorbell on Postgres (live: true)", () => {
       seen.push(...events.map(text));
     });
     const channel = notifyChannel({ schemaName: "public", table: TABLE });
-    // kill every backend that LISTENs on the channel (the reader's and the writer's doorbell)
-    const killed = await admin.query(
-      "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query ILIKE $1",
-      [`%LISTEN "${channel}"%`],
-    );
-    expect(killed.rowCount).toBeGreaterThan(0);
+    // kill every backend that LISTENs on the channel (the reader's and the writer's doorbell) —
+    // once it is there: watch() resolves when the reader has caught up, LISTEN may still be on its way
+    let killed = 0;
+    const deadline = Date.now() + 3_000;
+    while (killed === 0 && Date.now() < deadline) {
+      const result = await admin.query(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query ILIKE $1",
+        [`%LISTEN "${channel}"%`],
+      );
+      killed = result.rowCount ?? 0;
+      if (killed === 0) await wait(20);
+    }
+    expect(killed).toBeGreaterThan(0);
     await writer.append([notes.NoteAdded({ text: "while down" }, { tenantId: "t-2" })]);
     await until(() => seen.includes("while down"), 5_000);
     await writer.append([notes.NoteAdded({ text: "after reconnect" }, { tenantId: "t-2" })]);
