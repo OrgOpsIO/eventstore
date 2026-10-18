@@ -37,6 +37,8 @@ export interface CommitListenerOptions {
 
 export class CommitListener {
   private readonly listeners = new Set<(hint: number | null) => void>();
+  /** Listeners of further channels on the same connection, by channel. */
+  private readonly channels = new Map<string, Set<(payload: string | null) => void>>();
   private opened: OpenedConnection | undefined;
   private opening = false;
   private closed = false;
@@ -59,8 +61,40 @@ export class CommitListener {
     if (!this.opened && !this.opening && !this.timer) void this.connect();
     return () => {
       this.listeners.delete(listener);
-      if (this.listeners.size === 0) this.disconnect();
+      if (!this.wanted) this.disconnect();
     };
+  }
+
+  /**
+   * Listen on a second channel over the same connection (the persisted read models' channel):
+   * the listener gets each notification's payload, and `null` whenever LISTEN is (re)established.
+   */
+  addChannel(channel: string, listener: (payload: string | null) => void): () => void {
+    if (this.closed) throw new Error("eventstore/postgres: the store is closed");
+    let set = this.channels.get(channel);
+    const fresh = !set;
+    if (!set) this.channels.set(channel, (set = new Set()));
+    set.add(listener);
+    const opened = this.opened;
+    if (opened && fresh) {
+      const generation = this.generation;
+      opened.connection.query(`LISTEN ${quoteIdent(channel)}`).then(
+        () => generation === this.generation && listener(null), // whatever committed before LISTEN took effect
+        () => this.lost(generation),
+      );
+    } else if (!opened && !this.opening && !this.timer) {
+      void this.connect();
+    }
+    return () => {
+      set.delete(listener);
+      if (set.size === 0 && this.channels.get(channel) === set) this.channels.delete(channel);
+      if (!this.wanted) this.disconnect();
+    };
+  }
+
+  /** Someone listens: on the doorbell or on another channel. */
+  private get wanted(): boolean {
+    return this.listeners.size > 0 || this.channels.size > 0;
   }
 
   /** Whether a LISTEN connection is currently established (tests, health checks). */
@@ -71,6 +105,7 @@ export class CommitListener {
   async close(): Promise<void> {
     this.closed = true;
     this.listeners.clear();
+    this.channels.clear();
     this.disconnect();
   }
 
@@ -84,8 +119,18 @@ export class CommitListener {
     }
   }
 
+  private ringChannel(channel: string, payload: string | null): void {
+    for (const listener of [...(this.channels.get(channel) ?? [])]) {
+      try {
+        listener(payload);
+      } catch {
+        // a listener must never break the doorbell
+      }
+    }
+  }
+
   private async connect(): Promise<void> {
-    if (this.closed || this.listeners.size === 0) return;
+    if (this.closed || !this.wanted) return;
     this.opening = true;
     const generation = ++this.generation;
     let opened: OpenedConnection | undefined;
@@ -94,7 +139,11 @@ export class CommitListener {
       opened = await this.open();
       const { connection } = opened;
       connection.on("notification", (message) => {
-        if (generation !== this.generation || message.channel !== this.channel) return;
+        if (generation !== this.generation) return;
+        if (message.channel !== this.channel) {
+          if (this.channels.has(message.channel)) this.ringChannel(message.channel, message.payload ?? "");
+          return;
+        }
         // the SDK's trigger sends an empty payload; a digit string (an older trigger) is only a hint
         const hint = message.payload ? Number(message.payload) : Number.NaN;
         this.ring(Number.isSafeInteger(hint) ? hint : null);
@@ -102,15 +151,20 @@ export class CommitListener {
       connection.on("error", () => this.lost(generation));
       connection.on("end", () => this.lost(generation));
       await connection.query(`LISTEN ${quoteIdent(this.channel)}`);
-      if (this.closed || this.listeners.size === 0 || generation !== this.generation) {
+      const channels = [...this.channels.keys()];
+      for (const channel of channels) await connection.query(`LISTEN ${quoteIdent(channel)}`);
+      if (this.closed || !this.wanted || generation !== this.generation) {
         // dropped while connecting; a listener that arrived meanwhile still needs a connection
         opened.release();
-        again = !this.closed && this.listeners.size > 0;
+        again = !this.closed && this.wanted;
         return;
       }
       this.opened = opened;
       this.backoffMs = 0;
+      // a channel added while LISTEN was being set up
+      for (const channel of this.channels.keys()) if (!channels.includes(channel)) await connection.query(`LISTEN ${quoteIdent(channel)}`);
       this.ring(null); // whatever committed before LISTEN took effect: read now
+      for (const channel of this.channels.keys()) this.ringChannel(channel, null);
       await this.checkTrigger(generation);
     } catch {
       opened?.release();
@@ -149,7 +203,7 @@ export class CommitListener {
   }
 
   private retry(): void {
-    if (this.closed || this.listeners.size === 0 || this.timer) return;
+    if (this.closed || !this.wanted || this.timer) return;
     this.backoffMs = this.backoffMs === 0 ? MIN_BACKOFF_MS : Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
     this.timer = setTimeout(() => {
       this.timer = undefined;

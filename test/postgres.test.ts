@@ -118,7 +118,8 @@ describe.skipIf(!url)("PostgresStore", () => {
   it("appends and queries with byFilter, contextVersion vs lastReturned", async () => {
     const opened = accounts.AccountOpened({ owner: "Mary", email: "mary@example.com" }, {}, { id: "acc-1" });
     const first = await store.append([opened]);
-    expect(first).toEqual({ first: 1, last: 1, count: 1 });
+    expect(first).toEqual({ first: 1, last: 1, count: 1, transactionId: expect.any(String) });
+    expect((await store.query({})).events[0]!.transactionId).toBe(first.transactionId);
     await store.append([
       accounts.MoneyDeposited({ amount: 10 }, { accountOpenedId: "acc-1" }),
       accounts.MoneyDeposited({ amount: 5 }, { accountOpenedId: "acc-1" }),
@@ -180,7 +181,8 @@ describe.skipIf(!url)("PostgresStore", () => {
     const query = accounts.$scope("accountOpenedId", "acc-x");
     const ctx = await store.query(query);
     const ok = await store.appendIf([accounts.MoneyDeposited({ amount: 3 }, { accountOpenedId: "acc-x" })], { query, version: ctx.contextVersion });
-    expect(ok).toEqual({ ok: true, appended: { first: 2, last: 2, count: 1 } });
+    expect(ok).toEqual({ ok: true, appended: { first: 2, last: 2, count: 1, transactionId: expect.any(String) } });
+    expect(ok.ok && (await store.query(query)).events.find((e) => e.sequence === 2)?.transactionId).toBe(ok.ok && ok.appended.transactionId);
     const stale = await store.appendIf([accounts.MoneyDeposited({ amount: 3 }, { accountOpenedId: "acc-x" })], { query, version: ctx.contextVersion });
     expect(stale).toEqual({ ok: false, conflict: { expected: 1, actual: 2 } });
     // unrelated scope: no false conflict

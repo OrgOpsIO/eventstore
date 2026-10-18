@@ -179,13 +179,26 @@ export interface QueryResult<E extends RecordedEvent<string, unknown> = Recorded
   readonly ctx: ContextHandle;
   /** Highest settled `(transactionId, sequence)` among returned records; use it as the next `cursor`. */
   readonly settledCursor: Cursor | null;
+  /**
+   * A decimal transaction id below which every transaction had ended when this read ran. Absent
+   * when the store cannot tell. Postgres: the `xmin` of the read's own snapshot; memory store:
+   * only without `transactions` hooks. `subscribe` keeps the one of its last empty page
+   * (`Subscription.watermark`).
+   */
+  readonly watermark?: string;
 }
 
-/** The consecutive sequence range one append batch received. */
+/** The consecutive sequence range one append batch received, and the transaction it committed in. */
 export interface AppendResult {
   readonly first: number;
   readonly last: number;
   readonly count: number;
+  /**
+   * The decimal transaction id of the batch: every record of it carries this `transactionId`.
+   * With `last` it is the read-your-writes token `{ transactionId, sequence: last }`
+   * (see `Subscription.hasPassed`).
+   */
+  readonly transactionId: string;
 }
 
 /** The version `appendIf` expected versus the one it found. */
@@ -227,6 +240,36 @@ export interface StatisticsStore {
 export interface WakeStore {
   /** `hint`: the highest sequence of the commit when the store knows it, else `null` ("read anyway"). */
   onCommitted(listener: (hint: number | null) => void): () => void;
+}
+
+/** Where a persisted fold's stored state is found: tenant, fold identity and the state key text. */
+export interface FoldStateKey {
+  /** Set by the tenant view; absent outside one. */
+  readonly tenant?: string;
+  /** The fold's name (`defineFold`). */
+  readonly name: string;
+  /** The fold's version (`defineFold`); another version is another state. */
+  readonly version: number;
+  /** The query and the initial state as one text. Compared in full on read. */
+  readonly key: string;
+}
+
+/** A stored state as bytes (encoded by the core), with the settled cursor it was folded up to. */
+export interface StoredFoldState {
+  readonly cursor: Cursor;
+  readonly state: Uint8Array;
+  /** The fold's fingerprint, written with the state: a different one under the same version warns once (`ES_FOLD_CHANGED`). A store may ignore it; then nothing is compared. */
+  readonly fingerprint?: string;
+}
+
+/**
+ * Optional store capability: the backend of the persisted fold tier (`persistedFolds: true` on
+ * the memory and the Postgres store). It keeps bytes; the core encodes, decodes and decides.
+ */
+export interface FoldStateStore {
+  read(key: FoldStateKey): Promise<StoredFoldState | null>;
+  /** Monotone: a state at a cursor not beyond the stored one is ignored. */
+  write(key: FoldStateKey, stored: StoredFoldState): Promise<void>;
 }
 
 /** The store contract. Both the memory store and the Postgres store implement exactly this. */

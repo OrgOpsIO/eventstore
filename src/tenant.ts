@@ -1,7 +1,22 @@
 import { TenantMismatchError } from "./errors.js";
 import { isWakeStore } from "./memory.js";
+import { readModelStoreOf, stampedModelStore, type ReadModelStore } from "./modelstore.js";
 import { filtersOf } from "./query.js";
-import type { AppendIfOutcome, AppendResult, ContextHandle, EventStore, Filter, NewEvent, Query, QueryOptions, QueryResult, StatisticsStore, WakeStore } from "./types.js";
+import type {
+  AppendIfOutcome,
+  AppendResult,
+  ContextHandle,
+  EventStore,
+  Filter,
+  FoldStateKey,
+  FoldStateStore,
+  NewEvent,
+  Query,
+  QueryOptions,
+  QueryResult,
+  StatisticsStore,
+  WakeStore,
+} from "./types.js";
 
 /** How the tenant is represented: as a scope key in every event's payload. */
 export interface TenantConfig {
@@ -84,5 +99,28 @@ export function scopedToTenant(
   if (typeof inner.statistics === "function") view.statistics = (query: Query = {}) => inner.statistics!(narrow(query));
   // the doorbell carries no data, so it passes through unchanged; what a woken reader sees is narrowed
   if (isWakeStore(inner)) (view as EventStore & Partial<WakeStore>).onCommitted = (listener) => inner.onCommitted(listener);
+  // persisted fold states are stamped with the tenant like events, fail-closed against a key naming another
+  const states = (inner as EventStore & { foldStates?: FoldStateStore }).foldStates;
+  if (states) {
+    const stampKey = (k: FoldStateKey): FoldStateKey => {
+      if (k.tenant !== undefined && k.tenant !== tenantId) {
+        throw new TenantMismatchError(`eventstore: a fold state key names tenant ${k.tenant} but the store is bound to ${tenantId}`);
+      }
+      return { ...k, tenant: tenantId };
+    };
+    (view as EventStore & { foldStates?: FoldStateStore }).foldStates = {
+      read: async (k) => states.read(stampKey(k)),
+      write: async (k, stored) => states.write(stampKey(k), stored),
+    };
+  }
+  // persisted read models likewise: every model reference carries this tenant
+  const models = readModelStoreOf(inner);
+  if (models) {
+    (view as EventStore & { readModelStore?: ReadModelStore }).readModelStore = stampedModelStore(
+      models,
+      tenantId,
+      (claimed) => new TenantMismatchError(`eventstore: a read model reference names tenant ${claimed} but the store is bound to ${tenantId}`),
+    );
+  }
   return view;
 }

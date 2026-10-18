@@ -1,5 +1,6 @@
 import { UniqueViolationError } from "./errors.js";
 import { uuidv7 } from "./ids.js";
+import { memoryReadModelStore, type MemoryReadModelStore } from "./modelstore.js";
 import {
   assertOmittable,
   compareCursor,
@@ -21,12 +22,15 @@ import type {
   Cursor,
   EventStore,
   Filter,
+  FoldStateKey,
+  FoldStateStore,
   NewEvent,
   Query,
   QueryOptions,
   QueryResult,
   RecordedEvent,
   StatisticsStore,
+  StoredFoldState,
   StoreSchema,
   TypeStatistics,
   WakeStore,
@@ -58,6 +62,18 @@ export interface MemoryStoreOptions {
     readonly allocateId?: (first: number, count: number) => string;
     readonly isSettled?: (transactionId: string, sequence: number) => boolean;
   };
+  /**
+   * Keep persisted fold states (`foldStates`) beside the events, as the Postgres store does with
+   * `persistedFolds: true`: a fresh runtime over this store starts a `defineFold` from its stored
+   * state instead of from zero. Default `false`.
+   */
+  readonly persistedFolds?: boolean;
+  /**
+   * Keep persisted read models (`es.persistedReadModel(def)`) beside the events, as the Postgres
+   * store does with `persistedModels: true`: their rows and checkpoints live in this object, so a
+   * fresh runtime over this store resumes at the checkpoint. Default `false`.
+   */
+  readonly persistedModels?: boolean;
 }
 
 /** A stored row: the wire payload, so `upcast` runs on read exactly as in Postgres. */
@@ -97,12 +113,21 @@ export class MemoryStore implements EventStore, LiveStore, WakeStore, Statistics
   private readonly idKeys = new Map<string, string>();
   private readonly allocateId: (first: number, count: number) => string;
   private readonly isSettled: ((transactionId: string, sequence: number) => boolean) | undefined;
+  /** Neither `transactions` hook given: the store can tell a watermark (`QueryResult.watermark`). */
+  private readonly defaultTransactions: boolean;
+  /** The persisted fold tier's backend; present only with `persistedFolds: true`. */
+  readonly foldStates?: FoldStateStore;
+  /** @internal The persisted read models' backend; present only with `persistedModels: true`. */
+  readonly readModelStore?: MemoryReadModelStore;
 
   constructor(options: MemoryStoreOptions = {}) {
     this.schema = options.schema ?? emptySchema();
     this.clock = options.clock ?? (() => new Date());
     this.allocateId = options.transactions?.allocateId ?? ((first) => String(first));
     this.isSettled = options.transactions?.isSettled;
+    this.defaultTransactions = options.transactions?.allocateId === undefined && options.transactions?.isSettled === undefined;
+    if (options.persistedFolds) this.foldStates = memoryFoldStates();
+    if (options.persistedModels) this.readModelStore = memoryReadModelStore();
   }
 
   /** All records, in order. Handy in tests. */
@@ -146,6 +171,10 @@ export class MemoryStore implements EventStore, LiveStore, WakeStore, Statistics
       contextVersion: options.version === false ? -1 : contextVersion,
       ctx: { query, version: options.version === false ? -1 : contextVersion },
       settledCursor: cursorOf(events),
+      // Default hooks only: every row is settled at append, and the next batch's id is its first
+      // sequence, so every transaction below rows.length + 1 has ended and none below it can begin.
+      // A hook can hand a later batch a lower id or keep a row unsettled: then no watermark.
+      ...(this.defaultTransactions ? { watermark: String(this.rows.length + 1) } : {}),
     };
   }
 
@@ -336,7 +365,7 @@ export class MemoryStore implements EventStore, LiveStore, WakeStore, Statistics
       this.rows.push(row);
       this.indexRow(index, row);
     }
-    const result = { first, last: first + rows.length - 1, count: rows.length };
+    const result = { first, last: first + rows.length - 1, count: rows.length, transactionId };
     if (this.listeners.size > 0) {
       const recorded = rows.map((r) => this.toRecorded(r));
       for (const listener of this.listeners) {
@@ -425,6 +454,29 @@ function mergeSorted(lists: readonly number[][]): number[] {
       if (cursors[i]! < list.length && list[cursors[i]!] === min) cursors[i]!++;
     }
   }
+}
+
+/** Stored fold states in a map, as bytes: a copy goes in and a copy comes out, so nobody shares state with the store. */
+function memoryFoldStates(): FoldStateStore {
+  const rows = new Map<string, StoredFoldState>();
+  const keyOf = (key: FoldStateKey) => JSON.stringify([key.tenant ?? "", key.name, key.version, key.key]);
+  return {
+    async read(key) {
+      const row = rows.get(keyOf(key));
+      return row ? { cursor: { ...row.cursor }, state: Uint8Array.from(row.state), ...(row.fingerprint !== undefined ? { fingerprint: row.fingerprint } : {}) } : null;
+    },
+    async write(key, stored) {
+      const k = keyOf(key);
+      const row = rows.get(k);
+      // monotone, like the Postgres upsert: an older or equal cursor never replaces a newer state
+      if (row && compareCursor(stored.cursor, row.cursor) <= 0) return;
+      rows.set(k, {
+        cursor: { transactionId: stored.cursor.transactionId, sequence: stored.cursor.sequence },
+        state: Uint8Array.from(stored.state),
+        ...(stored.fingerprint !== undefined ? { fingerprint: stored.fingerprint } : {}),
+      });
+    },
+  };
 }
 
 function jsonRoundTrip(value: unknown): unknown {

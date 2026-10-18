@@ -86,11 +86,48 @@ export type FoldByHandlers<D extends Definitions, E> = {
   readonly [N in keyof D & string]?: (data: DataOf<D[N]>, entry: E | undefined, event: RecordedEventOf<D, N>) => E | null;
 };
 
-export interface RegistryFilter<D extends Definitions> {
-  readonly types?: readonly (keyof D & string)[];
+export interface RegistryFilter<D extends Definitions, N extends keyof D & string = keyof D & string> {
+  readonly types?: readonly N[];
   readonly scopes?: Partial<Record<AllScopeKeys<D> | (string & {}), string | readonly string[]>>;
   readonly where?: readonly Readonly<Record<string, unknown>>[];
 }
+
+/** Type-only key of the phantom a `$filter` result carries; it never exists at runtime. */
+declare const registrySource: unique symbol;
+
+/**
+ * What `$filter` returns: a plain `Filter` whose TYPE remembers the registry and the chosen types, so
+ * `defineReadModel` can check `keyBy`. The property is optional and never set — the object is a plain
+ * filter, and a plain `Filter` stays assignable to a variable inferred from `$filter`.
+ */
+export type RegistryFilterOf<D extends Definitions, N extends keyof D & string = keyof D & string> = Filter & {
+  readonly [registrySource]?: { readonly defs: D; readonly types: N };
+};
+
+/** The own-id key of type `T`: its explicit `idKey` literal, else `<lowerFirst(T)>Id` (as `defaultIdKey`). */
+type IdKeyOf<D extends Definitions, T extends keyof D & string> = D[T]["idKey"] extends infer K extends string
+  ? string extends K
+    ? `${Uncapitalize<T>}Id`
+    : K
+  : `${Uncapitalize<T>}Id`;
+
+/** What a read model over types `N` may be keyed by: their declared scope keys and their own id keys. */
+type KeysOfTypes<D extends Definitions, N extends keyof D & string> = {
+  [T in N]: RequiredScopeKeys<D[T]> | OptionalScopeKeys<D[T]> | IdKeyOf<D, T>;
+}[N];
+
+type KeysOfFilter<F> = F extends { readonly [registrySource]?: infer R }
+  ? NonNullable<R> extends { readonly defs: infer D extends Definitions; readonly types: infer N extends string }
+    ? KeysOfTypes<D, N & keyof D & string>
+    : string
+  : string;
+
+/**
+ * The admissible `keyBy` of a read model over source `Q` (decision 51): for a `$filter` source, or an
+ * array of them, a scope key declared by at least one chosen type or a chosen type's own id key;
+ * `string` as soon as one filter of the source is untyped (a `Filter` literal, `scope()`, `$scope()`).
+ */
+export type KeyByOf<Q> = Q extends readonly (infer F)[] ? KeysOfFilter<F> : KeysOfFilter<Q>;
 
 /** The structural part of a registry that stores and configs need — accepts any `defineEvents(...)` result. */
 export interface RegistryLike {
@@ -108,7 +145,7 @@ export type EventRegistry<D extends Definitions> = {
   /** All scope keys declared by any event in this registry. */
   readonly $scopeKeys: readonly string[];
   /** A filter over this registry's types (all of them unless `types` is given). */
-  $filter(filter?: RegistryFilter<D>): Filter;
+  $filter<const N extends keyof D & string = keyof D & string>(filter?: RegistryFilter<D, N>): RegistryFilterOf<D, N>;
   /**
    * Everything OF THIS REGISTRY that happened in relation to one event: `$scope("articleDraftedId", id)`.
    * For a cross-registry scope use the free `scope()` helper.
@@ -193,6 +230,14 @@ function trimmedSchema(schema: ZodType, omit: readonly string[]): ZodType | null
   return trimmed;
 }
 
+/** `$fold` / `$foldBy` results → their handlers (and `keyOf`): the fingerprint hashes those, not the closure (the same text for every fold). */
+const foldParts = new WeakMap<object, { readonly keyOf?: unknown; readonly handlers: Readonly<Record<string, unknown>> }>();
+
+/** The handlers (and for `$foldBy` the `keyOf`) behind a registry fold, or `undefined` for any other value. */
+export function foldPartsOf(fold: unknown): { readonly keyOf?: unknown; readonly handlers: Readonly<Record<string, unknown>> } | undefined {
+  return typeof fold === "function" ? foldParts.get(fold) : undefined;
+}
+
 export function defineEvents<const D extends Definitions>(defs: D): EventRegistry<D> {
   const types = Object.keys(defs) as (keyof D & string)[];
   for (const t of types) {
@@ -254,10 +299,14 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
     $scope(key: string, value: string | readonly string[]): Filter {
       return { types: [...types], scopes: { [key]: value } };
     },
-    $fold: <S>(handlers: FoldHandlers<D, S>) => foldWith(handlers),
+    $fold: <S>(handlers: FoldHandlers<D, S>) => {
+      const fold = foldWith(handlers);
+      foldParts.set(fold, { handlers: { ...handlers } as Readonly<Record<string, unknown>> });
+      return fold;
+    },
     $foldBy<K, E>(keyOf: (event: RecordedEventOf<D>) => K | undefined, handlers: FoldByHandlers<D, E>) {
       const table = handlers as Record<string, ((d: unknown, e: E | undefined, ev: RecordedEvent) => E | null) | undefined>;
-      return (events: readonly RecordedEvent[], state: Map<K, E>): Map<K, E> => {
+      const fold = (events: readonly RecordedEvent[], state: Map<K, E>): Map<K, E> => {
         let next: Map<K, E> | undefined;
         for (const event of events) {
           const handler = table[event.type];
@@ -272,6 +321,8 @@ export function defineEvents<const D extends Definitions>(defs: D): EventRegistr
         }
         return next ?? state;
       };
+      foldParts.set(fold, { keyOf, handlers: { ...handlers } as Readonly<Record<string, unknown>> });
+      return fold;
     },
     $foldAll<S>(initial: S | (() => S), handlers: FoldHandlers<D, S>) {
       const fold = foldWith(handlers);

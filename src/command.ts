@@ -62,6 +62,8 @@ export interface CommandSpec<S, R> {
   readonly decide: (state: S, tools: DecideTools) => Decided<R> | Promise<Decided<R>>;
   /** Retries on a conditional-append conflict or a transient store failure. Default 3. */
   readonly retries?: number;
+  /** A label for the context cache's `onLoad` report. */
+  readonly name?: string;
   /** Bypass the context cache for this command. */
   readonly noCache?: boolean;
 }
@@ -150,7 +152,7 @@ async function loadContext<S, R>(runtime: CommandRuntime, spec: CommandSpec<S, R
   if (spec.fold) {
     // `null` is a legitimate initial state ("nothing exists yet"); only `undefined` means "not given".
     const initial = (spec.initial !== undefined ? spec.initial : ([] as unknown)) as S | (() => S);
-    if (runtime.cache && !spec.noCache) return runtime.cache.load<S>({ query: context, fold: spec.fold, initial });
+    if (runtime.cache && !spec.noCache) return runtime.cache.load<S>({ query: context, fold: spec.fold, initial, ...(spec.name !== undefined ? { name: spec.name } : {}) });
     const result = await runtime.store.query(context);
     const base = typeof initial === "function" ? (initial as () => S)() : initial;
     return { state: spec.fold(result.events, base), ctx: result.ctx, delta: result.events, cacheHit: false };

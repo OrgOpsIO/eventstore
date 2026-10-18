@@ -117,6 +117,30 @@ export class WatchOverflowError extends EventStoreError {
   override readonly httpStatus = 503;
 }
 
+/**
+ * A read model's fold threw on one event of this key (the poison event). The event was skipped,
+ * every other key goes on; this key serves no state until a rebuild — fix the fold and bump the
+ * version. Fold on read throws for the same key, so the model never answers what the fold cannot.
+ * Carries the event's cursor, type and id, never its payload; the fold's error is the `cause`.
+ */
+export class FailedKeyError extends EventStoreError {
+  override readonly name = "FailedKeyError";
+  /** The key's tenant, set by a cross-tenant processor (`processor: "cross-tenant"`) in its `onFailedKey`; `undefined` elsewhere. */
+  readonly tenant?: string;
+  constructor(
+    readonly model: { readonly name: string; readonly version: number },
+    readonly key: string,
+    readonly event: { readonly type: string; readonly id: string; readonly sequence: number; readonly transactionId: string },
+    options?: { cause?: unknown; tenant?: string },
+  ) {
+    super(
+      `eventstore: read model "${model.name}" v${model.version}: key "${key}"${options?.tenant !== undefined ? ` of tenant ${options.tenant}` : ""} failed at event ${event.type} #${event.sequence} (id ${event.id}) — fix the fold and bump the version`,
+      options && "cause" in options ? { cause: options.cause } : undefined,
+    );
+    if (options?.tenant !== undefined) this.tenant = options.tenant;
+  }
+}
+
 /** Base for programming errors surfaced at request time: invalid query shapes, undeclared types. */
 export class UsageError extends EventStoreError {
   override readonly name = "UsageError";

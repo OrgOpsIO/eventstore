@@ -1,5 +1,6 @@
+import { UsageError } from "../errors.js";
 import { cursorOf, isLiveStore, isWakeStore, type LiveStore } from "../memory.js";
-import { filtersOf, matchesFilter } from "../query.js";
+import { filtersOf, matchesFilter, passedBy } from "../query.js";
 import { emptySchema } from "../registry.js";
 import type { Cursor, EventStore, Query, RecordedEvent, StoreSchema } from "../types.js";
 import { memoryCursors, type CursorStore } from "./cursors.js";
@@ -7,18 +8,48 @@ import { memoryCursors, type CursorStore } from "./cursors.js";
 export { fileCursors, memoryCursors } from "./cursors.js";
 export type { CursorStore } from "./cursors.js";
 
-/** Receives one batch of settled events; the cursor advances only after it resolves. */
+/**
+ * Receives one batch of settled events; the cursor advances only after it resolves. In processor
+ * mode (`target`) the handler commits the cursor itself: in one transaction it locks and reads the
+ * target's checkpoint, applies only the events beyond it, and writes `cursorOf(events)` as the new
+ * checkpoint. A redelivered batch can start below the checkpoint and end beyond it.
+ */
 export type SubscriptionHandler = (events: readonly RecordedEvent[]) => Promise<void> | void;
 
-/** What to do after a failed batch: retry with back-off, skip it, or stop the subscription. */
+/**
+ * What to do after a failed batch: retry with back-off, skip the one failing event, or stop the
+ * subscription. `"skip"` skips only the event the handler fails on: the batch is split to find it,
+ * and its neighbours are delivered and committed.
+ */
 export type ErrorDecision = "retry" | "skip" | "stop";
+
+/**
+ * Processor mode: the target keeps the checkpoint and writes it in its own transaction, with its
+ * rows, instead of `CursorStore.save` after the handler. The object belongs to one subscription;
+ * the application keys its checkpoint row itself.
+ */
+export interface CheckpointTarget {
+  /** Where the target's checkpoint stands; `null` starts at `from`. Read once, at start. */
+  load(): Promise<Cursor | null>;
+  /**
+   * Make a skipped poison event durable: under the same lock as the handler, commit `cursorOf([event])`
+   * as the checkpoint, with a dead letter if you keep one; do nothing when the checkpoint is already
+   * at or beyond the event (skipped before).
+   */
+  skip(event: RecordedEvent, error: unknown): Promise<void>;
+}
 
 /** Options of a durable subscription: store, cursor persistence, start position, polling, error policy. */
 export interface SubscribeOptions {
   readonly store: EventStore;
-  /** Where the cursor is remembered. Default: in memory (replay after restart). */
+  /** Where the cursor is remembered. Default: in memory (replay after restart). Not together with `target`. */
   readonly cursors?: CursorStore;
-  /** Start position when the cursor store has nothing for this name. Default `"beginning"`. */
+  /**
+   * Processor mode: the handler writes the checkpoint with its rows, in one transaction, and
+   * nothing is saved after it; a skipped event goes to `target.skip`. Not together with `cursors`.
+   */
+  readonly target?: CheckpointTarget;
+  /** Start position when the cursor store (or the target) has nothing for this name. Default `"beginning"`. */
   readonly from?: Cursor | null | "beginning" | "now";
   /**
    * Polling interval. A `LiveStore` push or a `WakeStore` doorbell wakes the poller at once, so
@@ -31,16 +62,18 @@ export interface SubscribeOptions {
   readonly data?: false;
   /** `false`: deliver records without reading the payload at all — see `QueryOptions.payload`. */
   readonly payload?: false;
-  /** Max events per handler call. Default 500. */
+  /** Max events per handler call: a positive integer. Default 500. */
   readonly batchSize?: number;
   /**
-   * What to do when the handler throws, or when the store/cursor store fails (then `batch` is
-   * empty and `"skip"` means `"retry"`). Default: `"retry"` with back-off (100 ms → 5 s).
+   * What to do when the handler throws, or when the store, the cursor store or the target fails
+   * (then `batch` is empty and `"skip"` means `"retry"`). Asked for the failed batch; after
+   * `"skip"`, asked once more for the isolated event the handler fails on alone (`batch` is that
+   * one event). Default: `"retry"` with back-off (100 ms → 5 s).
    */
   readonly onError?: (error: unknown, batch: readonly RecordedEvent[]) => ErrorDecision;
 }
 
-/** A running subscription: wait for catch-up, stop, inspect the cursor. */
+/** A running subscription: wait for catch-up, stop, inspect the cursor and what it has passed. */
 export interface Subscription {
   readonly name: string;
   /**
@@ -50,8 +83,24 @@ export interface Subscription {
   whenCaughtUp(): Promise<void>;
   /** Stops polling; awaits an in-flight batch. */
   stop(): Promise<void>;
-  /** The last persisted cursor. */
+  /**
+   * The last persisted cursor. In processor mode: the last checkpoint the target committed, as far
+   * as the subscription knows (`target.load()` at start, then every resolved handler call or skip).
+   */
   readonly cursor: Cursor | null;
+  /**
+   * The watermark of the last empty page (`QueryResult.watermark`): every matching event of a
+   * transaction below it has been handled or skipped. `null` before the first empty page, or
+   * when the store gives none.
+   */
+  readonly watermark: string | null;
+  /**
+   * Whether the subscription has passed a read-your-writes token
+   * `{ transactionId: appended.transactionId, sequence: appended.last }`: handled or skipped it,
+   * by the cursor, or by the watermark of the last empty page (for a write the query does not
+   * match). As fresh as the last poll; it reads no store.
+   */
+  hasPassed(token: Cursor): boolean;
   /** `true` after `stop()` or after the handler asked to stop. */
   readonly stopped: boolean;
 }
@@ -69,16 +118,38 @@ const MAX_UNSETTLED_MS = 500;
  * appends when the store is a `LiveStore`). The cursor advances to the batch's settled cursor
  * only after the handler resolved, so a crash re-delivers the batch (at-least-once). Pushed
  * events never bypass the query: the cursor is the only source of truth.
+ *
+ * When the handler fails and `onError` says `"skip"`, the batch is split in halves, left to right,
+ * until the one failing event is found; every part that succeeds is committed, the failing event
+ * is skipped. Neighbours of a failed batch are delivered again (at-least-once).
+ *
+ * With `target` (processor mode) the handler writes the checkpoint itself, with its rows, and
+ * nothing is saved after it. The subscription stays at-least-once; exactly-once is the target's:
+ * it locks its checkpoint and applies only the events beyond it, since a redelivered batch can be
+ * longer than the one it already committed. A guard on the batch's end alone is not enough.
  */
 export function subscribe(name: string, query: Query, handler: SubscriptionHandler, options: SubscribeOptions): Subscription {
   const store = options.store;
+  const target = options.target;
+  if (target && options.cursors) {
+    throw new UsageError(
+      "eventstore: subscribe() takes either `cursors` or `target`, not both — in processor mode (`target`) the target keeps the checkpoint, so drop `cursors`",
+    );
+  }
   const cursors = options.cursors ?? memoryCursors();
   const pollIntervalMs = options.pollIntervalMs ?? (isWakeStore(store) ? 5_000 : 500);
   const wakeCoalesceMs = options.wakeCoalesceMs ?? 25;
   const batchSize = options.batchSize ?? 500;
+  // a page of `limit: 0` is empty whatever waits beyond the cursor: it would never deliver, and its
+  // watermark would report unread events as passed
+  if (!(Number.isSafeInteger(batchSize) && batchSize >= 1)) {
+    throw new UsageError(`eventstore: subscribe() needs a batchSize that is a positive integer (default 500), got ${String(batchSize)}`);
+  }
   const onError = options.onError ?? (() => "retry" as const);
 
   let cursor: Cursor | null = null;
+  /** The watermark of the last empty settled page; only ever from that page's own read. */
+  let watermark: string | null = null;
   /** The start position is resolved inside the first successful poll: a failure there retries, it never falls back to replaying everything. */
   let cursorResolved = false;
   let stopped = false;
@@ -100,7 +171,7 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
   };
 
   const initialCursor = async (): Promise<Cursor | null> => {
-    const stored = await cursors.load(name);
+    const stored = await (target ? target.load() : cursors.load(name));
     if (stored) return stored;
     const from = options.from ?? "beginning";
     if (from === "beginning" || from === null) return null;
@@ -154,6 +225,9 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
       const settled = result.events;
       if (settled.length === 0) {
         backoffMs = 0;
+        // Everything matching below this read's watermark is at or below the cursor. Taken from
+        // this very read only, never from the probe below (a second statement, a later snapshot).
+        if (result.watermark !== undefined) watermark = result.watermark;
         for (const w of waitersBeforeRead) w();
         if (caughtUpWaiters.length > 0) wakeRequested = true;
         // Is something beyond the cursor waiting for an older transaction to end? It becomes
@@ -174,21 +248,17 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
       }
       unsettledMs = 0;
       caughtUpWaiters = [...waitersBeforeRead, ...caughtUpWaiters];
-      const decision = await deliver(settled);
-      if (decision === "stop") {
+      // commits happen inside: every handled part and every skipped event moves the cursor at once
+      const outcome = await deliverPage(settled);
+      if (outcome === "stop") {
         shutdown(); // not `stop()`: that would await this very poll
         return;
       }
-      if (decision === "retry") {
+      if (outcome === "retry") {
+        // back off from the committed cursor: what was committed of this page stays committed
         backoffMs = backoffMs === 0 ? MIN_BACKOFF_MS : Math.min(backoffMs * 2, MAX_BACKOFF_MS);
         schedule(backoffMs);
         return;
-      }
-      // "ok" or "skip": advance past this batch
-      const next = cursorOf(settled);
-      if (next) {
-        await cursors.save(name, next);
-        cursor = next;
       }
       backoffMs = 0;
       if (stopped) {
@@ -215,17 +285,81 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
     }
   };
 
-  const deliver = async (batch: readonly RecordedEvent[]): Promise<"ok" | ErrorDecision> => {
+  /**
+   * Make a handled part count. Default mode: save its cursor. Processor mode: the handler already
+   * wrote it with its rows. A failing save is a store error: it leaves to poll's catch.
+   */
+  const commit = async (part: readonly RecordedEvent[]): Promise<void> => {
+    const next = cursorOf(part);
+    if (!next) return;
+    if (!target) await cursors.save(name, next);
+    cursor = next;
+  };
+
+  /** Make a skipped event count: its own cursor, saved (default mode) or handed to `target.skip`. */
+  const skipEvent = async (event: RecordedEvent, error: unknown): Promise<void> => {
+    const next = cursorOf([event]);
+    if (target) await target.skip(event, error);
+    else if (next) await cursors.save(name, next);
+    if (next) cursor = next;
+  };
+
+  /** The handler on one part; a resolved part is committed (a commit error propagates). */
+  const attempt = async (part: readonly RecordedEvent[]): Promise<{ ok: true } | { ok: false; error: unknown }> => {
     try {
-      await handler(batch);
-      return "ok";
+      await handler(part);
     } catch (error) {
-      try {
-        return onError(error, batch);
-      } catch {
-        return "retry";
-      }
+      return { ok: false, error };
     }
+    await commit(part);
+    return { ok: true };
+  };
+
+  const ask = (error: unknown, part: readonly RecordedEvent[]): ErrorDecision => {
+    try {
+      return onError(error, part);
+    } catch {
+      return "retry";
+    }
+  };
+
+  /**
+   * One page: the handler on all of it; on a failure `onError` decides. `"skip"` skips the one
+   * failing event: a single event is skipped at once, a longer page is isolated.
+   */
+  const deliverPage = async (page: readonly RecordedEvent[]): Promise<"ok" | "retry" | "stop"> => {
+    const first = await attempt(page);
+    if (first.ok) return "ok";
+    const decision = ask(first.error, page);
+    if (decision !== "skip") return decision;
+    if (page.length === 1) {
+      await skipEvent(page[0]!, first.error);
+      return "ok";
+    }
+    return isolate(page);
+  };
+
+  /**
+   * A failed part of more than one event, after `"skip"`: deliver its halves left to right, commit
+   * each that succeeds, split each that fails again, and ask `onError` once more for an event that
+   * fails alone. The cursor only moves forward: every commit covers a contiguous prefix of the page.
+   */
+  const isolate = async (part: readonly RecordedEvent[]): Promise<"ok" | "retry" | "stop"> => {
+    const mid = Math.ceil(part.length / 2);
+    for (const half of [part.slice(0, mid), part.slice(mid)]) {
+      if (stopped) return "ok"; // what is committed stays; nothing more is delivered
+      const result = await attempt(half);
+      if (result.ok) continue;
+      if (half.length > 1) {
+        const outcome = await isolate(half);
+        if (outcome !== "ok") return outcome;
+        continue;
+      }
+      const decision = ask(result.error, half);
+      if (decision !== "skip") return decision;
+      await skipEvent(half[0]!, result.error);
+    }
+    return "ok";
   };
 
   const shutdown = (): void => {
@@ -299,6 +433,17 @@ export function subscribe(name: string, query: Query, handler: SubscriptionHandl
     stop,
     get cursor() {
       return cursor;
+    },
+    get watermark() {
+      return watermark;
+    },
+    hasPassed(token: Cursor) {
+      if (!token || typeof token.transactionId !== "string" || !/^\d+$/.test(token.transactionId) || !Number.isSafeInteger(token.sequence)) {
+        throw new UsageError(
+          "eventstore: hasPassed(token) needs a Cursor { transactionId, sequence } — build it from an append: { transactionId: appended.transactionId, sequence: appended.last }",
+        );
+      }
+      return passedBy(token, cursor, watermark);
     },
     get stopped() {
       return stopped;

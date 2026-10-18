@@ -1,13 +1,16 @@
 import { runCommand, type CommandOutcome, type CommandSpec, type RawCommandSpec } from "./command.js";
-import { CacheBudget, ContextCache, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
+import { CacheBudget, ContextCache, estimateSize, type ContextCacheOptions, type ContextSpec, type LoadedContext } from "./context.js";
 import { ConflictError, NotConfiguredError, UsageError } from "./errors.js";
 import { MemoryStore } from "./memory.js";
 import { buildSchema, type Definitions, type EventRegistry, type RecordedEventOf, type RegistryLike } from "./registry.js";
 import type { CreatePostgresStoreOptions } from "./postgres/store.js";
+import { PersistedModel, type PersistedReadModel } from "./persisted.js";
 import { queryKey } from "./query.js";
+import { modelFingerprint, setTypeDefs, type TypeDefs } from "./fingerprint.js";
+import { ReadModelRegistry, type LiveReadModel, type LiveReadModelOptions, type ReadModelDefinition } from "./readmodel.js";
 import { subscribe, type SubscribeOptions, type Subscription, type SubscriptionHandler } from "./subscribe/index.js";
 import { PLATFORM_TENANT_ID, scopedToTenant, type TenantConfig } from "./tenant.js";
-import { WatchHub, type Watch, type WatchLimits, type WatchOptions } from "./watch.js";
+import { WatchHub, watchPlaces, type Watch, type WatchLimits, type WatchOptions } from "./watch.js";
 import type {
   AppendIfOutcome,
   AppendResult,
@@ -100,6 +103,26 @@ export interface EventStoreApi extends EventStore {
   watch(query: Query, handler: (events: readonly RecordedEvent[]) => void | Promise<void>, options?: WatchOptions): Promise<Watch>;
   /** Load a context incrementally (cached per query in this view). */
   context<S>(spec: ContextSpec<S>): Promise<LoadedContext<S>>;
+  /**
+   * The live read model of this view for a `defineReadModel` definition: one per (tenant of the
+   * view, name, version) in this process, kept in memory by one feed, rebuilt from the store after
+   * a restart. Returns at once; reads wait for the first rebuild. On the root view it folds every
+   * tenant's events (under `rls` it fails: use `forTenant(t).readModel(def)`). A past view refuses.
+   * `options.start: "persisted"` starts it from the persisted model of the same name and version (rows and checkpoint,
+   * one snapshot) instead of a rebuild; the options apply when the model is created — a running model is returned as it is.
+   */
+  readModel<S>(definition: ReadModelDefinition<S>, options?: LiveReadModelOptions): LiveReadModel<S>;
+  /**
+   * The persisted read model of this view for the same kind of definition: state rows and a
+   * checkpoint in the store (which needs `persistedModels: true`), kept by one writer per model and
+   * version across every process; this process is the writer or a standby. One handle per (tenant
+   * of the view, name, version). Returns at once; reads work from the first call. Under `rls` use
+   * `forTenant(t).persistedReadModel(def)`: the root view's handle fails. A past view refuses.
+   * A definition with `processor: "cross-tenant"` has one writer for every tenant: the root view's handle is
+   * that processor (it has no reads; under `rls` it runs on an api connected as `postgres.processorRole`), and
+   * every tenant view's handle only reads.
+   */
+  persistedReadModel<S>(definition: ReadModelDefinition<S>): PersistedReadModel<S>;
   /** Like `appendIf`, but throws `ConflictError` instead of returning the conflict. */
   appendIfOrThrow(events: readonly NewEvent[], ctx: ContextHandle): Promise<AppendResult>;
   /**
@@ -125,7 +148,12 @@ export interface EventStoreApi extends EventStore {
   asOf(sequence: number): EventStoreApi;
   /** The underlying store (memory or Postgres), initialised. Not narrowed to a tenant. */
   store(): Promise<EventStore>;
-  /** Forget this view's cached contexts (all, or one query). */
+  /**
+   * Forget what this view keeps in this process. Without a query: its cached contexts, its live read models
+   * (rebuilt from the store in place — the same handles; reads wait for the rebuild, watchers end with
+   * `TransientError("read_model_rebuilt")`) and its persisted read models' `get` copies (the next `get` reads the
+   * rows again). With a query: only that query's cached contexts. The step that follows an erasure.
+   */
   invalidate(query?: Query): void;
   /** Closes the underlying store. On a tenant view this is a no-op — close the root api. */
   close(): Promise<void>;
@@ -160,7 +188,20 @@ export function createEventStore(config: EventStoreConfig): EventStoreApi {
   };
   const cacheOptions = config.contextCache === false ? { max: 0 } : (config.contextCache ?? {});
   const budget = new CacheBudget(cacheOptions.totalMaxBytes ?? 256 * 1024 * 1024);
-  return buildApi({ schema, store, created: () => storePromise !== undefined, config, tenantId: undefined, views: new Map(), budget, hub: new WatchHub(config.watch) });
+  // the schema seam of the fingerprint (decision 42): every declared type's data schema and upcaster
+  const typeDefs: TypeDefs = Object.freeze(Object.assign({}, ...(config.events ?? []).map((r) => r.$defs)) as TypeDefs);
+  return buildApi({
+    schema,
+    store,
+    created: () => storePromise !== undefined,
+    config,
+    tenantId: undefined,
+    views: new Map(),
+    budget,
+    hub: new WatchHub(config.watch),
+    readModels: new ReadModelRegistry(),
+    typeDefs,
+  });
 }
 
 interface ApiParts {
@@ -178,6 +219,10 @@ interface ApiParts {
   readonly until?: number;
   /** One watch hub per root api: readers shared per (view, query), limits per process. */
   readonly hub: WatchHub;
+  /** The live read models of the root api and every view: a dropped tenant view never orphans one. */
+  readonly readModels: ReadModelRegistry;
+  /** The declared event types, for fingerprints (internal seam, decision 42). */
+  readonly typeDefs: TypeDefs;
 }
 
 /** The store as it was at `until`: reads capped (never widened), writes refused. */
@@ -227,8 +272,9 @@ function buildApi(parts: ApiParts): EventStoreApi {
     if (!cache) {
       cache =
         parts.until !== undefined
-          ? new ContextCache(await view(), { ...(config.contextCache === false ? {} : (config.contextCache ?? {})), max: 0 }) // a past view keeps nothing
-          : new ContextCache(await view(), { ...(config.contextCache === false ? { max: 0 } : (config.contextCache ?? {})), budget: parts.budget });
+          ? new ContextCache(await view(), { ...(config.contextCache === false ? {} : withTenant(config.contextCache ?? {}, tenantId)), max: 0 }) // a past view keeps nothing
+          : new ContextCache(await view(), { ...(config.contextCache === false ? { max: 0, persist: false } : withTenant(config.contextCache ?? {}, tenantId)), budget: parts.budget });
+      setTypeDefs(cache, parts.typeDefs);
     }
     return cache;
   };
@@ -287,6 +333,36 @@ function buildApi(parts: ApiParts): EventStoreApi {
       const projection = options?.payload === false ? "bare" : options?.data === false ? "lean" : "full";
       return parts.hub.watch(JSON.stringify([tenantId ?? null, queryKey(query), projection]), await view(), query, handler, options);
     },
+    readModel(definition, options) {
+      if (parts.until !== undefined) throw new UsageError("eventstore: a past view (asOf) has no live read model — read it on a live view");
+      const start = startOf(options);
+      return parts.readModels.open(tenantId, definition, { schema, view, places: watchPlaces(parts.hub), start, typeDefs: parts.typeDefs });
+    },
+    persistedReadModel<S>(definition: ReadModelDefinition<S>): PersistedReadModel<S> {
+      if (parts.until !== undefined) throw new UsageError("eventstore: a past view (asOf) has no persisted read model — read it on a live view");
+      const cc = config.contextCache === false ? undefined : config.contextCache;
+      const copies = {
+        max: config.contextCache === false ? 0 : (cc?.max ?? 1000),
+        maxBytes: cc?.maxBytes ?? 64 * 1024 * 1024,
+        sizeOf: cc?.sizeOf ?? estimateSize,
+        maxEvents: cc?.maxEvents ?? 100_000,
+      };
+      return parts.readModels.openPersisted(
+        tenantId,
+        definition as ReadModelDefinition<unknown>,
+        (def, onStop) =>
+          new PersistedModel<unknown>(def, {
+            schema,
+            view,
+            tenantId,
+            places: watchPlaces(parts.hub),
+            copies,
+            fingerprint: modelFingerprint(def, parts.typeDefs),
+            tenantKey: config.tenant?.scopeKey,
+            onStop,
+          }),
+      ) as unknown as PersistedReadModel<S>;
+    },
     forTenant(id: string): EventStoreApi {
       if (!config.tenant) throw new Error("eventstore: forTenant() needs configure({ tenant: { scopeKey } })");
       if (id === tenantId) return api;
@@ -303,7 +379,7 @@ function buildApi(parts: ApiParts): EventStoreApi {
       while (parts.views.size > maxViews) {
         const oldest = parts.views.entries().next().value;
         if (!oldest) break;
-        oldest[1].invalidate(); // release its cache entries from the shared budget
+        releaseCache.get(oldest[1])?.(); // release its cache entries from the shared budget; its read models keep running (decision 49 §3)
         parts.views.delete(oldest[0]);
       }
       return existing;
@@ -318,13 +394,41 @@ function buildApi(parts: ApiParts): EventStoreApi {
     store: () => parts.store(),
     invalidate(query?: Query): void {
       cache?.invalidate(query);
+      // a past view keeps no model; a query is only a cache hint (decision 49 §1)
+      if (query === undefined && parts.until === undefined) parts.readModels.invalidateView(tenantId);
     },
     async close(): Promise<void> {
-      if (tenantId === undefined && parts.until === undefined) await parts.hub.close(); // watch readers are the api's; subscriptions are yours
+      if (tenantId === undefined && parts.until === undefined) {
+        // read models and watch readers are the api's; subscriptions are yours
+        await parts.readModels.close();
+        await parts.hub.close();
+      }
       if (tenantId === undefined && parts.until === undefined && parts.created()) await (await parts.store()).close();
     },
   };
+  releaseCache.set(api, () => cache?.invalidate());
   return api;
+}
+
+/** The cache-only release of a view, for the tenant-view LRU: eviction is not `invalidate()` (decision 49 §3). */
+const releaseCache = new WeakMap<EventStoreApi, () => void>();
+
+/** The checked `start` of `readModel(def, options)` (decision 43 §1). */
+function startOf(options: LiveReadModelOptions | undefined): "rebuild" | "persisted" {
+  if (options === undefined) return "rebuild";
+  if (options === null || typeof options !== "object") throw new UsageError("eventstore: readModel(definition, options) needs options as an object: { start?: \"rebuild\" | \"persisted\" }");
+  const start = options.start ?? "rebuild";
+  if (start !== "rebuild" && start !== "persisted") {
+    throw new UsageError(`eventstore: readModel() start must be "rebuild" (default) or "persisted", got ${typeof start === "string" ? `"${start}"` : String(start)}`);
+  }
+  return start;
+}
+
+/** Stamp the view's tenant onto every `onLoad` report. */
+function withTenant(options: ContextCacheOptions, tenantId: string | undefined): ContextCacheOptions {
+  const onLoad = options.onLoad;
+  if (!onLoad || tenantId === undefined) return options;
+  return { ...options, onLoad: (load) => onLoad({ ...load, tenant: tenantId }) };
 }
 
 async function resolveStore(config: EventStoreConfig, schema: StoreSchema): Promise<EventStore> {
@@ -426,6 +530,8 @@ export const es: EventStoreApi = {
   appendIfOrThrow: (e, c) => current().appendIfOrThrow(e, c),
   command: ((s: CommandSpec<unknown, unknown>) => current().command(s)) as EventStoreApi["command"],
   context: (s) => current().context(s),
+  readModel: (d, o) => current().readModel(d, o),
+  persistedReadModel: (d) => current().persistedReadModel(d),
   subscribe: (n, q, h, o) => current().subscribe(n, q, h, o),
   watch: (q, h, o) => current().watch(q, h, o),
   forTenant: (id) => current().forTenant(id),

@@ -84,6 +84,8 @@ export interface CatalogTable {
 export interface AdoptContext {
   readonly rls?: boolean;
   readonly ownPolicy?: string;
+  /** More policies of the store's own (the processor role's read policy, decision 46). */
+  readonly ownPolicies?: readonly string[];
 }
 
 export interface AdoptionPlan {
@@ -237,7 +239,7 @@ export function planAdoption(table: CatalogTable | null, tableRef: string, optio
   }
 
   for (const policy of table.policies ?? []) {
-    if (policy.name === context.ownPolicy) continue;
+    if (policy.name === context.ownPolicy || context.ownPolicies?.includes(policy.name)) continue;
     if (context.rls && policy.permissive) {
       problems.push(`policy "${policy.name}" is permissive: under rls it is OR-ed with the store's tenant policy and opens rows of every tenant — drop it or make it RESTRICTIVE`);
     } else {

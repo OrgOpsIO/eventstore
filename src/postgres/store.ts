@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import pg from "pg";
 import type { Pool, PoolClient } from "pg";
-import { EventStoreError, PolicyViolationError, TransientError, UniqueViolationError, UsageError } from "../errors.js";
+import { EventStoreError, PolicyViolationError, TenantMismatchError, TransientError, UniqueViolationError, UsageError } from "../errors.js";
 import { uuidv7 } from "../ids.js";
 import {
   assertOmittable,
@@ -20,12 +21,15 @@ import type {
   ContextHandle,
   Cursor,
   EventStore,
+  FoldStateKey,
+  FoldStateStore,
   NewEvent,
   Query,
   QueryOptions,
   QueryResult,
   RecordedEvent,
   StatisticsStore,
+  StoredFoldState,
   StoreSchema,
   TypeStatistics,
   WakeStore,
@@ -45,7 +49,9 @@ import {
   type CatalogColumn,
   type CatalogTable,
 } from "./adopt.js";
+import type { ReadModelStore } from "../modelstore.js";
 import { CommitListener, type OpenedConnection } from "./live.js";
+import { PostgresReadModels } from "./models.js";
 import {
   APPEND_SIGNATURE,
   DEFAULT_SCHEMA,
@@ -60,6 +66,10 @@ import {
   compileQuery,
   compileStatistics,
   ddlStatements,
+  FOLD_STATE_POLICY_EXPRESSION,
+  foldStatePolicyName,
+  foldStateTableDdl,
+  foldStateTargetOf,
   grantStatements,
   idempotencyIndexDdl,
   idempotencyIndexName,
@@ -73,6 +83,17 @@ import {
   policyExpression,
   policyName,
   qualified,
+  readModelIndexDdl,
+  checkProcessorRole,
+  processorPolicies,
+  processorPolicyDdl,
+  processorPolicyNames,
+  readModelPolicyName,
+  readModelStatePolicyName,
+  readModelStateTableDdl,
+  readModelTableDdl,
+  readModelTargetsOf,
+  type ReadModelTargets,
   quoteIdent,
   quoteLiteral,
   scopeFn,
@@ -182,6 +203,31 @@ export interface CreatePostgresStoreOptions {
    * cannot fill) stops the install before anything changes. See `AdoptOptions`.
    */
   readonly adopt?: AdoptOptions;
+  /**
+   * Keep persisted fold states in `<table>_fold_state` (installed with the events table, with
+   * its own policy under `rls`), and give the store and its tenant sessions `foldStates`: a fold
+   * made by `defineFold` then starts a cold process from its stored state and folds only the
+   * delta. The application role needs `SELECT, INSERT, UPDATE` on that table. Default `false`:
+   * no table, no change.
+   */
+  readonly persistedFolds?: boolean;
+  /**
+   * Keep persisted read models (`es.persistedReadModel(def)`) in `<table>_read_model` (one row per
+   * model: checkpoint, epoch, revision) and `<table>_read_model_state` (one row per key), installed
+   * with the events table, with their own policies under `rls`. A store with a running persisted
+   * model holds one extra connection per process for the writer locks. The application role needs
+   * `SELECT, INSERT, UPDATE` on both tables. Default `false`: no tables, no change.
+   */
+  readonly persistedModels?: boolean;
+  /**
+   * Under `rls` (with `persistedModels`): the database role a cross-tenant processor connects as (a read model
+   * defined with `processor: "cross-tenant"`). The installer gives that role three policies — read every tenant's
+   * events, read and write every tenant's model rows and state rows — and nothing else; the application role's
+   * isolation is unchanged. Pass the same value in every process; the processor's process connects as that role
+   * (`install: "none"`), and a store connected as it may read every tenant at its root. Never grant this role to the
+   * application role: members inherit its policies. Default: none — no cross-tenant processor under `rls`.
+   */
+  readonly processorRole?: string;
 }
 
 const DEFAULT_TIMEOUTS: Required<PoolTimeouts> = { statementMs: 30_000, lockMs: 10_000, idleInTransactionMs: 30_000 };
@@ -190,6 +236,8 @@ const TRANSIENT_SQLSTATES = new Set(["40P01", "40001", "55P03", "57014", "53200"
 
 interface Row {
   context_version: string;
+  /** The `xmin` of this statement's own snapshot: the watermark (decision 11). */
+  xmin: string;
   seq: string | null;
   event_type: string | null;
   payload: Record<string, unknown> | null;
@@ -213,6 +261,8 @@ interface AppendRow {
   first_seq: string | null;
   last_seq: string | null;
   cnt: number;
+  /** `pg_current_xact_id_if_assigned()` of the append statement; `NULL` when nothing was written. */
+  xid: string | null;
 }
 
 /** Anything that can run a parameterised statement: the pool, or a checked-out client inside a transaction. */
@@ -243,7 +293,28 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
   private readonly pool: Pool;
   private readonly ownsPool: boolean;
   private readonly installMode: "auto" | "none";
-  private readonly ddlOptions: { adhocQueries?: boolean; rls?: boolean; tenantScopeKey?: string; grantExecuteTo?: readonly string[]; typeIndex?: boolean; live?: boolean };
+  private readonly ddlOptions: {
+    adhocQueries?: boolean;
+    rls?: boolean;
+    tenantScopeKey?: string;
+    grantExecuteTo?: readonly string[];
+    typeIndex?: boolean;
+    live?: boolean;
+    persistedFolds?: boolean;
+    persistedModels?: boolean;
+    processorRole?: string;
+  };
+  /** Whether this store is connected as `processorRole` (read once, `current_user`); see `processorSession`. */
+  private processorCheck: Promise<boolean> | undefined;
+  /** The persisted read models' tables and their lock session; present only with `persistedModels`. */
+  private readonly modelTargets: ReadModelTargets | undefined;
+  private readonly models: PostgresReadModels | undefined;
+  /** @internal The persisted read models' backend on the root store (`persistedModels`). Under `rls` it refuses: use `withTenant(id)`. */
+  readonly readModelStore?: ReadModelStore;
+  /** The fold-state table; present only with `persistedFolds`. */
+  private readonly foldTarget: Target | undefined;
+  /** The persisted fold tier's backend on the root store (`persistedFolds`). Under `rls` it refuses: use `withTenant(id).foldStates`. */
+  readonly foldStates?: FoldStateStore;
   private readonly uniqueByIndex: Map<string, { type: string; path: string }>;
   private readonly idempotencyIndex: string;
   private readonly fn: string;
@@ -300,7 +371,27 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
       grantExecuteTo: options.grantExecuteTo,
       typeIndex: options.typeIndex,
       live: options.live !== undefined && options.live !== false,
+      persistedFolds: options.persistedFolds === true,
+      persistedModels: options.persistedModels === true,
+      ...(options.processorRole !== undefined ? { processorRole: options.processorRole } : {}),
     };
+    checkProcessorRole(this.ddlOptions);
+    this.modelTargets = options.persistedModels ? readModelTargetsOf(this.target) : undefined;
+    this.foldTarget = options.persistedFolds ? foldStateTargetOf(this.target) : undefined;
+    if (this.foldTarget) {
+      this.foldStates = {
+        read: async (key) => {
+          this.assertFoldStateSession();
+          await this.ensureInstalled();
+          return this.readFoldState(this.pool, key.tenant ?? "", key, false);
+        },
+        write: async (key, stored) => {
+          this.assertFoldStateSession();
+          await this.ensureInstalled();
+          return this.writeFoldState(this.pool, key.tenant ?? "", key, stored, false);
+        },
+      };
+    }
     if (this.ddlOptions.live) {
       const liveConnection = typeof options.live === "object" ? options.live.connection : undefined;
       const direct = liveConnection ?? (typeof options.connection === "string" ? options.connection : undefined);
@@ -331,6 +422,35 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
       });
       this.listener = listener;
       this.onCommitted = (l) => listener.add(l);
+    }
+    if (this.modelTargets) {
+      const direct = typeof options.connection === "string" ? options.connection : undefined;
+      const pool = this.pool;
+      this.models = new PostgresReadModels({
+        pool,
+        target: this.target,
+        targets: this.modelTargets,
+        lockSalt: this.schema.lockSalt,
+        rls: options.rls === true,
+        processorRole: this.ddlOptions.processorRole,
+        isProcessor: () => this.processorSession(),
+        listener: this.listener,
+        // the writer locks' own session, outside the pool: a session lock on a pooled connection would leak to the next borrower
+        openLockConnection: async () => {
+          if (direct === undefined) {
+            const client = await pool.connect();
+            client.on("error", () => undefined);
+            return { connection: client, release: () => client.release(true) }; // destroyed, never back into the pool
+          }
+          const client = new pg.Client({ connectionString: direct, keepAlive: true });
+          client.on("error", () => undefined); // the lock session's own "error" handler decides; never crash the process
+          await client.connect();
+          return { connection: client, release: () => void client.end().catch(() => undefined) };
+        },
+        ensureInstalled: () => this.ensureInstalled(),
+        translate: (err, inTenantSession) => this.translate(err, inTenantSession),
+      });
+      this.readModelStore = this.models.capability(null);
     }
     if (options.rls && !this.ddlOptions.tenantScopeKey) throw new Error("eventstore/postgres: rls: true needs tenantScopeKey");
     this.uniqueByIndex = new Map(uniqueIndexes(this.schema, this.table).map((u) => [u.name, { type: u.type, path: u.path }]));
@@ -421,8 +541,9 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     }
   }
 
-  private adoptContext(): { rls?: boolean; ownPolicy: string } {
-    return { rls: this.ddlOptions.rls, ownPolicy: policyName(this.table) };
+  private adoptContext(): { rls?: boolean; ownPolicy: string; ownPolicies: readonly string[] } {
+    // the processor role's read policy is the store's own too (decision 46 §2), whether or not this process names the role
+    return { rls: this.ddlOptions.rls, ownPolicy: policyName(this.table), ownPolicies: [processorPolicyNames(this.table).events] };
   }
 
   private async readCatalog(client: PoolClient, options: AdoptOptions): Promise<{ table: CatalogTable; sequenceColumn: string | undefined } | null> {
@@ -527,6 +648,12 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     if (this.schemaName !== DEFAULT_SCHEMA) await client.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(this.schemaName)}`);
     if (this.adopt) await this.adoptUnderLock(client, this.adopt);
     await client.query(tableDdl(target));
+    if (this.foldTarget) await client.query(foldStateTableDdl(this.foldTarget));
+    if (this.modelTargets) {
+      await client.query(readModelTableDdl(this.modelTargets));
+      await client.query(readModelStateTableDdl(this.modelTargets));
+      for (const statement of readModelIndexDdl(this.table, this.modelTargets)) await client.query(statement);
+    }
 
     // ── es_scope: missing → create; commented ours → ok; uncommented → probe; else stale
     const fnComment = await functionComment(client, scopeSig);
@@ -633,32 +760,102 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
 
     // ── row-level security: ALTER only when needed, policy recreated when USING or WITH CHECK drifted
     if (this.ddlOptions.rls) {
-      const key = tenantKey as string;
-      const policy = policyName(this.table);
-      const expr = policyExpression(this.schemaName, key);
-      const flags = await client.query<{ rls: boolean; force: boolean }>(
-        "SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS force FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $1 AND n.nspname = $2",
-        [this.table, this.schemaName],
-      );
-      if (!flags.rows[0]?.rls) await client.query(`ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY`);
-      if (!flags.rows[0]?.force) await client.query(`ALTER TABLE ${t} FORCE ROW LEVEL SECURITY`);
-      const existing = await client.query<{ qual: string | null; with_check: string | null }>(
-        "SELECT qual, with_check FROM pg_policies WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
-        [this.schemaName, this.table, policy],
-      );
-      const row = existing.rows[0];
-      const expected = normalisePolicyExpr(expr, this.schemaName);
-      const upToDate =
-        row !== undefined &&
-        row.qual !== null &&
-        row.with_check !== null &&
-        normalisePolicyExpr(row.qual, this.schemaName) === expected &&
-        normalisePolicyExpr(row.with_check, this.schemaName) === expected;
-      if (!upToDate) {
-        if (row !== undefined) await client.query(`DROP POLICY IF EXISTS ${quoteIdent(policy)} ON ${t}`);
-        await client.query(`CREATE POLICY ${quoteIdent(policy)} ON ${t} USING (${expr}) WITH CHECK (${expr})`);
+      await this.installPolicy(client, this.target, policyName(this.table), policyExpression(this.schemaName, tenantKey as string));
+      // the fold states are isolated like the events: same session variable, and never the empty tenant
+      if (this.foldTarget) await this.installPolicy(client, this.foldTarget, foldStatePolicyName(this.table), FOLD_STATE_POLICY_EXPRESSION);
+      // the model rows and state rows likewise
+      if (this.modelTargets) {
+        await this.installPolicy(client, this.modelTargets.model, readModelPolicyName(this.table), FOLD_STATE_POLICY_EXPRESSION);
+        await this.installPolicy(client, this.modelTargets.state, readModelStatePolicyName(this.table), FOLD_STATE_POLICY_EXPRESSION);
+        await this.installProcessorPolicies(client, this.modelTargets);
       }
       await this.markScopeFunctionsLeakproof(client);
+    }
+  }
+
+  /**
+   * The processor role's three policies (decision 46 §2), recreated when their role, command or expressions drifted.
+   * Without `processorRole` existing ones stay — a process installing without the option must not break a running
+   * processor — and are named in `warnings()`.
+   */
+  private async installProcessorPolicies(client: PoolClient, modelTargets: ReadModelTargets): Promise<void> {
+    const role = this.ddlOptions.processorRole;
+    const policies = processorPolicies(this.target, modelTargets);
+    const found = await client.query<{ tablename: string; policyname: string; cmd: string; roles: string[]; qual: string | null; with_check: string | null }>(
+      "SELECT tablename, policyname, cmd, roles::text[] AS roles, qual, with_check FROM pg_policies WHERE schemaname = $1 AND policyname = ANY($2::text[]) ORDER BY policyname COLLATE \"C\"",
+      [this.schemaName, policies.map((p) => p.name)],
+    );
+    if (role === undefined) {
+      if (found.rows.length > 0) {
+        this.warningList.push(
+          `rls: the processor policies ${found.rows.map((r) => `${r.policyname} (to ${r.roles.join(", ")})`).join(", ")} exist but this store has no processorRole — they are left in place for a running cross-tenant processor; drop them deliberately if none runs`,
+        );
+      }
+      return;
+    }
+    for (const policy of policies) {
+      const row = found.rows.find((r) => r.tablename === policy.target.table && r.policyname === policy.name);
+      const same = (actual: string | null, expected: string | null) =>
+        expected === null ? actual === null : actual !== null && normalisePolicyExpr(actual, this.schemaName) === normalisePolicyExpr(expected, this.schemaName);
+      const upToDate =
+        row !== undefined && row.cmd === policy.command && row.roles.length === 1 && row.roles[0] === role && same(row.qual, policy.using) && same(row.with_check, policy.check);
+      if (upToDate) continue;
+      if (row !== undefined) await client.query(`DROP POLICY IF EXISTS ${quoteIdent(policy.name)} ON ${tableRef(policy.target)}`);
+      await client.query(processorPolicyDdl(policy, role));
+    }
+  }
+
+  /**
+   * Whether this store is connected as `processorRole` (decision 46 §4): `current_user`, read once. Only then may its
+   * root read every tenant (the database's processor policies decide what it sees) and run a cross-tenant processor.
+   */
+  processorSession(): Promise<boolean> {
+    const role = this.ddlOptions.processorRole;
+    if (!this.ddlOptions.rls || role === undefined) return Promise.resolve(false);
+    if (!this.processorCheck) {
+      this.processorCheck = (async () => {
+        await this.ensureInstalled();
+        const found = await this.pool.query<{ role: string }>("SELECT current_user::text AS role");
+        return found.rows[0]?.role === role;
+      })().catch((error: unknown) => {
+        this.processorCheck = undefined;
+        throw this.translate(error, false);
+      });
+    }
+    return this.processorCheck;
+  }
+
+  /** The root's event reads under `rls`: refused, unless this store is connected as the processor role. */
+  private async assertRootReads(): Promise<void> {
+    if (!this.ddlOptions.rls) return;
+    if (this.ddlOptions.processorRole !== undefined && (await this.processorSession())) return;
+    this.assertRlsSession();
+  }
+
+  /** ENABLE and FORCE row-level security when needed; the policy recreated when USING or WITH CHECK drifted. */
+  private async installPolicy(client: PoolClient, target: Target, policy: string, expr: string): Promise<void> {
+    const t = tableRef(target);
+    const flags = await client.query<{ rls: boolean; force: boolean }>(
+      "SELECT c.relrowsecurity AS rls, c.relforcerowsecurity AS force FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $1 AND n.nspname = $2",
+      [target.table, target.schemaName],
+    );
+    if (!flags.rows[0]?.rls) await client.query(`ALTER TABLE ${t} ENABLE ROW LEVEL SECURITY`);
+    if (!flags.rows[0]?.force) await client.query(`ALTER TABLE ${t} FORCE ROW LEVEL SECURITY`);
+    const existing = await client.query<{ qual: string | null; with_check: string | null }>(
+      "SELECT qual, with_check FROM pg_policies WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+      [target.schemaName, target.table, policy],
+    );
+    const row = existing.rows[0];
+    const expected = normalisePolicyExpr(expr, target.schemaName);
+    const upToDate =
+      row !== undefined &&
+      row.qual !== null &&
+      row.with_check !== null &&
+      normalisePolicyExpr(row.qual, target.schemaName) === expected &&
+      normalisePolicyExpr(row.with_check, target.schemaName) === expected;
+    if (!upToDate) {
+      if (row !== undefined) await client.query(`DROP POLICY IF EXISTS ${quoteIdent(policy)} ON ${t}`);
+      await client.query(`CREATE POLICY ${quoteIdent(policy)} ON ${t} USING (${expr}) WITH CHECK (${expr})`);
     }
   }
 
@@ -751,8 +948,62 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
     }
   }
 
+  private assertFoldStateSession(): void {
+    if (this.ddlOptions.rls) {
+      throw new UsageError(
+        "eventstore/postgres: rls is enabled — persisted fold states are read and written only in a tenant session: use withTenant(tenantId) (or es.forTenant()); the root store has none",
+      );
+    }
+  }
+
+  /** One stored state, or `null`. A row whose key text differs (a hash collision) is a miss. */
+  private async readFoldState(runner: Runner, tenant: string, key: FoldStateKey, inTenantSession: boolean): Promise<StoredFoldState | null> {
+    const sql = `SELECT query_key, cursor_xid::text AS cursor_xid, cursor_seq::text AS cursor_seq, state, fingerprint FROM ${tableRef(this.foldTarget!)}
+WHERE tenant = $1 AND fold_name = $2 AND fold_version = $3 AND query_hash = $4`;
+    let result: pg.QueryResult<{ query_key: string; cursor_xid: string; cursor_seq: string; state: Buffer; fingerprint: string | null }>;
+    try {
+      result = await runner.query(sql, [tenant, key.name, key.version, foldStateHash(key.key)]);
+    } catch (err) {
+      throw this.translateFoldState(err, inTenantSession);
+    }
+    const row = result.rows[0];
+    if (!row || row.query_key !== key.key) return null;
+    return { cursor: { transactionId: row.cursor_xid, sequence: toSafeInt(row.cursor_seq) }, state: row.state, ...(row.fingerprint !== null ? { fingerprint: row.fingerprint } : {}) };
+  }
+
+  /** The monotone upsert: the row moves only to a further cursor; an older or equal one is a no-op. */
+  private async writeFoldState(runner: Runner, tenant: string, key: FoldStateKey, stored: StoredFoldState, inTenantSession: boolean): Promise<void> {
+    const sql = `INSERT INTO ${tableRef(this.foldTarget!)} AS t (tenant, fold_name, fold_version, query_hash, query_key, cursor_xid, cursor_seq, state, fingerprint)
+VALUES ($1, $2, $3, $4, $5, $6::xid8, $7::bigint, $8, $9)
+ON CONFLICT (tenant, fold_name, fold_version, query_hash) DO UPDATE
+SET query_key = EXCLUDED.query_key, cursor_xid = EXCLUDED.cursor_xid, cursor_seq = EXCLUDED.cursor_seq, state = EXCLUDED.state, fingerprint = EXCLUDED.fingerprint, updated_at = now()
+WHERE (t.cursor_xid, t.cursor_seq) < (EXCLUDED.cursor_xid, EXCLUDED.cursor_seq)`;
+    const bytes = Buffer.from(stored.state.buffer, stored.state.byteOffset, stored.state.byteLength);
+    try {
+      await runner.query(sql, [tenant, key.name, key.version, foldStateHash(key.key), key.key, stored.cursor.transactionId, String(stored.cursor.sequence), bytes, stored.fingerprint ?? null]);
+    } catch (err) {
+      throw this.translateFoldState(err, inTenantSession);
+    }
+  }
+
+  /** Errors of the fold-state table, in words that say what to do; everything else as `translate`. */
+  private translateFoldState(err: unknown, inTenantSession: boolean): unknown {
+    const e = err as { code?: string; message?: string } | null;
+    const name = `${this.schemaName}.${this.foldTarget!.table}`;
+    if (e?.code === "42P01") {
+      return new EventStoreError(
+        `eventstore/postgres: the fold-state table ${name} does not exist — let the store install it (persistedFolds: true with install: "auto"), or run printSchemaSql(schema, { persistedFolds: true }) as the owner`,
+        { cause: err },
+      );
+    }
+    if (e?.code === "42501" && !(this.ddlOptions.rls && inTenantSession)) {
+      return new EventStoreError(`eventstore/postgres: permission denied — the application role needs SELECT, INSERT, UPDATE on ${name}: ${e.message ?? ""}`, { cause: err });
+    }
+    return this.translate(err, inTenantSession);
+  }
+
   async query(query: Query, options: QueryOptions = {}): Promise<QueryResult> {
-    this.assertRlsSession();
+    await this.assertRootReads();
     await this.ensureInstalled();
     return this.queryWith(this.pool, query, options, false);
   }
@@ -783,7 +1034,9 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
       if (compiled.filterCount === 1) byFilter[0]!.push(event);
       else (row.hits ?? []).forEach((hit, i) => hit && byFilter[i]?.push(event));
     }
-    return { events, byFilter, lastReturned, contextVersion, ctx: { query, version: contextVersion }, settledCursor };
+    // the watermark is sound only from this very statement's snapshot, never from a second read
+    const watermark = first?.xmin;
+    return { events, byFilter, lastReturned, contextVersion, ctx: { query, version: contextVersion }, settledCursor, ...(watermark ? { watermark } : {}) };
   }
 
   private toRecorded(row: Row, options: QueryOptions = {}): RecordedEvent {
@@ -821,7 +1074,7 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
 
   /** Count, stored bytes and last sequence per event type, over the rows a query matches — no payload is fetched. */
   async statistics(query: Query = {}): Promise<readonly TypeStatistics[]> {
-    this.assertRlsSession();
+    await this.assertRootReads();
     await this.ensureInstalled();
     return this.statisticsWith(this.pool, query, false);
   }
@@ -874,7 +1127,10 @@ export class PostgresStore implements EventStore, StatisticsStore, Partial<WakeS
       prepared.map((e) => JSON.stringify(toPayload(e, this.schema.idKeyOf(e.type)))),
       prepared.map((e) => JSON.stringify(e.metadata ?? {})),
     ];
-    const sql = `SELECT ok, actual::text AS actual, first_seq::text AS first_seq, last_seq::text AS last_seq, cnt
+    // The transaction id comes from the append's own statement (decision 10); it is NULL only when
+    // nothing was written, i.e. on a conflict.
+    const sql = `SELECT ok, actual::text AS actual, first_seq::text AS first_seq, last_seq::text AS last_seq, cnt,
+       pg_current_xact_id_if_assigned()::text AS xid
 FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb, $6::bigint, $7::text[], $8::jsonb[], $9::jsonb[])`;
     let row: AppendRow | undefined;
     try {
@@ -887,9 +1143,10 @@ FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb,
     if (!row.ok) {
       return { ok: false, conflict: { expected: ctx ? ctx.version : 0, actual: toSafeInt(row.actual) } };
     }
+    if (row.xid === null) throw new EventStoreError("eventstore/postgres: append returned no transaction id");
     return {
       ok: true,
-      appended: { first: toSafeInt(row.first_seq as string), last: toSafeInt(row.last_seq as string), count: Number(row.cnt) },
+      appended: { first: toSafeInt(row.first_seq as string), last: toSafeInt(row.last_seq as string), count: Number(row.cnt), transactionId: row.xid },
     };
   }
 
@@ -956,12 +1213,36 @@ FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb,
    * (`scopedToTenant`) for query narrowing and event stamping. Under `rls` this is also the
    * store to hand to `subscribe`/`on`: the root store refuses to be polled.
    */
-  withTenant(tenantId: string): EventStore & StatisticsStore & Partial<WakeStore> {
+  withTenant(tenantId: string): EventStore & StatisticsStore & Partial<WakeStore> & { readonly foldStates?: FoldStateStore; readonly readModelStore?: ReadModelStore } {
     const inTenant = <T>(fn: (runner: Runner) => Promise<T>): Promise<T> =>
       this.ensureInstalled().then(() => withTenantSession(this.pool, tenantId, (client) => fn(client)));
+    /** The key's tenant is this session's, fail-closed; under `rls` the empty tenant has no rows of its own. */
+    const sessionKey = (key: FoldStateKey): FoldStateKey => {
+      if (key.tenant !== undefined && key.tenant !== tenantId) {
+        throw new TenantMismatchError(`eventstore/postgres: a fold state key names tenant ${key.tenant} but the session is bound to ${tenantId}`);
+      }
+      if (this.ddlOptions.rls && tenantId === "") {
+        throw new UsageError("eventstore/postgres: rls is enabled — a persisted fold needs a tenant; the empty tenant id has no fold states");
+      }
+      return key;
+    };
+    const foldStates: FoldStateStore | undefined = this.foldTarget
+      ? {
+          read: async (key) => {
+            const k = sessionKey(key);
+            return inTenant((r) => this.readFoldState(r, tenantId, k, true));
+          },
+          write: async (key, stored) => {
+            const k = sessionKey(key);
+            return inTenant((r) => this.writeFoldState(r, tenantId, k, stored, true));
+          },
+        }
+      : undefined;
     return {
       // the doorbell is the store's: it carries no tenant, the tenant session decides what a read sees
       ...(this.onCommitted ? { onCommitted: this.onCommitted } : {}),
+      ...(foldStates ? { foldStates } : {}),
+      ...(this.models ? { readModelStore: this.models.capability(tenantId) } : {}),
       query: (query, options = {}) => inTenant((r) => this.queryWith(r, query, options, true)),
       statistics: (query = {}) => inTenant((r) => this.statisticsWith(r, query, true)),
       append: async (events) => {
@@ -995,6 +1276,7 @@ FROM ${this.fn}($1::bigint[], $2::boolean[], $3::bigint, $4::boolean, $5::jsonb,
   }
 
   async close(): Promise<void> {
+    this.models?.close();
     await this.listener?.close();
     if (this.ownsPool) await this.pool.end();
   }
@@ -1101,6 +1383,11 @@ function normalisePolicyExpr(expr: string, schemaName: string): string {
     .replace(/\s+|\(|\)|"/g, "")
     .replace(new RegExp(`${schemaName.toLowerCase()}\\.`, "g"), "")
     .replace(/public\./g, "");
+}
+
+/** The primary-key column of a state key: SHA-256 of its text, 32 bytes (the text itself can outgrow a B-tree entry). */
+function foldStateHash(key: string): Buffer {
+  return createHash("sha256").update(key).digest();
 }
 
 function toSafeInt(value: string | number): number {

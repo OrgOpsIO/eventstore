@@ -5,8 +5,10 @@ import {
   buildSchema,
   createEventStore,
   defineEvents,
+  type Filter,
   type Fold,
   type NewEventOf,
+  type Query,
   type QueryResult,
   type RecordedEvent,
   type RecordedEventOf,
@@ -130,5 +132,20 @@ describe("types", () => {
     void like;
     const registries: readonly RegistryLike[] = [articles];
     void registries;
+  });
+
+  it("$filter stays a Filter: assignable to Filter, Filter[] and Query, and a plain Filter still fits a variable inferred from it", () => {
+    expectTypeOf(articles.$filter()).toMatchTypeOf<Filter>();
+    expectTypeOf(articles.$filter({ types: ["Pinged"] })).toMatchTypeOf<Query>();
+    const many: Filter[] = [articles.$filter(), articles.$filter({ types: ["ArticleDrafted"] })];
+    const query: Query = articles.$filter({ types: ["ArticleArchived"] });
+    let reassigned = articles.$filter({ types: ["Pinged"] });
+    reassigned = { types: ["Other"] };
+    const spread: Filter = { ...articles.$filter(), not: { types: ["Pinged"] } };
+    const typesOnly = () => {
+      // @ts-expect-error a type the registry does not declare
+      articles.$filter({ types: ["Nope"] });
+    };
+    void [many, query, reassigned, spread, typesOnly];
   });
 });

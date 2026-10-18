@@ -1,6 +1,6 @@
 import { fnv1a64, lockKeyOf } from "./ids.js";
 import { UnindexableContextError, UsageError, ValidationError } from "./errors.js";
-import type { Filter, NegatedFilter, NewEvent, Query, QueryOptions, RecordedEvent, StoreSchema } from "./types.js";
+import type { Cursor, Filter, NegatedFilter, NewEvent, Query, QueryOptions, RecordedEvent, StoreSchema } from "./types.js";
 
 export const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_CONTAINS_DEPTH = 64;
@@ -350,6 +350,16 @@ export function compareCursor(a: { transactionId: string; sequence: number }, b:
   const y = BigInt(b.transactionId);
   if (x !== y) return x < y ? -1 : 1;
   return a.sequence - b.sequence;
+}
+
+/**
+ * Whether a reader at `cursor`, holding the `watermark` of its last empty page, has passed a
+ * read-your-writes `token`: its cursor is at or beyond it, or every transaction up to the token's
+ * had ended when that empty page was read (strict: a watermark equal to the id may be in flight).
+ */
+export function passedBy(token: Cursor, cursor: Cursor | null, watermark: string | null): boolean {
+  if (cursor !== null && compareCursor(cursor, token) >= 0) return true;
+  return watermark !== null && BigInt(watermark) > BigInt(token.transactionId);
 }
 
 /** Split a unique path like `scopes.magicLinkRequestedId` into JSON path segments. */

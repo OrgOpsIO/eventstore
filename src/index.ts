@@ -6,6 +6,8 @@ export type {
   Cursor,
   EventStore,
   Filter,
+  FoldStateKey,
+  FoldStateStore,
   Metadata,
   NegatedFilter,
   NewEvent,
@@ -15,6 +17,7 @@ export type {
   RecordedEvent,
   Scopes,
   StatisticsStore,
+  StoredFoldState,
   StoreSchema,
   TypeStatistics,
   WakeStore,
@@ -23,6 +26,7 @@ export {
   ConflictError,
   ContextTooLargeError,
   EventStoreError,
+  FailedKeyError,
   NotConfiguredError,
   PolicyViolationError,
   TenantMismatchError,
@@ -57,7 +61,12 @@ export type {
 export { MemoryStore, cursorOf, isLiveStore, isWakeStore } from "./memory.js";
 export type { AppendedListener, LiveStore, MemoryStoreOptions } from "./memory.js";
 export { CacheBudget, ContextCache, estimateSize } from "./context.js";
-export type { ContextCacheOptions, ContextSpec, Fold, LoadedContext } from "./context.js";
+export type { ContextCacheOptions, ContextLoad, ContextSpec, Fold, LoadedContext } from "./context.js";
+export { defineFold } from "./foldstate.js";
+export { defineReadModel } from "./readmodel.js";
+export type { ListChange, ListOptions, ListResult, ListRow, LiveReadModel, LiveReadModelOptions, ReadModelDefinition, ReadModelReadOptions, ReadModelStatus, ReadModelWatchOptions } from "./readmodel.js";
+export type { PersistedReadModel, PersistedReadModelStatus } from "./persisted.js";
+export type { DefinedFold, FoldIdentity } from "./foldstate.js";
 export { CONFLICT_CODE, httpStatusOf, isRejection, reject, rejectMissing, runCommand } from "./command.js";
 export type { CommandOutcome, CommandRuntime, CommandSpec, Decided, DecideTools, Decision, RawCommandSpec, Rejection } from "./command.js";
 export { PLATFORM_TENANT_ID, scopedToTenant } from "./tenant.js";

@@ -83,7 +83,7 @@ describe("memory store + api", () => {
     const es = newApi().forTenant(WS);
     const drafted = articles.ArticleDrafted({ title: "Hello", slug: "hello" }, { workspaceProvisionedId: WS });
     const r1 = await es.append([drafted]);
-    expect(r1).toEqual({ first: 1, last: 1, count: 1 });
+    expect(r1).toEqual({ first: 1, last: 1, count: 1, transactionId: "1" });
     const stored = (await es.query(articles.$filter())).events[0]!;
     expect(stored.scopes.workspaceProvisionedId).toBe(WS);
     const id = stored.id;
@@ -181,6 +181,34 @@ describe("memory store + api", () => {
     expect(second.cacheHit).toBe(true);
     expect(second.delta).toHaveLength(1);
     expect(second.ctx.version).toBe(2);
+  });
+
+  it("onLoad reports read, fold and sizing time per load, with name and tenant", async () => {
+    const loads: import("../src/index.js").ContextLoad[] = [];
+    const api = createEventStore({
+      events: [articles],
+      tenant: { scopeKey: "workspaceProvisionedId" },
+      contextCache: {
+        onLoad: (load) => {
+          loads.push(load);
+          throw new Error("telemetry must not fail a load");
+        },
+      },
+    });
+    const es = api.forTenant(WS);
+    const fold = (events: readonly import("../src/index.js").RecordedEvent[], state: number) => state + events.length;
+    await es.append([articles.ArticleDrafted({ title: "A", slug: "a" }, { workspaceProvisionedId: WS })]);
+    expect((await es.context({ query: articles.$filter(), fold, initial: 0, name: "count" })).state).toBe(1);
+    await es.command({ name: "count-cmd", context: articles.$filter(), fold, initial: 0, decide: () => ({ events: [] }) });
+    expect(loads).toHaveLength(2);
+    const [cold, warm] = loads;
+    expect(cold).toMatchObject({ name: "count", tenant: WS, cacheHit: false, events: 1 });
+    expect(warm).toMatchObject({ name: "count-cmd", tenant: WS, cacheHit: true, events: 0 });
+    for (const load of loads) {
+      for (const ms of [load.readMs, load.foldMs, load.sizeMs]) expect(ms).toBeGreaterThanOrEqual(0);
+      expect(load.query).toContain("ArticleDrafted");
+    }
+    expect(cold!.bytes).toBeGreaterThan(0);
   });
 
   it("es.read(registry) narrows and re-validates", async () => {

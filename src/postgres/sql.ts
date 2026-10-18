@@ -55,6 +55,14 @@
  * migration tool and set `install: "none"`. `printSchemaSql` prints the unconditional form
  * (DROP + CREATE POLICY, CREATE OR REPLACE FUNCTION).
  *
+ * Persisted folds (`persistedFolds: true`) add one table beside the events table,
+ * `<table>_fold_state`: one stored state per tenant, fold name, fold version and state key
+ * (`query_hash` = SHA-256 of the key text, the full text compared on read), with the settled
+ * cursor it was folded up to (`cursor_xid`, `cursor_seq`). Writes are a monotone upsert: a row
+ * moves only to a further cursor. Under `rls` it gets the same session variable in its own policy,
+ * `tenant <> '' AND tenant = current_setting('app.current_tenant', true)`. Application roles need
+ * `SELECT, INSERT, UPDATE` on it.
+ *
  * Pools the SDK creates carry `statement_timeout`, `lock_timeout`,
  * `idle_in_transaction_session_timeout` and `search_path` as libpq startup options. A pool you
  * pass in gets none of that (recorded in `installWarnings`).
@@ -71,6 +79,7 @@
  * in 50-event batches at c=4 on the bench machine — batch when you can.
  */
 import { createHash } from "node:crypto";
+import { UsageError } from "../errors.js";
 import { filtersOf, negationsOf, uniquePathSegments } from "../query.js";
 import type { Filter, NegatedFilter, Query, QueryOptions, StoreSchema } from "../types.js";
 
@@ -217,6 +226,12 @@ export interface DdlOptions {
   readonly scopeStatistics?: "all" | readonly string[];
   /** The commit doorbell: a statement trigger that NOTIFYs (with an empty payload) after each insert. */
   readonly live?: boolean;
+  /** The persisted fold tier's table, `<table>_fold_state` (with its policy under `rls`). */
+  readonly persistedFolds?: boolean;
+  /** The persisted read models' tables, `<table>_read_model` and `<table>_read_model_state` (with their policies under `rls`). */
+  readonly persistedModels?: boolean;
+  /** Under `rls`: the role a cross-tenant processor connects as; it gets three policies `TO <role>` (decision 46). */
+  readonly processorRole?: string;
 }
 
 export interface UniqueIndex {
@@ -254,6 +269,182 @@ export function tableDdl(target: Target): string {
   recorded_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   transaction_id XID8 NOT NULL DEFAULT pg_current_xact_id()
 )`;
+}
+
+/**
+ * The persisted fold tier's table of an events table: `<table>_fold_state`, same schema. Postgres
+ * would cut a longer name to 63 bytes without a word, so a name that does not fit is refused.
+ */
+export function foldStateTargetOf(target: Target): Target {
+  const table = `${target.table}_fold_state`;
+  if (Buffer.byteLength(table) > 63) {
+    throw new UsageError(`eventstore/postgres: persistedFolds needs the table ${table}, which is longer than Postgres' 63 bytes — choose a shorter \`table\``);
+  }
+  return targetOf({ schemaName: target.schemaName, table });
+}
+
+/** The fold-state table (see `foldStateTargetOf`); the primary key holds the tenant, so one tenant's key never collides with another's. */
+export function foldStateTableDdl(foldTarget: Target): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableRef(foldTarget)} (
+  tenant TEXT NOT NULL,
+  fold_name TEXT NOT NULL,
+  fold_version INTEGER NOT NULL,
+  query_hash BYTEA NOT NULL,
+  query_key TEXT NOT NULL,
+  cursor_xid XID8 NOT NULL,
+  cursor_seq BIGINT NOT NULL,
+  state BYTEA NOT NULL,
+  fingerprint TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant, fold_name, fold_version, query_hash)
+)`;
+}
+
+/** The fold-state policy: the events policy's session variable, and never the empty tenant (a pooled connection's reset value). */
+export const FOLD_STATE_POLICY_EXPRESSION = "tenant <> '' AND tenant = current_setting('app.current_tenant', true)";
+
+export function foldStatePolicyName(table: string): string {
+  return indexName(table, "fold", "isolation");
+}
+
+// ── persisted read models (decision 26) ───────────────────────────────────────
+
+/** The two tables of the persisted read models: `<table>_read_model` (one row per model) and `<table>_read_model_state` (one per key). */
+export interface ReadModelTargets {
+  readonly model: Target;
+  readonly state: Target;
+}
+
+/** The persisted read models' tables of an events table, same schema; a name over Postgres' 63 bytes is refused. */
+export function readModelTargetsOf(target: Target): ReadModelTargets {
+  const model = `${target.table}_read_model`;
+  const state = `${target.table}_read_model_state`;
+  if (Buffer.byteLength(state) > 63) {
+    throw new UsageError(`eventstore/postgres: persistedModels needs the table ${state}, which is longer than Postgres' 63 bytes — choose a shorter \`table\``);
+  }
+  return { model: targetOf({ schemaName: target.schemaName, table: model }), state: targetOf({ schemaName: target.schemaName, table: state }) };
+}
+
+/** The model row: checkpoint, the current writer's epoch, the model revision, the version's status (blue-green) and the writer's fingerprint. */
+export function readModelTableDdl(targets: ReadModelTargets): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableRef(targets.model)} (
+  tenant TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  epoch BIGINT NOT NULL DEFAULT 0,
+  cursor_xid XID8,
+  cursor_seq BIGINT,
+  revision BIGINT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('building', 'active', 'retired')),
+  fingerprint TEXT,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant, name, version)
+)`;
+}
+
+/** The state rows: the key's hash in the primary key (a key of any length fits the B-tree), the state as `node:v8` bytes, its doc for `list`, the failed marker. */
+export function readModelStateTableDdl(targets: ReadModelTargets): string {
+  return `CREATE TABLE IF NOT EXISTS ${tableRef(targets.state)} (
+  tenant TEXT NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  key_hash BYTEA NOT NULL,
+  key TEXT NOT NULL,
+  state BYTEA,
+  doc JSONB,
+  prev_doc JSONB,
+  prev_revision BIGINT,
+  failed JSONB,
+  cursor_xid XID8 NOT NULL,
+  cursor_seq BIGINT NOT NULL,
+  revision BIGINT NOT NULL,
+  PRIMARY KEY (tenant, name, version, key_hash)
+)`;
+}
+
+/** The state table's indexes: by revision (the follower), the failed keys (counts), the doc (any `where`). */
+export function readModelIndexDdl(table: string, targets: ReadModelTargets): string[] {
+  const s = tableRef(targets.state);
+  return [
+    `CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(table, "rm", "revision"))} ON ${s} (tenant, name, version, revision)`,
+    `CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(table, "rm", "failed"))} ON ${s} (tenant, name, version) WHERE failed IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS ${quoteIdent(indexName(table, "rm", "doc"))} ON ${s} USING GIN (doc jsonb_path_ops)`,
+  ];
+}
+
+export function readModelPolicyName(table: string): string {
+  return indexName(table, "rm", "isolation");
+}
+
+export function readModelStatePolicyName(table: string): string {
+  return indexName(table, "rms", "isolation");
+}
+
+// ── the cross-tenant processor (decisions 45–47) ──────────────────────────────
+
+/** One role-targeted policy for the processor role (decision 46 §2): it widens what that role sees, never the application role. */
+export interface ProcessorPolicy {
+  readonly target: Target;
+  readonly name: string;
+  /** `SELECT` on the events table (the role reads, never appends); `ALL` on the model tables. */
+  readonly command: "SELECT" | "ALL";
+  readonly using: string;
+  /** `null` for a `FOR SELECT` policy. */
+  readonly check: string | null;
+}
+
+/** The names of the three processor policies: on the events table, the model rows, the state rows. */
+export function processorPolicyNames(table: string): { readonly events: string; readonly model: string; readonly state: string } {
+  return { events: indexName(table, "processor", "read"), model: indexName(table, "rm", "processor"), state: indexName(table, "rms", "processor") };
+}
+
+/** The processor policies of an events table and its model tables. */
+export function processorPolicies(target: Target, modelTargets: ReadModelTargets): ProcessorPolicy[] {
+  const names = processorPolicyNames(target.table);
+  return [
+    { target, name: names.events, command: "SELECT", using: "true", check: null },
+    { target: modelTargets.model, name: names.model, command: "ALL", using: "true", check: "true" },
+    // every tenant's state rows, never a row of the empty tenant
+    { target: modelTargets.state, name: names.state, command: "ALL", using: "true", check: "tenant <> ''" },
+  ];
+}
+
+/** `CREATE POLICY … TO <role>` of one processor policy. */
+export function processorPolicyDdl(policy: ProcessorPolicy, role: string): string {
+  const command = policy.command === "SELECT" ? " FOR SELECT" : "";
+  const check = policy.check === null ? "" : ` WITH CHECK (${policy.check})`;
+  return `CREATE POLICY ${quoteIdent(policy.name)} ON ${tableRef(policy.target)}${command} TO ${quoteIdent(role)} USING (${policy.using})${check}`;
+}
+
+/**
+ * `processorRole` needs `rls` (without it no role is needed: the root reads every tenant) and `persistedModels`
+ * (it writes the model tables), and must be a plain identifier.
+ */
+export function checkProcessorRole(options: { readonly processorRole?: string | undefined; readonly rls?: boolean | undefined; readonly persistedModels?: boolean | undefined }): void {
+  const role = options.processorRole;
+  if (role === undefined) return;
+  if (typeof role !== "string" || !IDENTIFIER.test(role)) {
+    throw new UsageError(`eventstore/postgres: processorRole must be a role name (letters, digits and _, not starting with a digit), got ${typeof role === "string" ? `"${role}"` : String(role)}`);
+  }
+  if (options.rls !== true || options.persistedModels !== true) {
+    throw new UsageError(
+      "eventstore/postgres: processorRole needs rls: true and persistedModels: true — it names the role a cross-tenant processor connects as under row-level security; without rls the application's root view is the processor and needs no role",
+    );
+  }
+}
+
+/**
+ * The erasure lock's arguments (decision 47): the two-key advisory lock `(hashtext('eventstore:erasure'),
+ * hashtext('<schema>.<table>'))` — shared in every cross-tenant page, exclusive as the erasure's first statement.
+ * Computed in SQL, so the recipe needs no number from the library; appends never take a two-key lock.
+ */
+export function erasureLockArgs(target: Target): string {
+  return `hashtext('eventstore:erasure'), hashtext(${quoteLiteral(`${target.schemaName}.${target.table}`)})`;
+}
+
+/** The NOTIFY channel of the persisted read models of a target; the payload is a model's lock key, never a name or a tenant. */
+export function readModelChannel(target: Target): string {
+  return `${notifyChannel(target)}_rm`;
 }
 
 function searchPath(schemaName: string): string {
@@ -448,9 +639,14 @@ export function ddlStatements(schema: StoreSchema, options: DdlOptions): string[
   const target = targetOf({ schemaName: options.schemaName ?? DEFAULT_SCHEMA, table: options.table });
   const t = tableRef(target);
   const statements: string[] = [];
+  checkProcessorRole(options);
 
   if (target.schemaName !== DEFAULT_SCHEMA) statements.push(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(target.schemaName)}`);
   statements.push(tableDdl(target));
+  const foldTarget = options.persistedFolds ? foldStateTargetOf(target) : undefined;
+  if (foldTarget) statements.push(foldStateTableDdl(foldTarget));
+  const modelTargets = options.persistedModels ? readModelTargetsOf(target) : undefined;
+  if (modelTargets) statements.push(readModelTableDdl(modelTargets), readModelStateTableDdl(modelTargets), ...readModelIndexDdl(target.table, modelTargets));
   statements.push(scopeFunctionDdl(target.schemaName));
   statements.push(`COMMENT ON FUNCTION ${scopeFn(target.schemaName)}(jsonb, text) IS ${quoteLiteral(scopeFunctionFingerprint(target.schemaName))}`);
 
@@ -500,6 +696,34 @@ export function ddlStatements(schema: StoreSchema, options: DdlOptions): string[
     statements.push(`ALTER TABLE ${t} FORCE ROW LEVEL SECURITY`);
     statements.push(`DROP POLICY IF EXISTS ${policy} ON ${t}`);
     statements.push(`CREATE POLICY ${policy} ON ${t} USING (${expr}) WITH CHECK (${expr})`);
+    if (foldTarget) {
+      const f = tableRef(foldTarget);
+      const foldPolicy = quoteIdent(foldStatePolicyName(target.table));
+      statements.push(`ALTER TABLE ${f} ENABLE ROW LEVEL SECURITY`);
+      statements.push(`ALTER TABLE ${f} FORCE ROW LEVEL SECURITY`);
+      statements.push(`DROP POLICY IF EXISTS ${foldPolicy} ON ${f}`);
+      statements.push(`CREATE POLICY ${foldPolicy} ON ${f} USING (${FOLD_STATE_POLICY_EXPRESSION}) WITH CHECK (${FOLD_STATE_POLICY_EXPRESSION})`);
+    }
+    if (modelTargets) {
+      // the model rows and state rows are isolated like the fold states: the session's tenant, never the empty one
+      for (const [modelTarget, name] of [
+        [modelTargets.model, readModelPolicyName(target.table)],
+        [modelTargets.state, readModelStatePolicyName(target.table)],
+      ] as const) {
+        const m = tableRef(modelTarget);
+        statements.push(`ALTER TABLE ${m} ENABLE ROW LEVEL SECURITY`);
+        statements.push(`ALTER TABLE ${m} FORCE ROW LEVEL SECURITY`);
+        statements.push(`DROP POLICY IF EXISTS ${quoteIdent(name)} ON ${m}`);
+        statements.push(`CREATE POLICY ${quoteIdent(name)} ON ${m} USING (${FOLD_STATE_POLICY_EXPRESSION}) WITH CHECK (${FOLD_STATE_POLICY_EXPRESSION})`);
+      }
+      // the cross-tenant processor's role reads every tenant: policies TO that role only, never the application's
+      if (options.processorRole) {
+        for (const policy of processorPolicies(target, modelTargets)) {
+          statements.push(`DROP POLICY IF EXISTS ${quoteIdent(policy.name)} ON ${tableRef(policy.target)}`);
+          statements.push(processorPolicyDdl(policy, options.processorRole));
+        }
+      }
+    }
   }
 
   return statements;
@@ -950,7 +1174,7 @@ export function compileQuery(tableOrTarget: string | Target, query: Query, optio
   // The single-row ctx CTE joined laterally to the ordered rows: a nested loop over one outer
   // row preserves the inner ORDER BY, so no outer sort is needed. int8/xid8 arrive as strings.
   const sql = `WITH ctx AS (SELECT ${version ? `(${version.sql})::text` : "'-1'::text"} AS v, pg_snapshot_xmin(pg_current_snapshot()) AS xmin${anchor})
-SELECT ctx.v AS context_version,
+SELECT ctx.v AS context_version, ctx.xmin::text AS xmin,
        e.sequence_number AS seq, e.event_type, e.payload, e.metadata, e.recorded_at, e.xid, e.settled, e.hits
 FROM ctx
 LEFT JOIN LATERAL (
